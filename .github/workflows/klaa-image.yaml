@@ -1,0 +1,49 @@
+# Builds our custom zot image (upstream zot + patched distribution S3 driver via
+# the go.mod replace onto klaainteractive/distribution) and pushes it to GHCR.
+# Temporary: drop this workflow and the go.mod replace once a zot release pins
+# distribution past the StartAfter fix (distribution PR #4935).
+name: Build klaa zot image
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Image tag to publish to ghcr.io/<owner>/zot
+        required: true
+        default: v2.1.20-klaa1
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-push:
+    name: Build and push linux/amd64 image
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: build/Dockerfile
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            COMMIT=${{ github.sha }}
+            RELEASE_TAG=${{ inputs.tag }}
+          tags: ghcr.io/${{ github.repository_owner }}/zot:${{ inputs.tag }}

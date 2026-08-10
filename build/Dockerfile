@@ -16,11 +16,12 @@ FROM --platform=$BUILDPLATFORM ghcr.io/project-zot/golang:1.26 AS builder
 ARG TARGETOS
 ARG TARGETARCH
 ARG COMMIT
+ARG RELEASE_TAG=dev
 
 RUN mkdir -p /go/src/github.com/project-zot/zot
 WORKDIR /go/src/github.com/project-zot/zot
 COPY . .
-RUN make COMMIT=$COMMIT OS=$TARGETOS ARCH=$TARGETARCH clean binary
+RUN make RELEASE_TAG=$RELEASE_TAG COMMIT=$COMMIT OS=$TARGETOS ARCH=$TARGETARCH clean binary
 RUN echo '{\n\
     "storage": {\n\
         "rootDirectory": "/var/lib/registry"\n\
