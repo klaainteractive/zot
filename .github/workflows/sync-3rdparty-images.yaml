@@ -18,12 +18,11 @@ jobs:
     strategy:
       matrix:
         golang_version:
-          - "1.25"
-          - "1.26"
+          - "1.27"
     runs-on: ubuntu-latest
     steps:
       - name: Log in to GitHub Docker Registry
-        uses: docker/login-action@371161bbe7024a29a25c5e19bfcbc0804fe9ad2c # v4.5.2
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -50,8 +49,8 @@ jobs:
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # setup oras
-          make $PWD/hack/tools/bin/oras
+          # setup oras (OS/ARCH avoid Makefile `go env`; $PWD matches $(ORAS))
+          OS=linux ARCH=amd64 make "$PWD/hack/tools/bin/oras"
           export PATH=$PATH:$PWD/hack/tools/bin
           test -n "${GHCR_TOKEN}" || { echo "Missing GHCR token"; exit 1; }
           echo "${GHCR_TOKEN}" | oras login -u "${GITHUB_ACTOR}" --password-stdin ghcr.io
@@ -70,7 +69,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Log in to GitHub Docker Registry
-        uses: docker/login-action@371161bbe7024a29a25c5e19bfcbc0804fe9ad2c # v4.5.2
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -80,3 +79,25 @@ jobs:
           docker pull localstack/localstack:${{ matrix.localstack_version }}
           docker tag localstack/localstack:${{ matrix.localstack_version }} ghcr.io/${{ github.repository_owner }}/ci-images/localstack:${{ matrix.localstack_version }}
           docker push ghcr.io/${{ github.repository_owner }}/ci-images/localstack:${{ matrix.localstack_version }}
+  sync-floci:
+    name: 'floci'
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        floci_version:
+          - "1.5.34"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log in to GitHub Docker Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Tag and push floci to ghcr
+        run: |
+          docker pull floci/floci:${{ matrix.floci_version }}
+          docker tag floci/floci:${{ matrix.floci_version }} ghcr.io/${{ github.repository_owner }}/ci-images/floci:${{ matrix.floci_version }}
+          docker push ghcr.io/${{ github.repository_owner }}/ci-images/floci:${{ matrix.floci_version }}

@@ -25,10 +25,36 @@ type ImageStore interface { //nolint:interfacebloat
 	Name() string
 	DirExists(d string) bool
 	RootDir() string
-	RLock(*time.Time)
-	RUnlock(*time.Time)
-	Lock(*time.Time)
-	Unlock(*time.Time)
+	// WithRepoLock and WithRepoReadLock run wrappedFunc while holding the write, respectively
+	// read, lock for work on repo, and return its error.
+	//
+	// The repo argument names the repository the caller works on. It is not a promise that
+	// only that repository is touched: with dedupe, a blob in one repo can be a link to, or
+	// a placeholder for, content stored under another repo, so reads and writes made under
+	// these locks can reach other repositories' blobs. That is safe only because the default
+	// store has a single lock, which every repo maps to. Locking per repo is therefore not a
+	// change that can be made behind these two methods alone: content shared between
+	// repositories first needs a lock of its own.
+	WithRepoLock(repo string, wrappedFunc func() error) error
+	WithRepoReadLock(repo string, wrappedFunc func() error) error
+	// WithBlobstoreLock and WithBlobstoreReadLock run wrappedFunc while holding the write,
+	// respectively read, lock for the blob content repositories share, and return its error.
+	// This is the lock of its own that shared content needs before repos can be locked
+	// separately. Callers that work on a repo and can also reach shared content name both,
+	// through the three methods below, instead of nesting the two kinds of lock themselves.
+	//
+	// The default store still has its single lock, and all of these methods take it, once.
+	// They are therefore not reentrant: wrappedFunc must not call another of them.
+	WithBlobstoreLock(wrappedFunc func() error) error
+	WithBlobstoreReadLock(wrappedFunc func() error) error
+	// WithBlobstoreAndRepoLock holds the write lock on both the shared content and repo.
+	WithBlobstoreAndRepoLock(repo string, wrappedFunc func() error) error
+	// WithBlobstoreReadAndRepoLock holds repo's write lock and reads shared content.
+	WithBlobstoreReadAndRepoLock(repo string, wrappedFunc func() error) error
+	// WithRepoCleanupLock holds what deleting blobs out of repo requires. Passes that remove
+	// a repo's blobs (GC, removal of an emptied repo) use it rather than choosing a lock
+	// themselves: whether such a delete can touch shared content is for the store to know.
+	WithRepoCleanupLock(repo string, wrappedFunc func() error) error
 	InitRepo(ctx context.Context, name string) error
 	ValidateRepo(name string) (bool, error)
 	GetRepositories() ([]string, error)
@@ -51,14 +77,21 @@ type ImageStore interface { //nolint:interfacebloat
 	FullBlobUpload(ctx context.Context, repo string, body io.Reader, digest godigest.Digest) (string, int64, error)
 	DedupeBlob(src string, dstDigest godigest.Digest, dstRepo, dst string) error
 	DeleteBlobUpload(repo, uuid string) error
+	DeleteBlobUploadIfIdle(repo, uuid string) (bool, error)
 	BlobPath(repo string, digest godigest.Digest) string
 	CheckBlob(ctx context.Context, repo string, digest godigest.Digest) (bool, int64, error)
 	StatBlob(repo string, digest godigest.Digest) (bool, int64, time.Time, error)
+	// StatBlobEntry stats the object at BlobPath(repo, digest) without resolving through
+	// the dedupe cache to a content original. Use it for age checks (GC delay, idle-repo
+	// reclaim): a remote placeholder's own modtime is when this repo gained the digest,
+	// whereas StatBlob returns the original's modtime.
+	StatBlobEntry(repo string, digest godigest.Digest) (bool, int64, time.Time, error)
 	GetBlob(repo string, digest godigest.Digest, mediaType string) (io.ReadCloser, int64, error)
 	GetBlobPartial(repo string, digest godigest.Digest, mediaType string, from, to int64,
 	) (io.ReadCloser, int64, int64, error)
 	DeleteBlob(repo string, digest godigest.Digest) error
-	CleanupRepo(repo string, blobs []godigest.Digest, removeRepo bool) (int, error)
+	CleanupRepo(repo string, blobs []godigest.Digest) (int, error)
+	RemoveIdleRepository(repo string, maxBlobAge time.Duration) (bool, error)
 	GetIndexContent(repo string) ([]byte, error)
 	PutIndexContent(repo string, index ispec.Index) error
 	StatIndex(repo string) (bool, int64, time.Time, error)
@@ -82,7 +115,7 @@ type Driver interface { //nolint:interfacebloat
 	ReadFile(path string) ([]byte, error)
 	Delete(path string) error
 	Stat(path string) (storagedriver.FileInfo, error)
-	Writer(filepath string, append bool) (storagedriver.FileWriter, error) //nolint: predeclared
+	Writer(filepath string, isAppend bool) (storagedriver.FileWriter, error)
 	WriteFile(filepath string, content []byte) (int, error)
 	Walk(path string, f storagedriver.WalkFn) error
 	List(fullpath string) ([]string, error)

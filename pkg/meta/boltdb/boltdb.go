@@ -10,7 +10,6 @@ import (
 	"time"
 
 	godigest "github.com/opencontainers/go-digest"
-	ispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"go.etcd.io/bbolt"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -156,14 +155,13 @@ func (bdw *BoltDB) SetImageMeta(digest godigest.Digest, imageMeta mTypes.ImageMe
 
 		protoImageMeta := &proto_go.ImageMeta{}
 
-		if imageMeta.MediaType == ispec.MediaTypeImageManifest ||
-			compat.IsCompatibleManifestMediaType(imageMeta.MediaType) {
+		if compat.IsImageManifestMediaType(imageMeta.MediaType) {
 			manifest := imageMeta.Manifests[0]
 			protoImageMeta = mConvert.GetProtoImageManifestData(manifest.Manifest, manifest.Config,
-				manifest.Size, manifest.Digest.String())
-		} else if imageMeta.MediaType == ispec.MediaTypeImageIndex ||
-			compat.IsCompatibleManifestListMediaType(imageMeta.MediaType) {
-			protoImageMeta = mConvert.GetProtoImageIndexMeta(*imageMeta.Index, imageMeta.Size, imageMeta.Digest.String())
+				manifest.Size, manifest.Digest.String(), imageMeta.MediaType)
+		} else if compat.IsImageIndexMediaType(imageMeta.MediaType) {
+			protoImageMeta = mConvert.GetProtoImageIndexMeta(*imageMeta.Index, imageMeta.Size, imageMeta.Digest.String(),
+				imageMeta.MediaType)
 		}
 
 		pImageMetaBlob, err := proto.Marshal(protoImageMeta)
@@ -393,6 +391,8 @@ func unmarshalProtoRepoMeta(repo string, repoMetaBlob []byte) (*proto_go.RepoMet
 		if err != nil {
 			return protoRepoMeta, err
 		}
+
+		common.StripSignatureLayerContent(protoRepoMeta)
 	}
 
 	if protoRepoMeta.Tags == nil {
@@ -440,8 +440,7 @@ func (bdw *BoltDB) FilterImageMeta(ctx context.Context, digests []string,
 				return err
 			}
 
-			if protoImageMeta.MediaType == ispec.MediaTypeImageIndex ||
-				compat.IsCompatibleManifestListMediaType(protoImageMeta.MediaType) {
+			if compat.IsImageIndexMediaType(protoImageMeta.MediaType) {
 				_, manifestDataList, err := getAllContainedMeta(imageBuck, protoImageMeta)
 				if err != nil {
 					return err
@@ -529,10 +528,7 @@ func getAllContainedMeta(imageBuck *bbolt.Bucket, imageIndexData *proto_go.Image
 	imageMetaList := make([]*proto_go.ImageMeta, 0, len(imageIndexData.Index.Index.Manifests))
 
 	for _, manifest := range imageIndexData.Index.Index.Manifests {
-		if manifest.MediaType != ispec.MediaTypeImageManifest &&
-			manifest.MediaType != ispec.MediaTypeImageIndex &&
-			!compat.IsCompatibleManifestMediaType(manifest.MediaType) &&
-			!compat.IsCompatibleManifestListMediaType(manifest.MediaType) {
+		if !compat.IsImageManifestMediaType(manifest.MediaType) && !compat.IsImageIndexMediaType(manifest.MediaType) {
 			// filter out unexpected media types from the manifest lists,
 			// this could be the case of buildkit cache entries for example
 			continue
@@ -548,12 +544,10 @@ func getAllContainedMeta(imageBuck *bbolt.Bucket, imageIndexData *proto_go.Image
 			return imageMetaList, manifestDataList, err
 		}
 
-		if imageManifestData.MediaType == ispec.MediaTypeImageManifest ||
-			compat.IsCompatibleManifestMediaType(imageManifestData.MediaType) {
+		if compat.IsImageManifestMediaType(imageManifestData.MediaType) {
 			imageMetaList = append(imageMetaList, imageManifestData)
 			manifestDataList = append(manifestDataList, imageManifestData.Manifests[0])
-		} else if imageManifestData.MediaType == ispec.MediaTypeImageIndex ||
-			compat.IsCompatibleManifestListMediaType(imageManifestData.MediaType) {
+		} else if compat.IsImageIndexMediaType(imageManifestData.MediaType) {
 			partialImageDataList, partialManifestDataList, err := getAllContainedMeta(imageBuck, imageManifestData)
 			if err != nil {
 				// getAllContainedMeta skips missing items internally, so any error returned
@@ -614,8 +608,7 @@ func (bdw *BoltDB) SearchTags(ctx context.Context, searchText string,
 
 			var protoImageMeta *proto_go.ImageMeta
 
-			if descriptor.MediaType == ispec.MediaTypeImageManifest || //nolint:gocritic
-				compat.IsCompatibleManifestMediaType(descriptor.MediaType) {
+			if compat.IsImageManifestMediaType(descriptor.MediaType) { //nolint:gocritic
 				manifestDigest := descriptor.Digest
 
 				imageManifestData, err := getProtoImageMeta(imageBuck, manifestDigest)
@@ -625,8 +618,7 @@ func (bdw *BoltDB) SearchTags(ctx context.Context, searchText string,
 				}
 
 				protoImageMeta = imageManifestData
-			} else if descriptor.MediaType == ispec.MediaTypeImageIndex ||
-				compat.IsCompatibleManifestListMediaType(descriptor.MediaType) {
+			} else if compat.IsImageIndexMediaType(descriptor.MediaType) {
 				indexDigest := descriptor.Digest
 
 				imageIndexData, err := getProtoImageMeta(imageBuck, indexDigest)
@@ -697,8 +689,7 @@ func (bdw *BoltDB) FilterTags(ctx context.Context, filterRepoTag mTypes.FilterRe
 					continue
 				}
 
-				if descriptor.MediaType == ispec.MediaTypeImageManifest || //nolint:gocritic
-					compat.IsCompatibleManifestMediaType(descriptor.MediaType) {
+				if compat.IsImageManifestMediaType(descriptor.MediaType) { //nolint:gocritic
 					manifestDigest := descriptor.Digest
 
 					imageManifestData, err := getProtoImageMeta(imageMetaBuck, manifestDigest)
@@ -713,8 +704,7 @@ func (bdw *BoltDB) FilterTags(ctx context.Context, filterRepoTag mTypes.FilterRe
 					if filterFunc(repoMeta, imageMeta) {
 						images = append(images, mConvert.GetFullImageMetaFromProto(tag, protoRepoMeta, imageManifestData))
 					}
-				} else if descriptor.MediaType == ispec.MediaTypeImageIndex ||
-					compat.IsCompatibleManifestListMediaType(descriptor.MediaType) {
+				} else if compat.IsImageIndexMediaType(descriptor.MediaType) {
 					indexDigest := descriptor.Digest
 
 					protoImageIndexMeta, err := getProtoImageMeta(imageMetaBuck, indexDigest)
@@ -835,6 +825,35 @@ func (bdw *BoltDB) GetRepoMeta(ctx context.Context, repo string) (mTypes.RepoMet
 	return mConvert.GetRepoMeta(protoRepoMeta), err
 }
 
+func (bdw *BoltDB) GetRepoSizeWithCandidate(ctx context.Context, repo string, references []string,
+	imageMeta mTypes.ImageMeta,
+) (int64, int64, error) {
+	var current, projected int64
+
+	err := bdw.DB.View(func(transaction *bbolt.Tx) error {
+		repoMeta, metaErr := getProtoRepoMeta(repo, transaction.Bucket([]byte(RepoMetaBuck)))
+		if metaErr != nil && !errors.Is(metaErr, zerr.ErrRepoMetaNotFound) {
+			return metaErr
+		}
+
+		repoBlobsBytes := transaction.Bucket([]byte(RepoBlobsBuck)).Get([]byte(repo))
+		repoBlobs, blobsErr := unmarshalProtoRepoBlobs(repo, repoBlobsBytes)
+		if blobsErr != nil {
+			return blobsErr
+		}
+
+		var projectErr error
+		current, projected, projectErr = common.ProjectRepoSize(repoMeta, repoBlobs, references, imageMeta)
+		if projectErr != nil {
+			return projectErr
+		}
+
+		return nil
+	})
+
+	return current, projected, err
+}
+
 func (bdw *BoltDB) GetFullImageMeta(ctx context.Context, repo string, tag string) (mTypes.FullImageMeta, error) {
 	protoRepoMeta := &proto_go.RepoMeta{}
 	protoImageMeta := &proto_go.ImageMeta{}
@@ -873,8 +892,7 @@ func (bdw *BoltDB) GetFullImageMeta(ctx context.Context, repo string, tag string
 			return err
 		}
 
-		if protoImageMeta.MediaType == ispec.MediaTypeImageIndex ||
-			compat.IsCompatibleManifestListMediaType(protoImageMeta.MediaType) {
+		if compat.IsImageIndexMediaType(protoImageMeta.MediaType) {
 			_, manifestDataList, err := getAllContainedMeta(imageBuck, protoImageMeta)
 			if err != nil {
 				return err
@@ -900,8 +918,7 @@ func (bdw *BoltDB) GetImageMeta(digest godigest.Digest) (mTypes.ImageMeta, error
 			return err
 		}
 
-		if protoImageMeta.MediaType == ispec.MediaTypeImageIndex ||
-			compat.IsCompatibleManifestListMediaType(protoImageMeta.MediaType) {
+		if compat.IsImageIndexMediaType(protoImageMeta.MediaType) {
 			_, manifestDataList, err := getAllContainedMeta(imageBuck, protoImageMeta)
 			if err != nil {
 				return err
@@ -1076,7 +1093,12 @@ func (bdw *BoltDB) DeleteSignature(repo string, signedManifestDigest godigest.Di
 			return zerr.ErrImageMetaNotFound
 		}
 
-		signatureSlice := manifestSignatures.Map[sigMeta.SignatureType]
+		// SetRepoReference pre-creates Signatures[digest] without typed entries; missing
+		// types (e.g. signature layer never parsed into meta) are already cleaned.
+		signatureSlice, found := manifestSignatures.Map[sigMeta.SignatureType]
+		if !found || signatureSlice == nil {
+			return nil
+		}
 
 		newSignatureSlice := make([]*proto_go.SignatureInfo, 0, len(signatureSlice.List))
 
@@ -1347,13 +1369,19 @@ func (bdw *BoltDB) UpdateStatsOnDownload(repo string, reference string) error {
 }
 
 func (bdw *BoltDB) UpdateSignaturesValidity(ctx context.Context, repo string, manifestDigest godigest.Digest) error {
-	err := bdw.DB.Update(func(transaction *bbolt.Tx) error {
-		imgTrustStore := bdw.ImageTrustStore()
+	imgTrustStore := bdw.ImageTrustStore()
 
-		if imgTrustStore == nil {
-			return nil
-		}
+	if imgTrustStore == nil {
+		return nil
+	}
 
+	var (
+		verifyImageMeta mTypes.ImageMeta
+		signatures      *proto_go.ManifestSignatures
+	)
+
+	// Read the signatures, verify them without holding bbolt's writer lock, then write the results back.
+	err := bdw.DB.View(func(transaction *bbolt.Tx) error {
 		// get ManifestData of signed manifest
 		imageMetaBuck := transaction.Bucket([]byte(ImageMetaBuck))
 		idBlob := imageMetaBuck.Get([]byte(manifestDigest))
@@ -1370,7 +1398,8 @@ func (bdw *BoltDB) UpdateSignaturesValidity(ctx context.Context, repo string, ma
 			return err
 		}
 
-		// update signatures with details about validity and author
+		verifyImageMeta = mConvert.GetImageMeta(&protoImageMeta)
+
 		repoBuck := transaction.Bucket([]byte(RepoMetaBuck))
 
 		repoMetaBlob := repoBuck.Get([]byte(repo))
@@ -1383,50 +1412,38 @@ func (bdw *BoltDB) UpdateSignaturesValidity(ctx context.Context, repo string, ma
 			return err
 		}
 
-		manifestSignatures := proto_go.ManifestSignatures{Map: map[string]*proto_go.SignaturesInfo{"": {}}}
+		signatures = protoRepoMeta.Signatures[manifestDigest.String()]
 
-		for sigType, sigs := range protoRepoMeta.Signatures[manifestDigest.String()].Map {
-			if zcommon.IsContextDone(ctx) {
-				return ctx.Err()
-			}
+		return nil
+	})
+	if err != nil || signatures == nil {
+		return err
+	}
 
-			signaturesInfo := []*proto_go.SignatureInfo{}
+	validity, err := common.VerifyManifestSignatures(ctx, imgTrustStore, repo, manifestDigest, verifyImageMeta, signatures,
+		bdw.Log)
+	if err != nil {
+		return err
+	}
 
-			for _, sigInfo := range sigs.List {
-				layersInfo := []*proto_go.LayersInfo{}
+	return bdw.DB.Update(func(transaction *bbolt.Tx) error {
+		repoBuck := transaction.Bucket([]byte(RepoMetaBuck))
 
-				for _, layerInfo := range sigInfo.LayersInfo {
-					author, date, isTrusted, _ := imgTrustStore.VerifySignature(sigType, layerInfo.LayerContent,
-						layerInfo.SignatureKey, manifestDigest, mConvert.GetImageMeta(&protoImageMeta), repo)
-
-					if isTrusted {
-						layerInfo.Signer = author
-					} else {
-						layerInfo.Signer = ""
-					}
-
-					if !date.IsZero() {
-						layerInfo.Date = timestamppb.New(date)
-					}
-
-					layersInfo = append(layersInfo, layerInfo)
-				}
-
-				signaturesInfo = append(signaturesInfo, &proto_go.SignatureInfo{
-					SignatureManifestDigest: sigInfo.SignatureManifestDigest,
-					LayersInfo:              layersInfo,
-				})
-			}
-
-			manifestSignatures.Map[sigType] = &proto_go.SignaturesInfo{List: signaturesInfo}
+		repoMetaBlob := repoBuck.Get([]byte(repo))
+		if len(repoMetaBlob) == 0 {
+			// the repo was removed while its signatures were verified
+			return nil
 		}
 
-		protoRepoMeta.Signatures[manifestDigest.String()] = &manifestSignatures
+		protoRepoMeta, err := unmarshalProtoRepoMeta(repo, repoMetaBlob)
+		if err != nil {
+			return err
+		}
+
+		common.ApplySignaturesValidity(protoRepoMeta.Signatures[manifestDigest.String()], validity)
 
 		return setProtoRepoMeta(protoRepoMeta, repoBuck)
 	})
-
-	return err
 }
 
 func (bdw *BoltDB) RemoveRepoReference(repo, reference string, manifestDigest godigest.Digest) error {
@@ -1493,8 +1510,10 @@ func (bdw *BoltDB) RemoveRepoReference(repo, reference string, manifestDigest go
 			}
 		}
 
-		/* try to find at least one tag pointing to manifestDigest
-		if not found then we can also remove everything related to this digest */
+		// No remaining tag points at this digest. Signatures and referrers are
+		// deleted either way. Statistics stay when reference is a tag, because that
+		// caller left the manifest in the index. They are deleted when reference is
+		// a digest, because the manifest itself is gone.
 		var foundTag bool
 
 		for _, desc := range protoRepoMeta.Tags {
@@ -1504,7 +1523,10 @@ func (bdw *BoltDB) RemoveRepoReference(repo, reference string, manifestDigest go
 		}
 
 		if !foundTag {
-			delete(protoRepoMeta.Statistics, manifestDigest.String())
+			if common.ReferenceIsDigest(reference) {
+				delete(protoRepoMeta.Statistics, manifestDigest.String())
+			}
+
 			delete(protoRepoMeta.Signatures, manifestDigest.String())
 			delete(protoRepoMeta.Referrers, manifestDigest.String())
 		}

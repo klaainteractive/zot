@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -19,6 +20,7 @@ import (
 	glob "github.com/bmatcuk/doublestar/v4"
 	"github.com/go-viper/mapstructure/v2"
 	distspec "github.com/opencontainers/distribution-spec/specs-go"
+	"github.com/regclient/regclient/types/platform"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 
@@ -83,30 +85,14 @@ func newServeCmd(conf *config.Config) *cobra.Command {
 				conf.Storage.FastRestart = &disable
 			}
 
-			ctlr := api.NewController(conf)
-
-			ldapCredentials := ""
-
-			if conf.HTTP.Auth != nil && conf.HTTP.Auth.LDAP != nil {
-				ldapCredentials = conf.HTTP.Auth.LDAP.CredentialsFile
-			}
-			// config reloader
-			hotReloader, err := NewHotReloader(ctlr, args[0], ldapCredentials)
+			ctlr, hotReloader, err := InitController(conf, args[0])
 			if err != nil {
-				ctlr.Log.Error().Err(err).Msg("failed to create a new hot reloader")
-
 				return err
 			}
 
-			hotReloader.Start()
+			defer hotReloader.Stop()
 
-			if err := ctlr.Init(); err != nil {
-				ctlr.Log.Error().Err(err).Msg("failed to init controller")
-
-				return err
-			}
-
-			initShutDownRoutine(ctlr)
+			initShutDownRoutine(ctlr, hotReloader)
 
 			if err := ctlr.Run(); err != nil {
 				logger.Error().Err(err).Msg("failed to start controller, exiting")
@@ -120,6 +106,32 @@ func newServeCmd(conf *config.Config) *cobra.Command {
 		"force a full storage->metaDB reparse on startup, ignoring the fast-restart stamp")
 
 	return serveCmd
+}
+
+// InitController creates a controller, initializes it, then starts the config hot-reloader.
+// On init failure it shuts down the controller and stops the reloader before returning.
+// After a successful return the caller must stop both the controller and the hot reloader.
+func InitController(conf *config.Config, configPath string) (*api.Controller, *HotReloader, error) {
+	ctlr := api.NewController(conf)
+
+	ldapCredentials := ""
+	if conf.HTTP.Auth != nil && conf.HTTP.Auth.LDAP != nil {
+		ldapCredentials = conf.HTTP.Auth.LDAP.CredentialsFile
+	}
+
+	hotReloader := NewHotReloader(ctlr, configPath, ldapCredentials)
+
+	if err := ctlr.Init(); err != nil {
+		hotReloader.Stop()
+		ctlr.Shutdown() //nolint: contextcheck
+		ctlr.Log.Error().Err(err).Msg("failed to init controller")
+
+		return nil, nil, err
+	}
+
+	hotReloader.Start()
+
+	return ctlr, hotReloader, nil
 }
 
 func newScrubCmd(conf *config.Config) *cobra.Command {
@@ -169,6 +181,7 @@ func newScrubCmd(conf *config.Config) *cobra.Command {
 				// server is down
 				ctlr := api.NewController(conf)
 				ctlr.Metrics = monitoring.NewMetricsServer(false, ctlr.Log)
+				defer ctlr.Metrics.Stop()
 
 				if err := ctlr.InitImageStore(); err != nil {
 					return err
@@ -266,6 +279,8 @@ func NewServerRootCmd() *cobra.Command {
 	rootCmd.AddCommand(newSchemaCmd())
 	// "verify-feature"
 	rootCmd.AddCommand(newVerifyFeatureCmd(conf))
+	// "healthcheck"
+	rootCmd.AddCommand(newHealthcheckCmd(conf))
 	// "version"
 	rootCmd.Flags().BoolVarP(&showVersion, "version", "v", false, "show the version and exit")
 
@@ -575,6 +590,22 @@ func validateMetricsConfig(cfg *extconf.ExtensionConfig) error {
 	return nil
 }
 
+func validateEventsConfig(cfg *extconf.ExtensionConfig) error {
+	eventsCfg := cfg.GetEventsConfig()
+	if eventsCfg == nil {
+		return nil
+	}
+
+	// The prefix replaces the leading segment of dot-separated event types,
+	// so it must not create empty segments in the rendered type.
+	prefix := eventsCfg.TypePrefix
+	if strings.HasPrefix(prefix, ".") || strings.HasSuffix(prefix, ".") || strings.Contains(prefix, "..") {
+		return fmt.Errorf("%w: events typePrefix must not contain a leading, trailing or double dot", zerr.ErrBadConfig)
+	}
+
+	return nil
+}
+
 func validateExtensionsConfig(cfg *config.Config, logger zlog.Logger) error {
 	extensionsConfig := cfg.CopyExtensionsConfig()
 	if extensionsConfig != nil && extensionsConfig.Mgmt != nil {
@@ -592,6 +623,48 @@ func validateExtensionsConfig(cfg *config.Config, logger zlog.Logger) error {
 			logger.Error().Err(joinedErr).Msg("invalid metrics config")
 
 			return joinedErr
+		}
+
+		if eventsValErr := validateEventsConfig(extensionsConfig); eventsValErr != nil {
+			logger.Error().Err(eventsValErr).Msg("invalid events config")
+
+			return eventsValErr
+		}
+
+		if extensionsConfig.Search != nil && extensionsConfig.Search.CVE != nil &&
+			extensionsConfig.Search.CVE.Trivy != nil && extensionsConfig.Search.CVE.Trivy.IgnoreFile != "" {
+			ignoreFile := extensionsConfig.Search.CVE.Trivy.IgnoreFile
+
+			file, err := os.Open(ignoreFile)
+			if err != nil {
+				wrappedErr := fmt.Errorf("%w: failed to open Trivy ignore file %q: %w", zerr.ErrBadConfig, ignoreFile, err)
+				logger.Error().Err(wrappedErr).Msg("invalid Trivy ignore file")
+
+				return wrappedErr
+			}
+
+			fileInfo, statErr := file.Stat()
+			closeErr := file.Close()
+			if statErr != nil {
+				wrappedErr := fmt.Errorf("%w: failed to stat Trivy ignore file %q: %w", zerr.ErrBadConfig, ignoreFile, statErr)
+				logger.Error().Err(wrappedErr).Msg("invalid Trivy ignore file")
+
+				return wrappedErr
+			}
+
+			if closeErr != nil {
+				wrappedErr := fmt.Errorf("%w: failed to close Trivy ignore file %q: %w", zerr.ErrBadConfig, ignoreFile, closeErr)
+				logger.Error().Err(wrappedErr).Msg("invalid Trivy ignore file")
+
+				return wrappedErr
+			}
+
+			if !fileInfo.Mode().IsRegular() {
+				wrappedErr := fmt.Errorf("%w: Trivy ignore file %q is not a regular file", zerr.ErrBadConfig, ignoreFile)
+				logger.Error().Err(wrappedErr).Msg("invalid Trivy ignore file")
+
+				return wrappedErr
+			}
 		}
 	}
 
@@ -979,6 +1052,13 @@ func applyDefaultValues(config *config.Config, viperInstance *viper.Viper, logge
 				if regCfg.ResponseHeaderTimeout == 0 {
 					regCfg.ResponseHeaderTimeout = syncConstants.DefaultResponseHeaderTimeout
 				}
+
+				if regCfg.PreserveDigest {
+					logger.Warn().Int("registryIndex", idx).
+						Msg("extensions.sync.registries[].preserveDigest is deprecated and ignored; " +
+							"docker media types are stored as-is when http.compat includes docker2s2, " +
+							"otherwise sync rejects them")
+				}
 			}
 		}
 
@@ -1023,6 +1103,13 @@ func applyDefaultValues(config *config.Config, viperInstance *viper.Viper, logge
 						Msg("using default trivy vulnerability severity sources.")
 
 					config.Extensions.Search.CVE.Trivy.VulnSeveritySources = defaultVulnSeveritySources
+				}
+
+				if config.Extensions.Search.CVE.Trivy.DetectionPriority == "" {
+					defaultDetectionPriority := "precise"
+					logger.Info().Str("detectionPriority", defaultDetectionPriority).Str("component", "config").
+						Msg("using default trivy detection priority.")
+					config.Extensions.Search.CVE.Trivy.DetectionPriority = defaultDetectionPriority
 				}
 			}
 		}
@@ -1680,106 +1767,326 @@ func validateGCRules(retention config.ImageRetention, logger zlog.Logger) error 
 	return nil
 }
 
+// validateRegistryManifestCheckInterval rejects a manifestCheckInterval that cannot take effect.
+// The interval only throttles on-demand manifest checks, so it is meaningless without onDemand.
+func validateRegistryManifestCheckInterval(regCfg syncconf.RegistryConfig) error {
+	if regCfg.ManifestCheckInterval < 0 {
+		return fmt.Errorf("%w: %s", zerr.ErrBadConfig, "manifestCheckInterval cannot be negative")
+	}
+
+	if regCfg.ManifestCheckInterval > 0 && !regCfg.OnDemand {
+		return fmt.Errorf("%w: %s", zerr.ErrBadConfig, "manifestCheckInterval requires onDemand to be enabled")
+	}
+
+	return nil
+}
+
+// validateRegistryOnDemandInBackground rejects onDemandInBackground settings that cannot
+// take effect or conflict with blocking on-demand refresh semantics.
+func validateRegistryOnDemandInBackground(regCfg syncconf.RegistryConfig) error {
+	if !regCfg.IsOnDemandInBackgroundEnabled() {
+		return nil
+	}
+
+	if !regCfg.OnDemand {
+		return fmt.Errorf("%w: %s", zerr.ErrBadConfig, "onDemandInBackground requires onDemand to be enabled")
+	}
+
+	if regCfg.ManifestCheckInterval > 0 {
+		return fmt.Errorf("%w: %s", zerr.ErrBadConfig,
+			"onDemandInBackground is incompatible with manifestCheckInterval")
+	}
+
+	return nil
+}
+
+func validateRegistryPlatforms(regCfg syncconf.RegistryConfig) error {
+	if err := validatePlatformsList(regCfg.Platforms); err != nil {
+		return err
+	}
+
+	for _, content := range regCfg.Content {
+		if content.Platforms == nil {
+			continue
+		}
+
+		if err := validatePlatformsList(*content.Platforms); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func validatePlatformsList(platforms []string) error {
+	for _, platformEntry := range platforms {
+		if platformEntry == "" {
+			// Empty string is intentional: copy index children that have no platform.
+			continue
+		}
+
+		// Rely on regclient platform.Parse (os/arch[/variant]). It ignores slash tokens
+		// beyond the first three rather than rejecting them.
+		if _, err := platform.Parse(platformEntry); err != nil {
+			return fmt.Errorf("%w: invalid platforms entry %q: %w", zerr.ErrBadConfig, platformEntry, err)
+		}
+	}
+
+	return nil
+}
+
 func validateSync(config *config.Config, logger zlog.Logger) error {
 	// check glob patterns in sync config are compilable
 	extensionsConfig := config.CopyExtensionsConfig()
 	// can't check with IsSyncEnabled(), because it can't test invalid sync configs
-	if extensionsConfig != nil && extensionsConfig.Sync != nil && len(extensionsConfig.Sync.Registries) > 0 {
-		for regID, regCfg := range extensionsConfig.Sync.Registries {
-			// check retry options are configured for sync
-			if regCfg.MaxRetries != nil && regCfg.RetryDelay == nil {
-				msg := "retryDelay is required when using maxRetries"
-				logger.Error().Err(zerr.ErrBadConfig).Int("id", regID).Interface("extensions.sync.registries[id]",
-					extensionsConfig.Sync.Registries[regID]).Msg(msg)
+	if extensionsConfig == nil || extensionsConfig.Sync == nil || len(extensionsConfig.Sync.Registries) == 0 {
+		return nil
+	}
 
-				return fmt.Errorf("%w: %s", zerr.ErrBadConfig, msg)
-			}
+	for regID, regCfg := range extensionsConfig.Sync.Registries {
+		if err := validateSyncRegistry(config, regID, regCfg, logger); err != nil {
+			return err
+		}
+	}
 
-			if regCfg.MaxRetryDelay != nil && regCfg.RetryDelay == nil {
-				msg := "retryDelay is required when using maxRetryDelay"
-				logger.Error().Err(zerr.ErrBadConfig).Int("id", regID).Interface("extensions.sync.registries[id]",
-					extensionsConfig.Sync.Registries[regID]).Msg(msg)
+	if err := validateStreamingMaxConcurrentStreams(extensionsConfig.Sync.Registries); err != nil {
+		return err
+	}
 
-				return fmt.Errorf("%w: %s", zerr.ErrBadConfig, msg)
-			}
+	return nil
+}
 
-			if regCfg.MaxRetryDelay != nil && regCfg.RetryDelay != nil &&
-				*regCfg.MaxRetryDelay < *regCfg.RetryDelay {
-				msg := "maxRetryDelay must be greater than or equal to retryDelay"
-				logger.Error().Err(zerr.ErrBadConfig).Int("id", regID).Interface("extensions.sync.registries[id]",
-					extensionsConfig.Sync.Registries[regID]).Msg(msg)
+// validateStreamingMaxConcurrentStreams rejects streaming registries that disagree on
+// maxConcurrentStreams: the shared stream manager takes the first one's, so others would be
+// silently ignored. Unset counts as the default, so [unset, 8] is rejected too.
+func validateStreamingMaxConcurrentStreams(registries []syncconf.RegistryConfig) error {
+	var first *int
 
-				return fmt.Errorf("%w: %s", zerr.ErrBadConfig, msg)
-			}
+	for idx := range registries {
+		regCfg := &registries[idx]
 
-			// check the oauth2 credential helper config is complete and consistent
-			if regCfg.CredentialHelper == "oauth2" {
-				oauth2Config, err := syncconf.OAuth2HelperConfigFromMap(regCfg.Oauth2CredentialHelper)
-				if err == nil {
-					err = oauth2Config.Validate()
-				}
+		if !regCfg.IsStreamEnabled() {
+			continue
+		}
 
-				if err != nil {
-					msg := "invalid oauth2CredentialHelper config"
-					logger.Error().Err(zerr.ErrBadConfig).Int("id", regID).Interface("extensions.sync.registries[id]",
-						extensionsConfig.Sync.Registries[regID]).Msg(msg)
+		effective := syncConstants.DefaultMaxConcurrentStreams
+		if regCfg.MaxConcurrentStreams != nil {
+			effective = *regCfg.MaxConcurrentStreams
+		}
 
-					return fmt.Errorf("%w: %s: %w", zerr.ErrBadConfig, msg, err)
-				}
-			}
+		if first == nil {
+			first = &effective
 
-			// check preserveDigest without compat
-			if regCfg.PreserveDigest && !config.IsCompatEnabled() {
-				msg := "can not use PreserveDigest option without enabling http.Compat"
-				logger.Error().Err(zerr.ErrBadConfig).Int("id", regID).Interface("extensions.sync.registries[id]",
-					extensionsConfig.Sync.Registries[regID]).Msg(msg)
+			continue
+		}
 
-				return fmt.Errorf("%w: %s", zerr.ErrBadConfig, msg)
-			}
+		if effective != *first {
+			return fmt.Errorf("%w: %s", zerr.ErrBadConfig,
+				"maxConcurrentStreams must be the same across every streaming registry - it is a single "+
+					"limit shared by all of them, not set per registry (an unset value counts as its default)")
+		}
+	}
 
-			if regCfg.Content != nil {
-				for _, content := range regCfg.Content {
-					ok := glob.ValidatePattern(content.Prefix)
-					if !ok {
-						msg := "sync prefix could not be compiled"
-						logger.Error().Err(glob.ErrBadPattern).Str("prefix", content.Prefix).Msg(msg)
+	return nil
+}
 
-						return fmt.Errorf("%w: %s: %s", zerr.ErrBadConfig, msg, content.Prefix)
-					}
+// validateRegistryStreamingSyncConfig rejects an unsafe Stream config. Bytes reach clients before
+// the digest is verified, so the upstream must be authenticated: https with TLS verification.
+func validateRegistryStreamingSyncConfig(regCfg syncconf.RegistryConfig) error {
+	if !regCfg.IsStreamEnabled() {
+		return nil
+	}
 
-					if content.Tags != nil && content.Tags.Regex != nil {
-						_, err := regexp.Compile(*content.Tags.Regex)
-						if err != nil {
-							msg := "sync content regex could not be compiled"
-							logger.Error().Err(glob.ErrBadPattern).Str("regex", *content.Tags.Regex).Msg(msg)
+	if !regCfg.OnDemand {
+		return fmt.Errorf("%w: %s", zerr.ErrBadConfig, "stream requires onDemand to be enabled")
+	}
 
-							return fmt.Errorf("%w: %s: %s", zerr.ErrBadConfig, msg, *content.Tags.Regex)
-						}
-					}
+	// The two answer a local miss oppositely: a 404 and a queued sync, versus the upstream manifest.
+	if regCfg.IsOnDemandInBackgroundEnabled() {
+		return fmt.Errorf("%w: %s", zerr.ErrBadConfig, "stream cannot be combined with onDemandInBackground")
+	}
 
-					if content.Tags != nil && content.Tags.ExcludeRegex != nil {
-						_, err := regexp.Compile(*content.Tags.ExcludeRegex)
-						if err != nil {
-							msg := "sync content excludeRegex could not be compiled"
-							logger.Error().Err(glob.ErrBadPattern).Str("excludeRegex", *content.Tags.ExcludeRegex).Msg(msg)
+	if regCfg.MaxRetries != nil || regCfg.RetryDelay != nil {
+		return fmt.Errorf("%w: %s", zerr.ErrBadConfig, "stream cannot be combined with maxRetries/retryDelay")
+	}
 
-							return fmt.Errorf("%w: %s: %s", zerr.ErrBadConfig, msg, *content.Tags.ExcludeRegex)
-						}
-					}
+	if regCfg.TLSVerify != nil && !*regCfg.TLSVerify {
+		return fmt.Errorf("%w: %s", zerr.ErrBadConfig, "stream cannot be combined with tlsVerify: false")
+	}
 
-					if content.StripPrefix && !strings.Contains(content.Prefix, "/*") && content.Destination == "/" {
-						msg := "can not use stripPrefix true and destination '/' without using glob patterns in prefix"
-						logger.Error().Err(zerr.ErrBadConfig).
-							Interface("sync content", content).Str("component", "sync").Msg(msg)
+	// Require an explicit https://host: url.Parse reads a bare "host:port" as scheme "host" with an
+	// empty host, which sync would then use as an empty registry hostname.
+	for _, rawURL := range regCfg.URLs {
+		parsed, err := url.Parse(rawURL)
+		if err != nil || !strings.EqualFold(parsed.Scheme, "https") || parsed.Host == "" {
+			return fmt.Errorf("%w: stream requires https upstream URLs (https://host[:port]), got %q",
+				zerr.ErrBadConfig, rawURL)
+		}
+	}
 
-						return fmt.Errorf("%w: %s", zerr.ErrBadConfig, msg)
-					}
+	if regCfg.MaxConcurrentStreams != nil && *regCfg.MaxConcurrentStreams <= 0 {
+		return fmt.Errorf("%w: %s", zerr.ErrBadConfig, "maxConcurrentStreams must be greater than 0")
+	}
 
-					// check sync config doesn't overlap with retention config
-					validateRetentionSyncOverlaps(config, content, regCfg.URLs, logger)
-				}
+	return nil
+}
+
+func validateSyncRegistry(config *config.Config, regID int, regCfg syncconf.RegistryConfig, logger zlog.Logger) error {
+	if bgValidationErr := validateRegistryOnDemandInBackground(regCfg); bgValidationErr != nil {
+		logger.Error().Err(bgValidationErr).Int("id", regID).Interface("extensions.sync.registries[id]",
+			regCfg).Msg("invalid config for onDemandInBackground")
+
+		return bgValidationErr
+	}
+
+	if intervalValidationErr := validateRegistryManifestCheckInterval(regCfg); intervalValidationErr != nil {
+		logger.Error().Err(intervalValidationErr).Int("id", regID).Interface("extensions.sync.registries[id]",
+			regCfg).Msg("invalid config for manifestCheckInterval")
+
+		return intervalValidationErr
+	}
+
+	if streamValidationErr := validateRegistryStreamingSyncConfig(regCfg); streamValidationErr != nil {
+		logger.Error().Err(streamValidationErr).Int("id", regID).Interface("extensions.sync.registries[id]",
+			regCfg).Msg("invalid config for stream")
+
+		return streamValidationErr
+	}
+
+	// check retry options are configured for sync
+	if regCfg.MaxRetries != nil && regCfg.RetryDelay == nil {
+		msg := "retryDelay is required when using maxRetries"
+		logger.Error().Err(zerr.ErrBadConfig).Int("id", regID).Interface("extensions.sync.registries[id]",
+			regCfg).Msg(msg)
+
+		return fmt.Errorf("%w: %s", zerr.ErrBadConfig, msg)
+	}
+
+	if regCfg.MaxRetryDelay != nil && regCfg.RetryDelay == nil {
+		msg := "retryDelay is required when using maxRetryDelay"
+		logger.Error().Err(zerr.ErrBadConfig).Int("id", regID).Interface("extensions.sync.registries[id]",
+			regCfg).Msg(msg)
+
+		return fmt.Errorf("%w: %s", zerr.ErrBadConfig, msg)
+	}
+
+	if regCfg.MaxRetryDelay != nil && regCfg.RetryDelay != nil &&
+		*regCfg.MaxRetryDelay < *regCfg.RetryDelay {
+		msg := "maxRetryDelay must be greater than or equal to retryDelay"
+		logger.Error().Err(zerr.ErrBadConfig).Int("id", regID).Interface("extensions.sync.registries[id]",
+			regCfg).Msg(msg)
+
+		return fmt.Errorf("%w: %s", zerr.ErrBadConfig, msg)
+	}
+
+	if err := validateSyncReqLimits(regID, regCfg, logger); err != nil {
+		return err
+	}
+
+	if err := validateRegistryPlatforms(regCfg); err != nil {
+		logger.Error().Err(err).Int("id", regID).Interface("extensions.sync.registries[id]",
+			regCfg).Msg("invalid config for platforms")
+
+		return err
+	}
+
+	// check the oauth2 credential helper config is complete and consistent
+	if regCfg.CredentialHelper == "oauth2" {
+		oauth2Config, err := syncconf.OAuth2HelperConfigFromMap(regCfg.Oauth2CredentialHelper)
+		if err == nil {
+			err = oauth2Config.Validate()
+		}
+
+		if err != nil {
+			msg := "invalid oauth2CredentialHelper config"
+			logger.Error().Err(zerr.ErrBadConfig).Int("id", regID).Interface("extensions.sync.registries[id]",
+				regCfg).Msg(msg)
+
+			return fmt.Errorf("%w: %s: %w", zerr.ErrBadConfig, msg, err)
+		}
+	}
+
+	return validateSyncContent(config, regCfg, logger)
+}
+
+// invalidOptionalPositiveFloat reports whether an optional float setting is set to a value that is
+// not a finite number strictly greater than zero. NaN and +/-Inf bypass a naive `*v <= 0` check
+// (NaN compares false against everything), so they are rejected explicitly.
+func invalidOptionalPositiveFloat(value *float64) bool {
+	return value != nil && (*value <= 0 || math.IsNaN(*value) || math.IsInf(*value, 0))
+}
+
+func validateSyncReqLimits(regID int, regCfg syncconf.RegistryConfig, logger zlog.Logger) error {
+	if regCfg.ReqConcurrent != nil && *regCfg.ReqConcurrent <= 0 {
+		msg := "reqConcurrent must be greater than 0"
+		logger.Error().Err(zerr.ErrBadConfig).Int("id", regID).Interface("extensions.sync.registries[id]",
+			regCfg).Msg(msg)
+
+		return fmt.Errorf("%w: %s", zerr.ErrBadConfig, msg)
+	}
+
+	if invalidOptionalPositiveFloat(regCfg.ReqPerSec) {
+		msg := "reqPerSec must be a finite value greater than 0"
+		logger.Error().Err(zerr.ErrBadConfig).Int("id", regID).Interface("extensions.sync.registries[id]",
+			regCfg).Msg(msg)
+
+		return fmt.Errorf("%w: %s", zerr.ErrBadConfig, msg)
+	}
+
+	// Only checked when the pointer is set: 0 silently means DefaultMaxIdleConnsPerHost (2) to Go's
+	// transport, and a negative value would otherwise pass straight through to it. disableHTTP2 with
+	// maxIdleConnsPerHost omitted is unaffected by this check; newClient fills the idle pool itself.
+	if regCfg.MaxIdleConnsPerHost != nil && *regCfg.MaxIdleConnsPerHost <= 0 {
+		msg := "maxIdleConnsPerHost must be greater than 0"
+		logger.Error().Err(zerr.ErrBadConfig).Int("id", regID).Interface("extensions.sync.registries[id]",
+			regCfg).Msg(msg)
+
+		return fmt.Errorf("%w: %s", zerr.ErrBadConfig, msg)
+	}
+
+	return nil
+}
+
+func validateSyncContent(config *config.Config, regCfg syncconf.RegistryConfig, logger zlog.Logger) error {
+	for _, content := range regCfg.Content {
+		ok := glob.ValidatePattern(content.Prefix)
+		if !ok {
+			msg := "sync prefix could not be compiled"
+			logger.Error().Err(glob.ErrBadPattern).Str("prefix", content.Prefix).Msg(msg)
+
+			return fmt.Errorf("%w: %s: %s", zerr.ErrBadConfig, msg, content.Prefix)
+		}
+
+		if content.Tags != nil && content.Tags.Regex != nil {
+			_, err := regexp.Compile(*content.Tags.Regex)
+			if err != nil {
+				msg := "sync content regex could not be compiled"
+				logger.Error().Err(glob.ErrBadPattern).Str("regex", *content.Tags.Regex).Msg(msg)
+
+				return fmt.Errorf("%w: %s: %s", zerr.ErrBadConfig, msg, *content.Tags.Regex)
 			}
 		}
+
+		if content.Tags != nil && content.Tags.ExcludeRegex != nil {
+			_, err := regexp.Compile(*content.Tags.ExcludeRegex)
+			if err != nil {
+				msg := "sync content excludeRegex could not be compiled"
+				logger.Error().Err(glob.ErrBadPattern).Str("excludeRegex", *content.Tags.ExcludeRegex).Msg(msg)
+
+				return fmt.Errorf("%w: %s: %s", zerr.ErrBadConfig, msg, *content.Tags.ExcludeRegex)
+			}
+		}
+
+		if content.StripPrefix && !strings.Contains(content.Prefix, "/*") && content.Destination == "/" {
+			msg := "can not use stripPrefix true and destination '/' without using glob patterns in prefix"
+			logger.Error().Err(zerr.ErrBadConfig).
+				Interface("sync content", content).Str("component", "sync").Msg(msg)
+
+			return fmt.Errorf("%w: %s", zerr.ErrBadConfig, msg)
+		}
+
+		// check sync config doesn't overlap with retention config
+		validateRetentionSyncOverlaps(config, content, regCfg.URLs, logger)
 	}
 
 	return nil

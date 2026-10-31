@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -33,6 +34,7 @@ import (
 	"zotregistry.dev/zot/v2/pkg/storage"
 	"zotregistry.dev/zot/v2/pkg/storage/cache"
 	storageConstants "zotregistry.dev/zot/v2/pkg/storage/constants"
+	"zotregistry.dev/zot/v2/pkg/storage/errclass"
 	"zotregistry.dev/zot/v2/pkg/storage/s3"
 	storageTypes "zotregistry.dev/zot/v2/pkg/storage/types"
 	. "zotregistry.dev/zot/v2/pkg/test/image-utils"
@@ -55,10 +57,25 @@ func cleanupStorage(store driver.StorageDriver, name string) {
 	_ = store.Delete(context.Background(), name)
 }
 
+// emptyIndexContent returns the marshaled bytes of a valid, empty OCI index.json,
+// so mocked GetContentFn hooks can make common.GetIndex succeed instead of hitting
+// ErrRepoBadVersion on an empty/unparseable index.
+func emptyIndexContent() []byte {
+	var index ispec.Index
+	index.SchemaVersion = 2
+
+	content, err := json.Marshal(index)
+	if err != nil {
+		panic(err)
+	}
+
+	return content
+}
+
 func createMockStorage(rootDir string, cacheDir string, dedupe bool, store driver.StorageDriver,
 ) storageTypes.ImageStore {
 	log := log.NewTestLogger()
-	metrics := monitoring.NewMetricsServer(true, log)
+	metrics := monitoring.NewNopMetricServer()
 
 	var cacheDriver storageTypes.Cache
 
@@ -80,10 +97,16 @@ func createMockStorage(rootDir string, cacheDir string, dedupe bool, store drive
 func createMockStorageWithMockCache(rootDir string, store driver.StorageDriver,
 	cacheDriver storageTypes.Cache,
 ) storageTypes.ImageStore {
-	log := log.NewTestLogger()
-	metrics := monitoring.NewMetricsServer(false, log)
+	return createMockStorageWithMockCacheDedupe(rootDir, true, store, cacheDriver)
+}
 
-	il := s3.NewImageStore(rootDir, "", true, false, log, metrics, nil, store, cacheDriver, nil, nil)
+func createMockStorageWithMockCacheDedupe(rootDir string, dedupe bool, store driver.StorageDriver,
+	cacheDriver storageTypes.Cache,
+) storageTypes.ImageStore {
+	log := log.NewTestLogger()
+	metrics := monitoring.NewNopMetricServer()
+
+	il := s3.NewImageStore(rootDir, "", dedupe, false, log, metrics, nil, store, cacheDriver, nil, nil)
 
 	return il
 }
@@ -128,7 +151,7 @@ func createObjectsStore(rootDir string, cacheDir string, dedupe bool) (
 	store := createStoreDriver(rootDir)
 
 	log := log.NewTestLogger()
-	metrics := monitoring.NewMetricsServer(false, log)
+	metrics := monitoring.NewNopMetricServer()
 
 	var cacheDriver storageTypes.Cache
 
@@ -158,7 +181,7 @@ func createObjectsStoreDynamo(rootDir string, cacheDir string, dedupe bool, tabl
 	store := createStoreDriver(rootDir)
 
 	log := log.NewTestLogger()
-	metrics := monitoring.NewMetricsServer(false, log)
+	metrics := monitoring.NewNopMetricServer()
 
 	var cacheDriver storageTypes.Cache
 
@@ -186,7 +209,7 @@ func createObjectsStoreDynamo(rootDir string, cacheDir string, dedupe bool, tabl
 
 func runAndGetScheduler() *scheduler.Scheduler {
 	log := log.NewTestLogger()
-	metrics := monitoring.NewMetricsServer(false, log)
+	metrics := monitoring.NewNopMetricServer()
 	taskScheduler := scheduler.NewScheduler(config.New(), metrics, log)
 	taskScheduler.RateLimit = 50 * time.Millisecond
 
@@ -383,9 +406,9 @@ func TestGetOCIReferrers(t *testing.T) {
 					Size:      int64(mbuflen),
 					Digest:    mdigest,
 				},
-			}
 
-			artifactManifest.SchemaVersion = 2
+				SchemaVersion: 2,
+			}
 
 			manBuf, err := json.Marshal(artifactManifest)
 			So(err, ShouldBeNil)
@@ -489,11 +512,9 @@ func TestNegativeCasesObjectsStorage(t *testing.T) {
 			endpoint := os.Getenv("S3MOCK_ENDPOINT")
 
 			storageDriverParams := config.GlobalStorageConfig{
-				StorageConfig: config.StorageConfig{
-					Dedupe:        true,
-					RootDirectory: t.TempDir(),
-					RemoteCache:   false,
-				},
+				Dedupe:        true,
+				RootDirectory: t.TempDir(),
+				RemoteCache:   false,
 				SubPaths: map[string]config.StorageConfig{
 					"/a": {
 						Dedupe:        true,
@@ -1038,9 +1059,9 @@ func TestS3Dedupe(t *testing.T) {
 					Size:      int64(buflen),
 				},
 			},
-		}
 
-		manifest.SchemaVersion = 2
+			SchemaVersion: 2,
+		}
 		manifestBuf, err := json.Marshal(manifest)
 		So(err, ShouldBeNil)
 
@@ -1119,8 +1140,9 @@ func TestS3Dedupe(t *testing.T) {
 					Size:      int64(buflen),
 				},
 			},
+
+			SchemaVersion: 2,
 		}
-		manifest.SchemaVersion = 2
 		manifestBuf, err = json.Marshal(manifest)
 		So(err, ShouldBeNil)
 
@@ -1300,8 +1322,9 @@ func TestS3Dedupe(t *testing.T) {
 						Size:      int64(buflen),
 					},
 				},
+
+				SchemaVersion: 2,
 			}
-			manifest.SchemaVersion = 2
 			manifestBuf, err = json.Marshal(manifest)
 			So(err, ShouldBeNil)
 
@@ -1475,9 +1498,9 @@ func TestS3Dedupe(t *testing.T) {
 					Size:      int64(buflen),
 				},
 			},
-		}
 
-		manifest.SchemaVersion = 2
+			SchemaVersion: 2,
+		}
 		manifestBuf, err := json.Marshal(manifest)
 		So(err, ShouldBeNil)
 
@@ -1547,8 +1570,9 @@ func TestS3Dedupe(t *testing.T) {
 					Size:      int64(buflen),
 				},
 			},
+
+			SchemaVersion: 2,
 		}
-		manifest.SchemaVersion = 2
 		manifestBuf, err = json.Marshal(manifest)
 		So(err, ShouldBeNil)
 
@@ -1772,9 +1796,9 @@ func TestRebuildDedupeIndex(t *testing.T) {
 					Size:      int64(buflen),
 				},
 			},
-		}
 
-		manifest.SchemaVersion = 2
+			SchemaVersion: 2,
+		}
 		manifestBuf, err := json.Marshal(manifest)
 		So(err, ShouldBeNil)
 
@@ -1851,7 +1875,7 @@ func TestRebuildDedupeIndex(t *testing.T) {
 		Convey("Intrerrupt rebuilding and restart, checking idempotency", func() {
 			for i := range 10 {
 				log := log.NewTestLogger()
-				metrics := monitoring.NewMetricsServer(false, log)
+				metrics := monitoring.NewNopMetricServer()
 				taskScheduler := scheduler.NewScheduler(config.New(), metrics, log)
 				taskScheduler.RateLimit = 1 * time.Millisecond
 
@@ -1893,7 +1917,7 @@ func TestRebuildDedupeIndex(t *testing.T) {
 			// now from dedupe false to true
 			for i := range 10 {
 				log := log.NewTestLogger()
-				metrics := monitoring.NewMetricsServer(false, log)
+				metrics := monitoring.NewNopMetricServer()
 				taskScheduler := scheduler.NewScheduler(config.New(), metrics, log)
 				taskScheduler.RateLimit = 1 * time.Millisecond
 
@@ -2056,30 +2080,6 @@ func TestRebuildDedupeIndex(t *testing.T) {
 			So(err, ShouldBeNil)
 			So(fi2.Size(), ShouldEqual, fi1.Size())
 		})
-	})
-}
-
-func TestNextRepositoryMockStoreDriver(t *testing.T) {
-	testDir := t.TempDir()
-	tdir := t.TempDir()
-
-	// some s3 implementations (eg, digitalocean spaces) will return pathnotfounderror for walk but not list
-	// This code cannot be reliably covered by end to end tests
-	Convey("Trigger PathNotFound error when Walk() is called in GetNextRepository()", t, func() {
-		imgStore := createMockStorage(testDir, tdir, false, &mocks.StorageDriverMock{
-			ListFn: func(ctx context.Context, path string) ([]string, error) {
-				return []string{}, nil
-			},
-			WalkFn: func(ctx context.Context, path string, walkFn driver.WalkFn, options ...func(*driver.WalkOptions)) error {
-				return driver.PathNotFoundError{}
-			},
-		})
-
-		processedRepos := make(map[string]struct{}, 0)
-		processedRepos["testRepo"] = struct{}{}
-		nextRepository, err := imgStore.GetNextRepository(processedRepos)
-		So(err, ShouldBeNil)
-		So(nextRepository, ShouldEqual, "")
 	})
 }
 
@@ -2316,16 +2316,9 @@ func TestRebuildDedupeMockStoreDriver(t *testing.T) {
 
 	Convey("Trigger PutContent() error in dedupeBlobs()", t, func() {
 		tdir := t.TempDir()
+		// Two full copies: the first becomes the origin; linking the second must hit PutContent.
 		imgStore := createMockStorage(testDir, tdir, true, &mocks.StorageDriverMock{
 			StatFn: func(ctx context.Context, path string) (driver.FileInfo, error) {
-				if path == blobPath("path/to", validDigest) {
-					return &mocks.FileInfoMock{
-						SizeFn: func() int64 {
-							return int64(0)
-						},
-					}, nil
-				}
-
 				return &mocks.FileInfoMock{
 					SizeFn: func() int64 {
 						return int64(10)
@@ -2659,6 +2652,623 @@ func TestRebuildDedupeMockStoreDriver(t *testing.T) {
 	})
 }
 
+func dedupeTestBlobPath(repo string, digest godigest.Digest) string {
+	return fmt.Sprintf("%s/%s/%s/%s", repo, ispec.ImageBlobsDir, digest.Algorithm().String(), digest.Encoded())
+}
+
+// mockDedupeSizesDriver tracks object sizes and records paths emptied by Link/PutContent.
+func mockDedupeSizesDriver(sizes map[string]int64, emptied *[]string) *mocks.StorageDriverMock {
+	return &mocks.StorageDriverMock{
+		StatFn: func(ctx context.Context, objectPath string) (driver.FileInfo, error) {
+			size, ok := sizes[objectPath]
+			if !ok {
+				return nil, driver.PathNotFoundError{Path: objectPath}
+			}
+
+			return &mocks.FileInfoMock{
+				SizeFn: func() int64 { return size },
+				PathFn: func() string { return objectPath },
+			}, nil
+		},
+		PutContentFn: func(ctx context.Context, objectPath string, content []byte) error {
+			if len(content) == 0 {
+				*emptied = append(*emptied, objectPath)
+				sizes[objectPath] = 0
+			}
+
+			return nil
+		},
+	}
+}
+
+// mutableCacheOriginMock models PutBlob's "first origin wins" behavior for repair tests.
+func mutableCacheOriginMock(cachedOrigin *string) *mocks.CacheMock {
+	return &mocks.CacheMock{
+		GetAllBlobsFn: func(digest godigest.Digest) ([]string, error) {
+			if *cachedOrigin == "" {
+				return nil, zerr.ErrCacheMiss
+			}
+
+			return []string{*cachedOrigin}, nil
+		},
+		GetBlobFn: func(digest godigest.Digest) (string, error) {
+			if *cachedOrigin == "" {
+				return "", zerr.ErrCacheMiss
+			}
+
+			return *cachedOrigin, nil
+		},
+		DeleteBlobFn: func(digest godigest.Digest, objectPath string) error {
+			if objectPath == *cachedOrigin {
+				*cachedOrigin = ""
+			}
+
+			return nil
+		},
+		PutBlobFn: func(digest godigest.Digest, objectPath string) error {
+			if *cachedOrigin == "" {
+				*cachedOrigin = objectPath
+			}
+
+			return nil
+		},
+	}
+}
+
+func TestDedupeBlobsPreservesOrigin(t *testing.T) {
+	testDir := t.TempDir()
+	validDigest := godigest.FromString("digest")
+	stubPath := dedupeTestBlobPath("a/img", validDigest)
+	originPath := dedupeTestBlobPath("b/img", validDigest)
+
+	const originSize int64 = 42
+
+	Convey("startup dedupe walk must not empty the content-bearing original", t, func() {
+		Convey("stub listed before origin, cache points at origin", func() {
+			sizes := map[string]int64{
+				stubPath:   0,
+				originPath: originSize,
+			}
+			emptied := []string{}
+
+			imgStore := createMockStorageWithMockCache(testDir, mockDedupeSizesDriver(sizes, &emptied),
+				&mocks.CacheMock{
+					GetBlobFn: func(digest godigest.Digest) (string, error) {
+						return originPath, nil
+					},
+				})
+
+			err := imgStore.RunDedupeForDigest(context.TODO(), validDigest, true,
+				[]string{stubPath, originPath})
+			So(err, ShouldBeNil)
+			So(sizes[originPath], ShouldEqual, originSize)
+			So(emptied, ShouldNotContain, originPath)
+		})
+
+		Convey("still replaces a second full copy with a stub", func() {
+			dupPath := dedupeTestBlobPath("c/img", validDigest)
+			sizes := map[string]int64{
+				stubPath:   0,
+				originPath: originSize,
+				dupPath:    originSize,
+			}
+			emptied := []string{}
+
+			imgStore := createMockStorageWithMockCache(testDir, mockDedupeSizesDriver(sizes, &emptied),
+				&mocks.CacheMock{
+					GetBlobFn: func(digest godigest.Digest) (string, error) {
+						return originPath, nil
+					},
+				})
+
+			err := imgStore.RunDedupeForDigest(context.TODO(), validDigest, true,
+				[]string{stubPath, originPath, dupPath})
+			So(err, ShouldBeNil)
+			So(sizes[originPath], ShouldEqual, originSize)
+			So(sizes[dupPath], ShouldEqual, 0)
+			So(emptied, ShouldContain, dupPath)
+			So(emptied, ShouldNotContain, originPath)
+		})
+
+		Convey("full copy between stub and cached origin does not empty the origin", func() {
+			midPath := dedupeTestBlobPath("c/img", validDigest)
+			sizes := map[string]int64{
+				stubPath:   0,
+				midPath:    originSize,
+				originPath: originSize,
+			}
+			emptied := []string{}
+
+			imgStore := createMockStorageWithMockCache(testDir, mockDedupeSizesDriver(sizes, &emptied),
+				&mocks.CacheMock{
+					GetBlobFn: func(digest godigest.Digest) (string, error) {
+						return originPath, nil
+					},
+				})
+
+			err := imgStore.RunDedupeForDigest(context.TODO(), validDigest, true,
+				[]string{stubPath, midPath, originPath})
+			So(err, ShouldBeNil)
+			So(sizes[originPath], ShouldEqual, originSize)
+			So(sizes[midPath], ShouldEqual, 0)
+			So(emptied, ShouldContain, midPath)
+			So(emptied, ShouldNotContain, originPath)
+		})
+
+		Convey("non-PathNotFound stat error on cached origin fails the rebuild", func() {
+			sizes := map[string]int64{
+				stubPath:   0,
+				originPath: originSize,
+			}
+			emptied := []string{}
+			deleteCalls := 0
+			driverMock := mockDedupeSizesDriver(sizes, &emptied)
+			baseStat := driverMock.StatFn
+			driverMock.StatFn = func(ctx context.Context, objectPath string) (driver.FileInfo, error) {
+				// Fail the first Stat (checkCacheBlob) so rebuild must not treat it as a miss.
+				if objectPath == originPath {
+					return nil, errS3
+				}
+
+				return baseStat(ctx, objectPath)
+			}
+
+			imgStore := createMockStorageWithMockCache(testDir, driverMock, &mocks.CacheMock{
+				GetBlobFn: func(digest godigest.Digest) (string, error) {
+					return originPath, nil
+				},
+				DeleteBlobFn: func(digest godigest.Digest, objectPath string) error {
+					deleteCalls++
+
+					return nil
+				},
+			})
+
+			err := imgStore.RunDedupeForDigest(context.TODO(), validDigest, true,
+				[]string{stubPath, originPath})
+			So(err, ShouldNotBeNil)
+			So(deleteCalls, ShouldEqual, 0)
+			So(sizes[originPath], ShouldEqual, originSize)
+			So(emptied, ShouldNotContain, originPath)
+		})
+
+		Convey("transient Stat after checkCacheBlob still fails the rebuild", func() {
+			sizes := map[string]int64{
+				stubPath:   0,
+				originPath: originSize,
+			}
+			originStatCount := 0
+			emptied := []string{}
+			driverMock := mockDedupeSizesDriver(sizes, &emptied)
+			baseStat := driverMock.StatFn
+			driverMock.StatFn = func(ctx context.Context, objectPath string) (driver.FileInfo, error) {
+				if objectPath == originPath {
+					originStatCount++
+					// Succeed for checkCacheBlob; transient error on getOriginalBlob size check.
+					if originStatCount == 2 {
+						return nil, errS3
+					}
+				}
+
+				return baseStat(ctx, objectPath)
+			}
+
+			imgStore := createMockStorageWithMockCache(testDir, driverMock, &mocks.CacheMock{
+				GetBlobFn: func(digest godigest.Digest) (string, error) {
+					return originPath, nil
+				},
+			})
+
+			err := imgStore.RunDedupeForDigest(context.TODO(), validDigest, true,
+				[]string{stubPath, originPath})
+			So(err, ShouldNotBeNil)
+			So(sizes[originPath], ShouldEqual, originSize)
+			So(emptied, ShouldNotContain, originPath)
+		})
+
+		Convey("DeleteBlob error after PathNotFound in checkCacheBlob fails the rebuild", func() {
+			sizes := map[string]int64{
+				stubPath:   0,
+				originPath: originSize,
+			}
+			emptied := []string{}
+			driverMock := mockDedupeSizesDriver(sizes, &emptied)
+			baseStat := driverMock.StatFn
+			driverMock.StatFn = func(ctx context.Context, objectPath string) (driver.FileInfo, error) {
+				if objectPath == originPath {
+					return nil, driver.PathNotFoundError{Path: objectPath}
+				}
+
+				return baseStat(ctx, objectPath)
+			}
+
+			imgStore := createMockStorageWithMockCache(testDir, driverMock, &mocks.CacheMock{
+				GetBlobFn: func(digest godigest.Digest) (string, error) {
+					return originPath, nil
+				},
+				DeleteBlobFn: func(digest godigest.Digest, objectPath string) error {
+					return errS3
+				},
+			})
+
+			err := imgStore.RunDedupeForDigest(context.TODO(), validDigest, true,
+				[]string{stubPath, originPath})
+			So(err, ShouldNotBeNil)
+			So(emptied, ShouldNotContain, originPath)
+		})
+
+		Convey("PathNotFound on checkCacheBlob falls through to disk search", func() {
+			sizes := map[string]int64{
+				stubPath:   0,
+				originPath: originSize,
+			}
+			emptied := []string{}
+			deleteCalls := 0
+			originStatCount := 0
+			driverMock := mockDedupeSizesDriver(sizes, &emptied)
+			baseStat := driverMock.StatFn
+			driverMock.StatFn = func(ctx context.Context, objectPath string) (driver.FileInfo, error) {
+				if objectPath == originPath {
+					originStatCount++
+					// First Stat is checkCacheBlob: missing origin is cleared from cache.
+					if originStatCount == 1 {
+						return nil, driver.PathNotFoundError{Path: objectPath}
+					}
+				}
+
+				return baseStat(ctx, objectPath)
+			}
+
+			cachedOrigin := originPath
+			imgStore := createMockStorageWithMockCache(testDir, driverMock, &mocks.CacheMock{
+				GetBlobFn: func(digest godigest.Digest) (string, error) {
+					if cachedOrigin == "" {
+						return "", zerr.ErrCacheMiss
+					}
+
+					return cachedOrigin, nil
+				},
+				DeleteBlobFn: func(digest godigest.Digest, objectPath string) error {
+					deleteCalls++
+					if objectPath == cachedOrigin {
+						cachedOrigin = ""
+					}
+
+					return nil
+				},
+				PutBlobFn: func(digest godigest.Digest, objectPath string) error {
+					if cachedOrigin == "" {
+						cachedOrigin = objectPath
+					}
+
+					return nil
+				},
+			})
+
+			err := imgStore.RunDedupeForDigest(context.TODO(), validDigest, true,
+				[]string{stubPath, originPath})
+			So(err, ShouldBeNil)
+			So(deleteCalls, ShouldEqual, 1)
+			So(sizes[originPath], ShouldEqual, originSize)
+			So(emptied, ShouldNotContain, originPath)
+			So(cachedOrigin, ShouldEqual, originPath)
+		})
+
+		Convey("PathNotFound on cached origin validation falls through to disk search", func() {
+			sizes := map[string]int64{
+				stubPath:   0,
+				originPath: originSize,
+			}
+			originStatCount := 0
+			emptied := []string{}
+			driverMock := mockDedupeSizesDriver(sizes, &emptied)
+			baseStat := driverMock.StatFn
+			driverMock.StatFn = func(ctx context.Context, objectPath string) (driver.FileInfo, error) {
+				if objectPath == originPath {
+					originStatCount++
+					// Succeed for checkCacheBlob; PathNotFound on getOriginalBlob size check.
+					if originStatCount == 2 {
+						return nil, driver.PathNotFoundError{Path: objectPath}
+					}
+				}
+
+				return baseStat(ctx, objectPath)
+			}
+
+			imgStore := createMockStorageWithMockCache(testDir, driverMock, &mocks.CacheMock{
+				GetBlobFn: func(digest godigest.Digest) (string, error) {
+					return originPath, nil
+				},
+			})
+
+			err := imgStore.RunDedupeForDigest(context.TODO(), validDigest, true,
+				[]string{stubPath, originPath})
+			So(err, ShouldBeNil)
+			So(sizes[originPath], ShouldEqual, originSize)
+			So(emptied, ShouldNotContain, originPath)
+		})
+
+		Convey("remote rebuild does not rewrite existing stubs", func() {
+			sizes := map[string]int64{
+				stubPath:   0,
+				originPath: originSize,
+			}
+			emptied := []string{}
+
+			imgStore := createMockStorageWithMockCache(testDir, mockDedupeSizesDriver(sizes, &emptied),
+				&mocks.CacheMock{
+					GetBlobFn: func(digest godigest.Digest) (string, error) {
+						return originPath, nil
+					},
+				})
+
+			err := imgStore.RunDedupeForDigest(context.TODO(), validDigest, true,
+				[]string{stubPath, originPath})
+			So(err, ShouldBeNil)
+			So(sizes[originPath], ShouldEqual, originSize)
+			// Size-0 remote stubs are already placeholders; rebuild only repairs cache.
+			So(emptied, ShouldNotContain, stubPath)
+			So(emptied, ShouldNotContain, originPath)
+		})
+
+		Convey("genuine empty-content digest origin is kept", func() {
+			emptyDigest := godigest.FromBytes(nil)
+			emptyStub := dedupeTestBlobPath("a/img", emptyDigest)
+			emptyOrigin := dedupeTestBlobPath("b/img", emptyDigest)
+
+			imgStore := createMockStorageWithMockCache(testDir, &mocks.StorageDriverMock{
+				StatFn: func(ctx context.Context, objectPath string) (driver.FileInfo, error) {
+					return &mocks.FileInfoMock{
+						SizeFn: func() int64 { return 0 },
+						PathFn: func() string { return objectPath },
+					}, nil
+				},
+				PutContentFn: func(ctx context.Context, objectPath string, content []byte) error {
+					t.Fatalf("Link/PutContent must not run for empty digests, got path %s", objectPath)
+
+					return nil
+				},
+			}, &mocks.CacheMock{
+				GetBlobFn: func(digest godigest.Digest) (string, error) {
+					return emptyOrigin, nil
+				},
+			})
+
+			err := imgStore.RunDedupeForDigest(context.TODO(), emptyDigest, true,
+				[]string{emptyStub, emptyOrigin})
+			So(err, ShouldBeNil)
+		})
+
+		Convey("genuine empty-content digest is found on disk after cache miss", func() {
+			emptyDigest := godigest.FromBytes(nil)
+			emptyStub := dedupeTestBlobPath("a/img", emptyDigest)
+			emptyOrigin := dedupeTestBlobPath("b/img", emptyDigest)
+			cachedOrigin := ""
+
+			imgStore := createMockStorageWithMockCache(testDir, &mocks.StorageDriverMock{
+				StatFn: func(ctx context.Context, objectPath string) (driver.FileInfo, error) {
+					return &mocks.FileInfoMock{
+						SizeFn: func() int64 { return 0 },
+						PathFn: func() string { return objectPath },
+					}, nil
+				},
+				PutContentFn: func(ctx context.Context, objectPath string, content []byte) error {
+					t.Fatalf("Link/PutContent must not run for empty digests, got path %s", objectPath)
+
+					return nil
+				},
+			}, mutableCacheOriginMock(&cachedOrigin))
+
+			err := imgStore.RunDedupeForDigest(context.TODO(), emptyDigest, true,
+				[]string{emptyStub, emptyOrigin})
+			So(err, ShouldBeNil)
+			So(cachedOrigin, ShouldEqual, emptyStub)
+		})
+	})
+}
+
+func TestCopyBlobLinkFailure(t *testing.T) {
+	testDir := t.TempDir()
+	originPath := path.Join(testDir, "origin-blob")
+
+	Convey("copyBlob Link failure when cache origin exists", t, func() {
+		imgStore := createMockStorageWithMockCache(testDir, &mocks.StorageDriverMock{
+			StatFn: func(ctx context.Context, objectPath string) (driver.FileInfo, error) {
+				if objectPath == originPath {
+					return &mocks.FileInfoMock{
+						SizeFn: func() int64 { return 42 },
+						PathFn: func() string { return objectPath },
+					}, nil
+				}
+
+				return nil, driver.PathNotFoundError{Path: objectPath}
+			},
+			PutContentFn: func(ctx context.Context, objectPath string, content []byte) error {
+				return errS3
+			},
+		}, &mocks.CacheMock{
+			GetBlobFn: func(digest godigest.Digest) (string, error) {
+				return originPath, nil
+			},
+		})
+
+		digest := godigest.FromString("copyblob-link-fail")
+		_, _, err := imgStore.CheckBlob(context.Background(), "repo", digest)
+		So(err, ShouldNotBeNil)
+		// Link/PutContent failure is a storage I/O error, not blob absence.
+		So(errors.Is(err, zerr.ErrStorageTransient), ShouldBeTrue)
+		So(errors.Is(err, zerr.ErrBlobNotFound), ShouldBeFalse)
+	})
+}
+
+func TestDedupeBlobsRepairsCacheOrigin(t *testing.T) {
+	testDir := t.TempDir()
+	validDigest := godigest.FromString("digest")
+	stubPath := dedupeTestBlobPath("a/img", validDigest)
+	originPath := dedupeTestBlobPath("b/img", validDigest)
+
+	const originSize int64 = 42
+
+	Convey("dedupe rebuild repairs stale cache origin metadata", t, func() {
+		Convey("stub listed before origin, stale cache points at stub", func() {
+			sizes := map[string]int64{
+				stubPath:   0,
+				originPath: originSize,
+			}
+			emptied := []string{}
+			cachedOrigin := stubPath
+
+			imgStore := createMockStorageWithMockCache(testDir, mockDedupeSizesDriver(sizes, &emptied),
+				mutableCacheOriginMock(&cachedOrigin))
+
+			err := imgStore.RunDedupeForDigest(context.TODO(), validDigest, true,
+				[]string{stubPath, originPath})
+			So(err, ShouldBeNil)
+			So(sizes[originPath], ShouldEqual, originSize)
+			So(emptied, ShouldNotContain, originPath)
+			So(cachedOrigin, ShouldEqual, originPath)
+		})
+
+		Convey("origin listed before stub still repairs stale cache origin", func() {
+			sizes := map[string]int64{
+				stubPath:   0,
+				originPath: originSize,
+			}
+			emptied := []string{}
+			cachedOrigin := stubPath
+
+			imgStore := createMockStorageWithMockCache(testDir, mockDedupeSizesDriver(sizes, &emptied),
+				mutableCacheOriginMock(&cachedOrigin))
+
+			err := imgStore.RunDedupeForDigest(context.TODO(), validDigest, true,
+				[]string{originPath, stubPath})
+			So(err, ShouldBeNil)
+			So(sizes[originPath], ShouldEqual, originSize)
+			So(emptied, ShouldNotContain, originPath)
+			So(cachedOrigin, ShouldEqual, originPath)
+		})
+
+		Convey("cache backend errors during origin repair are not treated as misses", func() {
+			sizes := map[string]int64{
+				stubPath:   0,
+				originPath: originSize,
+			}
+			putCalls := 0
+			getBlobCalls := 0
+			emptied := []string{}
+
+			imgStore := createMockStorageWithMockCache(testDir, mockDedupeSizesDriver(sizes, &emptied),
+				&mocks.CacheMock{
+					GetBlobFn: func(digest godigest.Digest) (string, error) {
+						getBlobCalls++
+						// checkCacheBlob succeeds; SetOrigin must not treat
+						// a later backend failure as ErrCacheMiss.
+						if getBlobCalls == 1 {
+							return stubPath, nil
+						}
+
+						return "", errS3
+					},
+					PutBlobFn: func(digest godigest.Digest, objectPath string) error {
+						putCalls++
+
+						return nil
+					},
+				})
+
+			err := imgStore.RunDedupeForDigest(context.TODO(), validDigest, true,
+				[]string{stubPath, originPath})
+			So(err, ShouldNotBeNil)
+			So(putCalls, ShouldEqual, 0)
+		})
+
+		Convey("does not delete duplicate cache entries when origin already matches", func() {
+			sizes := map[string]int64{
+				stubPath:   0,
+				originPath: originSize,
+			}
+			emptied := []string{}
+			deleteCalls := 0
+
+			imgStore := createMockStorageWithMockCache(testDir, mockDedupeSizesDriver(sizes, &emptied),
+				&mocks.CacheMock{
+					GetBlobFn: func(digest godigest.Digest) (string, error) {
+						return originPath, nil
+					},
+					DeleteBlobFn: func(digest godigest.Digest, objectPath string) error {
+						deleteCalls++
+
+						return nil
+					},
+				})
+
+			err := imgStore.RunDedupeForDigest(context.TODO(), validDigest, true,
+				[]string{stubPath, originPath})
+			So(err, ShouldBeNil)
+			So(deleteCalls, ShouldEqual, 0)
+			So(sizes[originPath], ShouldEqual, originSize)
+		})
+
+		Convey("repairs cache origin when many stale entries are present", func() {
+			stalePaths := make([]string, 40)
+			for i := range stalePaths {
+				stalePaths[i] = dedupeTestBlobPath(fmt.Sprintf("stale%d/img", i), validDigest)
+			}
+
+			sizes := map[string]int64{
+				stubPath:   0,
+				originPath: originSize,
+			}
+			for _, p := range stalePaths {
+				sizes[p] = 0
+			}
+
+			emptied := []string{}
+
+			cachedPaths := append([]string{}, stalePaths...)
+
+			imgStore := createMockStorageWithMockCache(testDir, mockDedupeSizesDriver(sizes, &emptied),
+				&mocks.CacheMock{
+					GetBlobFn: func(digest godigest.Digest) (string, error) {
+						if len(cachedPaths) == 0 {
+							return "", zerr.ErrCacheMiss
+						}
+
+						return cachedPaths[0], nil
+					},
+					DeleteBlobFn: func(digest godigest.Digest, objectPath string) error {
+						for i, p := range cachedPaths {
+							if p == objectPath {
+								cachedPaths = append(cachedPaths[:i], cachedPaths[i+1:]...)
+
+								break
+							}
+						}
+
+						return nil
+					},
+					PutBlobFn: func(digest godigest.Digest, objectPath string) error {
+						if slices.Contains(cachedPaths, objectPath) {
+							return nil
+						}
+
+						cachedPaths = append([]string{objectPath}, cachedPaths...)
+
+						return nil
+					},
+				})
+
+			err := imgStore.RunDedupeForDigest(context.TODO(), validDigest, true,
+				[]string{stubPath, originPath})
+			So(err, ShouldBeNil)
+			So(sizes[originPath], ShouldEqual, originSize)
+			So(emptied, ShouldNotContain, originPath)
+			So(len(cachedPaths), ShouldBeGreaterThan, 0)
+			So(cachedPaths[0], ShouldEqual, originPath)
+		})
+	})
+}
+
 func TestS3PullRange(t *testing.T) {
 	tskip.SkipS3(t)
 
@@ -2903,8 +3513,9 @@ func TestS3ManifestImageIndex(t *testing.T) {
 					Size:      int64(bsize1),
 				},
 			},
+
+			SchemaVersion: 2,
 		}
-		manifest.SchemaVersion = 2
 		content, err = json.Marshal(manifest)
 		So(err, ShouldBeNil)
 
@@ -2949,8 +3560,9 @@ func TestS3ManifestImageIndex(t *testing.T) {
 					Size:      int64(bsize1),
 				},
 			},
+
+			SchemaVersion: 2,
 		}
-		manifest.SchemaVersion = 2
 		content, err = json.Marshal(manifest)
 		So(err, ShouldBeNil)
 
@@ -2994,8 +3606,9 @@ func TestS3ManifestImageIndex(t *testing.T) {
 						Size:      int64(bsize1),
 					},
 				},
+
+				SchemaVersion: 2,
 			}
-			manifest.SchemaVersion = 2
 			content, err = json.Marshal(manifest)
 			So(err, ShouldBeNil)
 
@@ -3064,8 +3677,9 @@ func TestS3ManifestImageIndex(t *testing.T) {
 						Size:      int64(bsize1),
 					},
 				},
+
+				SchemaVersion: 2,
 			}
-			manifest.SchemaVersion = 2
 			content, err = json.Marshal(manifest)
 			So(err, ShouldBeNil)
 
@@ -3228,8 +3842,9 @@ func TestS3ManifestImageIndex(t *testing.T) {
 							Size:      int64(len(content)),
 						},
 					},
+
+					SchemaVersion: 2,
 				}
-				manifest.SchemaVersion = 2
 				content, err = json.Marshal(manifest)
 				So(err, ShouldBeNil)
 
@@ -3379,8 +3994,9 @@ func TestS3ManifestImageIndex(t *testing.T) {
 					Size:      int64(bsize),
 				},
 			},
+
+			SchemaVersion: 2,
 		}
-		manifest.SchemaVersion = 2
 		content, err = json.Marshal(manifest)
 		So(err, ShouldBeNil)
 
@@ -3416,8 +4032,9 @@ func TestS3ManifestImageIndex(t *testing.T) {
 					Size:      int64(bsize),
 				},
 			},
+
+			SchemaVersion: 2,
 		}
-		manifest.SchemaVersion = 2
 		content, err = json.Marshal(manifest)
 		So(err, ShouldBeNil)
 
@@ -3465,6 +4082,191 @@ func TestS3ManifestImageIndex(t *testing.T) {
 	})
 }
 
+func TestDedupeBlobOriginStatClasses(t *testing.T) {
+	Convey("Transient origin Stat does not DeleteBlob", t, func() {
+		staleOrigin := "/repo-a/blobs/sha256/deadbeef"
+		deleted := false
+
+		imgStore := createMockStorageWithMockCache("root", &mocks.StorageDriverMock{
+			StatFn: func(ctx context.Context, path string) (driver.FileInfo, error) {
+				if path == staleOrigin {
+					return nil, errclass.MarkTransient(errors.New("stat blip")) //nolint:err113 // test
+				}
+
+				return &mocks.FileInfoMock{}, nil
+			},
+		}, mocks.CacheMock{
+			GetBlobFn: func(digest godigest.Digest) (string, error) {
+				return staleOrigin, nil
+			},
+			DeleteBlobFn: func(digest godigest.Digest, path string) error {
+				deleted = true
+
+				return nil
+			},
+			UsesRelativePathsFn: func() bool { return false },
+		})
+
+		digest := godigest.NewDigestFromEncoded(godigest.SHA256, "digest")
+		err := imgStore.DedupeBlob("/uploads/src", digest, "repo-b", "/repo-b/blobs/sha256/digest")
+		So(errors.Is(err, zerr.ErrStorageTransient), ShouldBeTrue)
+		So(deleted, ShouldBeFalse)
+	})
+
+	Convey("Missing origin Stat still heals the cache", t, func() {
+		staleOrigin := "/repo-a/blobs/sha256/deadbeef"
+		deleted := false
+		moved := false
+
+		imgStore := createMockStorageWithMockCache("root", &mocks.StorageDriverMock{
+			StatFn: func(ctx context.Context, path string) (driver.FileInfo, error) {
+				if path == staleOrigin {
+					return nil, driver.PathNotFoundError{Path: path}
+				}
+
+				return &mocks.FileInfoMock{}, nil
+			},
+			MoveFn: func(ctx context.Context, sourcePath, destPath string) error {
+				moved = true
+
+				return nil
+			},
+		}, mocks.CacheMock{
+			GetBlobFn: func(digest godigest.Digest) (string, error) {
+				if deleted {
+					return "", zerr.ErrCacheMiss
+				}
+
+				return staleOrigin, nil
+			},
+			DeleteBlobFn: func(digest godigest.Digest, path string) error {
+				deleted = true
+
+				return nil
+			},
+			PutBlobFn: func(digest godigest.Digest, path string) error {
+				return nil
+			},
+			UsesRelativePathsFn: func() bool { return false },
+		})
+
+		digest := godigest.NewDigestFromEncoded(godigest.SHA256, "digest")
+		err := imgStore.DedupeBlob("/uploads/src", digest, "repo-b", "/repo-b/blobs/sha256/digest")
+		So(err, ShouldBeNil)
+		So(deleted, ShouldBeTrue)
+		So(moved, ShouldBeTrue)
+	})
+}
+
+func TestDedupeBlobRemoteCacheRace(t *testing.T) {
+	Convey("concurrent DeleteBlob cache miss is retried as a miss", t, func() {
+		// Scale-out Redis: two nodes Stat a phantom/stale origin, both DeleteBlob;
+		// the second DeleteBlob sees ErrCacheMiss. That must retry as a cache miss,
+		// not fail the upload with HTTP 500.
+		staleOrigin := "/repo-a/blobs/sha256/deadbeef"
+		getCalls := 0
+		moved := false
+		putPaths := []string{}
+
+		imgStore := createMockStorageWithMockCache("root", &mocks.StorageDriverMock{
+			StatFn: func(ctx context.Context, path string) (driver.FileInfo, error) {
+				if path == staleOrigin {
+					return nil, driver.PathNotFoundError{Path: path}
+				}
+
+				return &mocks.FileInfoMock{}, nil
+			},
+			MoveFn: func(ctx context.Context, sourcePath, destPath string) error {
+				moved = true
+
+				return nil
+			},
+		}, mocks.CacheMock{
+			GetBlobFn: func(digest godigest.Digest) (string, error) {
+				getCalls++
+				if getCalls == 1 {
+					return staleOrigin, nil
+				}
+
+				return "", zerr.ErrCacheMiss
+			},
+			DeleteBlobFn: func(digest godigest.Digest, path string) error {
+				So(path, ShouldEqual, staleOrigin)
+
+				return zerr.ErrCacheMiss
+			},
+			PutBlobFn: func(digest godigest.Digest, path string) error {
+				putPaths = append(putPaths, path)
+
+				return nil
+			},
+			UsesRelativePathsFn: func() bool { return false },
+		})
+
+		digest := godigest.NewDigestFromEncoded(godigest.SHA256, "digest")
+		err := imgStore.DedupeBlob("/uploads/src", digest, "repo-b", "/repo-b/blobs/sha256/digest")
+		So(err, ShouldBeNil)
+		So(moved, ShouldBeTrue)
+		So(putPaths, ShouldResemble, []string{"/repo-b/blobs/sha256/digest"})
+		So(getCalls, ShouldBeGreaterThanOrEqualTo, 2)
+	})
+
+	Convey("first digest writer moves before publishing cache origin", t, func() {
+		var sequence []string
+
+		imgStore := createMockStorageWithMockCache("root", &mocks.StorageDriverMock{
+			MoveFn: func(ctx context.Context, sourcePath, destPath string) error {
+				sequence = append(sequence, "move:"+destPath)
+
+				return nil
+			},
+		}, mocks.CacheMock{
+			GetBlobFn: func(digest godigest.Digest) (string, error) {
+				return "", zerr.ErrCacheMiss
+			},
+			PutBlobFn: func(digest godigest.Digest, path string) error {
+				sequence = append(sequence, "put:"+path)
+
+				return nil
+			},
+			UsesRelativePathsFn: func() bool { return false },
+		})
+
+		digest := godigest.NewDigestFromEncoded(godigest.SHA256, "digest")
+		err := imgStore.DedupeBlob("/uploads/src", digest, "repo", "/repo/blobs/sha256/digest")
+		So(err, ShouldBeNil)
+		So(sequence, ShouldResemble, []string{
+			"move:/repo/blobs/sha256/digest",
+			"put:/repo/blobs/sha256/digest",
+		})
+	})
+
+	Convey("PutBlob failure after Move still commits the upload", t, func() {
+		moved := false
+
+		imgStore := createMockStorageWithMockCache("root", &mocks.StorageDriverMock{
+			MoveFn: func(ctx context.Context, sourcePath, destPath string) error {
+				moved = true
+
+				return nil
+			},
+		}, mocks.CacheMock{
+			GetBlobFn: func(digest godigest.Digest) (string, error) {
+				return "", zerr.ErrCacheMiss
+			},
+			PutBlobFn: func(digest godigest.Digest, path string) error {
+				return errCache
+			},
+			UsesRelativePathsFn: func() bool { return false },
+		})
+
+		digest := godigest.NewDigestFromEncoded(godigest.SHA256, "digest")
+		err := imgStore.DedupeBlob("/uploads/src", digest, "repo", "/repo/blobs/sha256/digest")
+		So(err, ShouldBeNil)
+		So(moved, ShouldBeTrue)
+	})
+}
+
 func TestS3DedupeErr(t *testing.T) {
 	tskip.SkipS3(t)
 
@@ -3488,9 +4290,9 @@ func TestS3DedupeErr(t *testing.T) {
 		err = os.Remove(path.Join(tdir, storageConstants.BoltdbName+storageConstants.DBExtensionName))
 		digest := godigest.NewDigestFromEncoded(godigest.SHA256, "digest")
 
-		// trigger unable to insert blob record
+		// Empty dst makes PutBlob fail after Move; the blob is treated as committed.
 		err := imgStore.DedupeBlob("", digest, "", "")
-		So(err, ShouldNotBeNil)
+		So(err, ShouldBeNil)
 
 		imgStore = createMockStorage(testDir, tdir, true, &mocks.StorageDriverMock{
 			MoveFn: func(ctx context.Context, sourcePath string, destPath string) error {
@@ -3537,8 +4339,9 @@ func TestS3DedupeErr(t *testing.T) {
 			PutContentFn: func(ctx context.Context, path string, content []byte) error {
 				return errS3
 			},
+			// a blob with content at whatever path is asked, so that SameFile tells copies apart
 			StatFn: func(ctx context.Context, path string) (driver.FileInfo, error) {
-				return nil, nil //nolint:nilnil
+				return driver.FileInfoInternal{FileInfoFields: driver.FileInfoFields{Path: path, Size: 10}}, nil
 			},
 		})
 
@@ -3553,8 +4356,9 @@ func TestS3DedupeErr(t *testing.T) {
 	Convey("Test DedupeBlob - error on cache.PutBlob()", t, func(c C) {
 		tdir := t.TempDir()
 		imgStore = createMockStorage(testDir, tdir, true, &mocks.StorageDriverMock{
+			// a blob with content at whatever path is asked, so that SameFile tells copies apart
 			StatFn: func(ctx context.Context, path string) (driver.FileInfo, error) {
-				return nil, nil //nolint:nilnil
+				return driver.FileInfoInternal{FileInfoFields: driver.FileInfoFields{Path: path, Size: 10}}, nil
 			},
 		})
 
@@ -3572,8 +4376,9 @@ func TestS3DedupeErr(t *testing.T) {
 			DeleteFn: func(ctx context.Context, path string) error {
 				return errS3
 			},
+			// a blob with content at whatever path is asked, so that SameFile tells copies apart
 			StatFn: func(ctx context.Context, path string) (driver.FileInfo, error) {
-				return nil, nil //nolint:nilnil
+				return driver.FileInfoInternal{FileInfoFields: driver.FileInfoFields{Path: path, Size: 10}}, nil
 			},
 		})
 
@@ -3681,7 +4486,34 @@ func TestS3DedupeErr(t *testing.T) {
 					return driver.FileInfoInternal{}, driver.PathNotFoundError{}
 				}
 
-				return driver.FileInfoInternal{}, nil
+				// Only the surviving cache origin holds content. The repo-local
+				// blob path must stay a zero-size placeholder so GetBlob still
+				// walks the cache (and fails while origin is missing).
+				if strings.Contains(path, "repo2/dst2") {
+					return &mocks.FileInfoMock{
+						SizeFn: func() int64 { return 1 },
+						PathFn: func() string { return path },
+					}, nil
+				}
+
+				return &mocks.FileInfoMock{
+					SizeFn: func() int64 { return 0 },
+					PathFn: func() string { return path },
+				}, nil
+			},
+			GetContentFn: func(ctx context.Context, path string) ([]byte, error) {
+				if strings.Contains(path, "repo2/dst2") {
+					return []byte{0x1}, nil
+				}
+
+				return []byte{}, nil
+			},
+			ReaderFn: func(ctx context.Context, path string, offset int64) (io.ReadCloser, error) {
+				if strings.Contains(path, "repo2/dst2") {
+					return io.NopCloser(strings.NewReader("\x01")), nil
+				}
+
+				return io.NopCloser(strings.NewReader("")), nil
 			},
 		})
 
@@ -3695,9 +4527,8 @@ func TestS3DedupeErr(t *testing.T) {
 		_, _, _, err = imgStore.StatBlob("repo2", digest)
 		So(err, ShouldBeNil)
 
-		// it errors out because of bad range, as mock store returns a driver.FileInfo with 0 size
-		_, _, _, err = imgStore.GetBlobPartial("repo2", digest, "application/vnd.oci.image.layer.v1.tar+gzip", 0, 1)
-		So(err, ShouldNotBeNil)
+		_, _, _, err = imgStore.GetBlobPartial("repo2", digest, "application/vnd.oci.image.layer.v1.tar+gzip", 0, 0)
+		So(err, ShouldBeNil)
 	})
 
 	Convey("Test GetBlob() - error on store.Reader()", t, func(c C) {
@@ -3812,7 +4643,11 @@ func TestS3DedupeErr(t *testing.T) {
 			},
 			StatFn: func(ctx context.Context, path string) (driver.FileInfo, error) {
 				if path != blobPath {
-					return nil, errS3
+					// Mock driver skips formatErr; classify Missing so CheckBlob can
+					// heal from the cache. A bare/unclassified error is Transient and
+					// must not Link.
+					return nil, errclass.MarkMissing(
+						driver.PathNotFoundError{Path: path, DriverName: "s3"})
 				}
 
 				return &mocks.FileInfoMock{}, nil
@@ -3855,8 +4690,8 @@ func TestS3DedupeErr(t *testing.T) {
 }
 
 // TestS3DedupeZeroSizeBlob covers the zero-size blob branches in CheckBlob and
-// StatBlob (via originalBlobInfo) for the S3+dedupe configuration.  Four
-// sub-cases are exercised using mock storage so no real S3 endpoint is needed:
+// StatBlob (via originalBlobInfo) for the S3+dedupe configuration.  Sub-cases
+// are exercised using mock storage so no real S3 endpoint is needed:
 //
 //  1. A genuine empty blob (digest == hash-of-zero-bytes) is short-circuited:
 //     CheckBlob returns (true, 0, nil) and the cache is never consulted.
@@ -3867,6 +4702,9 @@ func TestS3DedupeErr(t *testing.T) {
 //     is resolved via the cache: CheckBlob falls through to the cache lookup
 //     and returns the real blob size.
 //  4. The same deduplication-placeholder path exercised through StatBlob.
+//  5. A cache "origin" that is itself empty must not be served as HTTP 200 for
+//     a non-empty digest (dedupe on or off) — StatBlob/GetBlob/CheckBlob return
+//     ErrBlobNotFound instead.
 func TestS3DedupeZeroSizeBlob(t *testing.T) {
 	testDir := "/oci-repo-test/dedupe-zero-size"
 
@@ -3959,14 +4797,22 @@ func TestS3DedupeZeroSizeBlob(t *testing.T) {
 		nonEmptyDigest := godigest.FromBytes(nonEmptyContent)
 		dstRecord := testDir + "/dedupe-src/blobs/sha256/real-blob"
 		realSize := int64(len(nonEmptyContent))
+		entryModTime := time.Now().Add(-time.Minute)
+		originalModTime := time.Now().Add(-7 * 24 * time.Hour)
 
 		imgStore := createMockStorageWithMockCache(testDir, &mocks.StorageDriverMock{
 			StatFn: func(ctx context.Context, path string) (driver.FileInfo, error) {
 				if path == dstRecord {
-					return &mocks.FileInfoMock{SizeFn: func() int64 { return realSize }}, nil
+					return &mocks.FileInfoMock{
+						SizeFn:    func() int64 { return realSize },
+						ModTimeFn: func() time.Time { return originalModTime },
+					}, nil
 				}
 
-				return &mocks.FileInfoMock{SizeFn: func() int64 { return 0 }}, nil
+				return &mocks.FileInfoMock{
+					SizeFn:    func() int64 { return 0 },
+					ModTimeFn: func() time.Time { return entryModTime },
+				}, nil
 			},
 		}, &mocks.CacheMock{
 			GetBlobFn: func(digest godigest.Digest) (string, error) {
@@ -3975,11 +4821,78 @@ func TestS3DedupeZeroSizeBlob(t *testing.T) {
 		})
 
 		// StatBlob exercises the deduped-placeholder branch in originalBlobInfo.
-		statOk, statSize, _, statErr := imgStore.StatBlob(repo, nonEmptyDigest)
+		statOk, statSize, statMod, statErr := imgStore.StatBlob(repo, nonEmptyDigest)
 		So(statOk, ShouldBeTrue)
 		So(statSize, ShouldEqual, realSize)
 		So(statErr, ShouldBeNil)
+		So(statMod.Equal(originalModTime), ShouldBeTrue)
+
+		// StatBlobEntry keeps the placeholder's own age for GC delay checks.
+		entryOk, entrySize, entryMod, entryErr := imgStore.StatBlobEntry(repo, nonEmptyDigest)
+		So(entryOk, ShouldBeTrue)
+		So(entrySize, ShouldEqual, 0)
+		So(entryErr, ShouldBeNil)
+		So(entryMod.Equal(entryModTime), ShouldBeTrue)
 	})
+
+	// ------------------------------------------------------------------ //
+	// Case 5: cache "origin" is itself a zero-size stub. Serving that as
+	// HTTP 200 would return a body that does not match the digest. Both
+	// StatBlob/GetBlob and CheckBlob must fail closed with ErrBlobNotFound
+	// (errors.Is; may also carry ErrStorageMissing), whether or not the store's
+	// dedupe flag is enabled.
+	// ------------------------------------------------------------------ //
+	for _, dedupe := range []bool{true, false} {
+		Convey(fmt.Sprintf("StatBlob/GetBlob reject empty cache origin (dedupe=%t)", dedupe), t, func() {
+			nonEmptyContent := []byte("non-empty-blob-content")
+			nonEmptyDigest := godigest.FromBytes(nonEmptyContent)
+			emptyOrigin := testDir + "/dedupe-src/blobs/sha256/empty-origin"
+
+			imgStore := createMockStorageWithMockCacheDedupe(testDir, dedupe, &mocks.StorageDriverMock{
+				StatFn: func(ctx context.Context, path string) (driver.FileInfo, error) {
+					return &mocks.FileInfoMock{SizeFn: func() int64 { return 0 }}, nil
+				},
+			}, &mocks.CacheMock{
+				GetBlobFn: func(digest godigest.Digest) (string, error) {
+					return emptyOrigin, nil
+				},
+			})
+
+			statOk, _, _, statErr := imgStore.StatBlob(repo, nonEmptyDigest)
+			So(statOk, ShouldBeFalse)
+			So(errors.Is(statErr, zerr.ErrBlobNotFound), ShouldBeTrue)
+
+			_, _, getErr := imgStore.GetBlob(repo, nonEmptyDigest, "application/octet-stream")
+			So(errors.Is(getErr, zerr.ErrBlobNotFound), ShouldBeTrue)
+		})
+
+		Convey(fmt.Sprintf("CheckBlob rejects empty cache origin (dedupe=%t)", dedupe), t, func() {
+			nonEmptyContent := []byte("non-empty-blob-content")
+			nonEmptyDigest := godigest.FromBytes(nonEmptyContent)
+			emptyOrigin := testDir + "/dedupe-src/blobs/sha256/empty-origin"
+
+			imgStore := createMockStorageWithMockCacheDedupe(testDir, dedupe, &mocks.StorageDriverMock{
+				StatFn: func(ctx context.Context, path string) (driver.FileInfo, error) {
+					return &mocks.FileInfoMock{SizeFn: func() int64 { return 0 }}, nil
+				},
+				PutContentFn: func(ctx context.Context, path string, content []byte) error {
+					return nil
+				},
+			}, &mocks.CacheMock{
+				GetBlobFn: func(digest godigest.Digest) (string, error) {
+					return emptyOrigin, nil
+				},
+				PutBlobFn: func(digest godigest.Digest, path string) error {
+					return nil
+				},
+			})
+
+			ok, size, err := imgStore.CheckBlob(context.Background(), repo, nonEmptyDigest)
+			So(ok, ShouldBeFalse)
+			So(size, ShouldEqual, int64(-1))
+			So(errors.Is(err, zerr.ErrBlobNotFound), ShouldBeTrue)
+		})
+	}
 }
 
 func TestInjectDedupe(t *testing.T) {
@@ -3993,9 +4906,10 @@ func TestInjectDedupe(t *testing.T) {
 	testDir := path.Join("/oci-repo-test", uuid.String())
 
 	Convey("Inject errors in DedupeBlob function", t, func() {
+		// Missing origin Stat drives the cache-heal path; Transient would fail closed.
 		imgStore := createMockStorage(testDir, tdir, true, &mocks.StorageDriverMock{
 			StatFn: func(ctx context.Context, path string) (driver.FileInfo, error) {
-				return &mocks.FileInfoMock{}, errS3
+				return &mocks.FileInfoMock{}, driver.PathNotFoundError{Path: path}
 			},
 		})
 		err := imgStore.DedupeBlob("blob", "digest", "", "newblob")
@@ -4031,10 +4945,12 @@ func TestDeleteBlobDeferredDuringDedupeRebuild(t *testing.T) {
 	contentDigest := godigest.FromBytes(content)
 	contentBlobPath := path.Join(testDir, repoName, "blobs",
 		contentDigest.Algorithm().String(), contentDigest.Encoded())
+	repoDirPath := path.Join(testDir, repoName)
+	indexPath := path.Join(testDir, repoName, ispec.ImageIndexFile)
 
 	newStoppedScheduler := func() *scheduler.Scheduler {
 		log := log.NewTestLogger()
-		metrics := monitoring.NewMetricsServer(false, log)
+		metrics := monitoring.NewNopMetricServer()
 		taskScheduler := scheduler.NewScheduler(config.New(), metrics, log)
 		taskScheduler.RateLimit = 50 * time.Millisecond
 
@@ -4050,7 +4966,18 @@ func TestDeleteBlobDeferredDuringDedupeRebuild(t *testing.T) {
 					return &mocks.FileInfoMock{SizeFn: func() int64 { return int64(len(content)) }}, nil
 				}
 
+				if statPath == repoDirPath {
+					return &mocks.FileInfoMock{IsDirFn: func() bool { return true }}, nil
+				}
+
 				return nil, driver.PathNotFoundError{Path: statPath}
+			},
+			GetContentFn: func(ctx context.Context, readPath string) ([]byte, error) {
+				if readPath == indexPath {
+					return emptyIndexContent(), nil
+				}
+
+				return nil, driver.PathNotFoundError{Path: readPath}
 			},
 			DeleteFn: func(ctx context.Context, deletePath string) error {
 				if deletePath == contentBlobPath {
@@ -4104,7 +5031,18 @@ func TestDeleteBlobDeferredDuringDedupeRebuild(t *testing.T) {
 					return &mocks.FileInfoMock{SizeFn: func() int64 { return 0 }}, nil
 				}
 
+				if statPath == repoDirPath {
+					return &mocks.FileInfoMock{IsDirFn: func() bool { return true }}, nil
+				}
+
 				return nil, driver.PathNotFoundError{Path: statPath}
+			},
+			GetContentFn: func(ctx context.Context, readPath string) ([]byte, error) {
+				if readPath == indexPath {
+					return emptyIndexContent(), nil
+				}
+
+				return nil, driver.PathNotFoundError{Path: readPath}
 			},
 			DeleteFn: func(ctx context.Context, deletePath string) error {
 				if deletePath == contentBlobPath {
@@ -4141,7 +5079,18 @@ func TestDeleteBlobDeferredDuringDedupeRebuild(t *testing.T) {
 					return &mocks.FileInfoMock{SizeFn: func() int64 { return int64(len(content)) }}, nil
 				}
 
+				if statPath == repoDirPath {
+					return &mocks.FileInfoMock{IsDirFn: func() bool { return true }}, nil
+				}
+
 				return nil, driver.PathNotFoundError{Path: statPath}
+			},
+			GetContentFn: func(ctx context.Context, readPath string) ([]byte, error) {
+				if readPath == indexPath {
+					return emptyIndexContent(), nil
+				}
+
+				return nil, driver.PathNotFoundError{Path: readPath}
 			},
 			DeleteFn: func(ctx context.Context, deletePath string) error {
 				if deletePath == contentBlobPath {
@@ -4189,10 +5138,12 @@ func TestDeleteBlobDeferredDuringRestoreWalk(t *testing.T) {
 	contentDigest := godigest.FromBytes(content)
 	contentBlobPath := path.Join(testDir, repoName, "blobs",
 		contentDigest.Algorithm().String(), contentDigest.Encoded())
+	repoDirPath := path.Join(testDir, repoName)
+	indexPath := path.Join(testDir, repoName, ispec.ImageIndexFile)
 
 	newStoppedScheduler := func() *scheduler.Scheduler {
 		log := log.NewTestLogger()
-		metrics := monitoring.NewMetricsServer(false, log)
+		metrics := monitoring.NewNopMetricServer()
 		taskScheduler := scheduler.NewScheduler(config.New(), metrics, log)
 		taskScheduler.RateLimit = 50 * time.Millisecond
 
@@ -4207,11 +5158,19 @@ func TestDeleteBlobDeferredDuringRestoreWalk(t *testing.T) {
 					return &mocks.FileInfoMock{SizeFn: func() int64 { return int64(len(content)) }}, nil
 				}
 
+				if statPath == repoDirPath {
+					return &mocks.FileInfoMock{IsDirFn: func() bool { return true }}, nil
+				}
+
 				return nil, driver.PathNotFoundError{Path: statPath}
 			},
 			GetContentFn: func(ctx context.Context, readPath string) ([]byte, error) {
 				if markerContent != "" && strings.HasSuffix(readPath, storageConstants.DedupeRestoreCompleteMarker) {
 					return []byte(markerContent), nil
+				}
+
+				if readPath == indexPath {
+					return emptyIndexContent(), nil
 				}
 
 				return nil, driver.PathNotFoundError{Path: readPath}
@@ -4329,10 +5288,14 @@ func TestDeleteBlobDeferredIssue2625CrossRepoOriginal(t *testing.T) {
 		digest.Algorithm().String(), digest.Encoded())
 	placeholderPath := path.Join(testDir, repoB, ispec.ImageBlobsDir,
 		digest.Algorithm().String(), digest.Encoded())
+	repoADirPath := path.Join(testDir, repoA)
+	repoBDirPath := path.Join(testDir, repoB)
+	indexPathA := path.Join(testDir, repoA, ispec.ImageIndexFile)
+	indexPathB := path.Join(testDir, repoB, ispec.ImageIndexFile)
 
 	newStoppedScheduler := func() *scheduler.Scheduler {
 		log := log.NewTestLogger()
-		metrics := monitoring.NewMetricsServer(false, log)
+		metrics := monitoring.NewNopMetricServer()
 		taskScheduler := scheduler.NewScheduler(config.New(), metrics, log)
 		taskScheduler.RateLimit = 50 * time.Millisecond
 
@@ -4345,8 +5308,19 @@ func TestDeleteBlobDeferredIssue2625CrossRepoOriginal(t *testing.T) {
 			return &mocks.FileInfoMock{SizeFn: func() int64 { return int64(len(content)) }}, nil
 		case placeholderPath:
 			return &mocks.FileInfoMock{SizeFn: func() int64 { return 0 }}, nil
+		case repoADirPath, repoBDirPath:
+			return &mocks.FileInfoMock{IsDirFn: func() bool { return true }}, nil
 		default:
 			return nil, driver.PathNotFoundError{Path: statPath}
+		}
+	}
+
+	getContentFn := func(_ context.Context, readPath string) ([]byte, error) {
+		switch readPath {
+		case indexPathA, indexPathB:
+			return emptyIndexContent(), nil
+		default:
+			return nil, driver.PathNotFoundError{Path: readPath}
 		}
 	}
 
@@ -4354,7 +5328,8 @@ func TestDeleteBlobDeferredIssue2625CrossRepoOriginal(t *testing.T) {
 		var deletedOriginal, deletedPlaceholder atomic.Bool
 
 		imgStore := createMockStorageWithMockCache(testDir, &mocks.StorageDriverMock{
-			StatFn: statFn,
+			StatFn:       statFn,
+			GetContentFn: getContentFn,
 			DeleteFn: func(ctx context.Context, deletePath string) error {
 				switch deletePath {
 				case originalPath:

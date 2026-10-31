@@ -106,6 +106,8 @@ definitions:
     type: object
   extensions.Auth:
     properties:
+      allowAnonymousAccess:
+        type: boolean
       apikey:
         type: boolean
       bearer:
@@ -281,6 +283,10 @@ paths:
           description: internal server error
           schema:
             type: string
+        "503":
+          description: storage temporarily unavailable
+          schema:
+            type: string
       summary: List image repositories
   /v2/_oci/ext/discover:
     get:
@@ -451,6 +457,22 @@ paths:
       responses:
         "202":
           description: accepted
+        "404":
+          description: not found
+          schema:
+            type: string
+        "405":
+          description: method not allowed
+          schema:
+            type: string
+        "500":
+          description: internal server error
+          schema:
+            type: string
+        "503":
+          description: storage temporarily unavailable
+          schema:
+            type: string
       summary: Delete image blob/layer
     get:
       consumes:
@@ -468,12 +490,29 @@ paths:
         required: true
         type: string
       produces:
-      - application/vnd.oci.image.layer.v1.tar+gzip
+      - application/json
+      - application/octet-stream
       responses:
         "200":
           description: OK
           schema:
             $ref: '#/definitions/api.ImageManifest'
+        "400":
+          description: bad request
+          schema:
+            type: string
+        "404":
+          description: not found
+          schema:
+            type: string
+        "500":
+          description: internal server error
+          schema:
+            type: string
+        "503":
+          description: storage temporarily unavailable
+          schema:
+            type: string
       summary: Get image blob/layer
     head:
       consumes:
@@ -492,6 +531,7 @@ paths:
         type: string
       produces:
       - application/json
+      - application/octet-stream
       responses:
         "200":
           description: OK
@@ -501,6 +541,22 @@ paths:
               type: string
           schema:
             $ref: '#/definitions/api.ImageManifest'
+        "400":
+          description: bad request
+          schema:
+            type: string
+        "404":
+          description: not found
+          schema:
+            type: string
+        "500":
+          description: internal server error
+          schema:
+            type: string
+        "503":
+          description: storage temporarily unavailable
+          schema:
+            type: string
       summary: Check image blob/layer
   /v2/{name}/blobs/uploads:
     post:
@@ -511,6 +567,7 @@ paths:
         and returns 202.
         A `digest` query parameter requests a monolithic upload and returns 201 on success.
         A `mount` query parameter requests a cross-repository blob mount and returns 201 or 202.
+        A `digest-algorithm` query parameter hints the algorithm for a multi-request upload.
       parameters:
       - description: repository name
         in: path
@@ -520,6 +577,10 @@ paths:
       - description: blob digest for monolithic upload
         in: query
         name: digest
+        type: string
+      - description: digest algorithm hint for multi-request uploads
+        in: query
+        name: digest-algorithm
         type: string
       - description: blob digest to mount into the repository
         in: query
@@ -566,6 +627,10 @@ paths:
           description: internal server error
           schema:
             type: string
+        "503":
+          description: storage temporarily unavailable
+          schema:
+            type: string
       summary: Create image blob/layer upload
   /v2/{name}/blobs/uploads/{session_id}:
     delete:
@@ -594,6 +659,10 @@ paths:
             type: string
         "500":
           description: internal server error
+          schema:
+            type: string
+        "503":
+          description: storage temporarily unavailable
           schema:
             type: string
       summary: Delete image blob/layer
@@ -634,6 +703,10 @@ paths:
             type: string
         "500":
           description: internal server error
+          schema:
+            type: string
+        "503":
+          description: storage temporarily unavailable
           schema:
             type: string
       summary: Get image blob/layer upload
@@ -681,6 +754,10 @@ paths:
             type: string
         "500":
           description: internal server error
+          schema:
+            type: string
+        "503":
+          description: storage temporarily unavailable
           schema:
             type: string
       summary: Resume image blob/layer upload
@@ -732,6 +809,10 @@ paths:
           description: internal server error
           schema:
             type: string
+        "503":
+          description: storage temporarily unavailable
+          schema:
+            type: string
       summary: Update image blob/layer upload
   /v2/{name}/manifests/{reference}:
     delete:
@@ -774,6 +855,10 @@ paths:
           description: internal server error
           schema:
             type: string
+        "503":
+          description: storage temporarily unavailable
+          schema:
+            type: string
       summary: Delete image manifest
     get:
       consumes:
@@ -809,6 +894,10 @@ paths:
           description: internal server error
           schema:
             type: string
+        "503":
+          description: storage temporarily unavailable or synchronization failed
+          schema:
+            type: string
       summary: Get image manifest
     head:
       consumes:
@@ -842,6 +931,10 @@ paths:
             type: string
         "500":
           description: internal server error
+          schema:
+            type: string
+        "503":
+          description: storage temporarily unavailable or synchronization failed
           schema:
             type: string
       summary: Check image manifest
@@ -902,6 +995,10 @@ paths:
           description: internal server error
           schema:
             type: string
+        "503":
+          description: storage temporarily unavailable
+          schema:
+            type: string
       summary: Update image manifest
   /v2/{name}/referrers/{digest}:
     get:
@@ -944,6 +1041,10 @@ paths:
           description: internal server error
           schema:
             type: string
+        "503":
+          description: storage temporarily unavailable
+          schema:
+            type: string
       summary: Get referrers for a given digest
   /v2/{name}/tags/list:
     get:
@@ -979,6 +1080,14 @@ paths:
             type: string
         "404":
           description: not found
+          schema:
+            type: string
+        "500":
+          description: internal server error
+          schema:
+            type: string
+        "503":
+          description: storage temporarily unavailable
           schema:
             type: string
       summary: List image tags

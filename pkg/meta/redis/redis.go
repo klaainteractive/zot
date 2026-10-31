@@ -12,7 +12,6 @@ import (
 	"github.com/go-redsync/redsync/v4"
 	gors "github.com/go-redsync/redsync/v4/redis/goredis/v9"
 	godigest "github.com/opencontainers/go-digest"
-	ispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -699,14 +698,13 @@ func (rc *RedisDB) SetImageMeta(digest godigest.Digest, imageMeta mTypes.ImageMe
 	protoImageMeta := &proto_go.ImageMeta{}
 	ctx := context.Background()
 
-	if imageMeta.MediaType == ispec.MediaTypeImageManifest ||
-		compat.IsCompatibleManifestMediaType(imageMeta.MediaType) {
+	if compat.IsImageManifestMediaType(imageMeta.MediaType) {
 		manifest := imageMeta.Manifests[0]
 		protoImageMeta = mConvert.GetProtoImageManifestData(manifest.Manifest, manifest.Config,
-			manifest.Size, manifest.Digest.String())
-	} else if imageMeta.MediaType == ispec.MediaTypeImageIndex ||
-		compat.IsCompatibleManifestListMediaType(imageMeta.MediaType) {
-		protoImageMeta = mConvert.GetProtoImageIndexMeta(*imageMeta.Index, imageMeta.Size, imageMeta.Digest.String())
+			manifest.Size, manifest.Digest.String(), imageMeta.MediaType)
+	} else if compat.IsImageIndexMediaType(imageMeta.MediaType) {
+		protoImageMeta = mConvert.GetProtoImageIndexMeta(*imageMeta.Index, imageMeta.Size, imageMeta.Digest.String(),
+			imageMeta.MediaType)
 	}
 
 	pImageMetaBlob, err := proto.Marshal(protoImageMeta)
@@ -1017,8 +1015,7 @@ func (rc *RedisDB) SearchTags(ctx context.Context, searchText string) ([]mTypes.
 
 			var protoImageMeta *proto_go.ImageMeta
 
-			if descriptor.MediaType == ispec.MediaTypeImageManifest || //nolint:gocritic
-				compat.IsCompatibleManifestMediaType(descriptor.MediaType) {
+			if compat.IsImageManifestMediaType(descriptor.MediaType) { //nolint:gocritic
 				manifestDigest := descriptor.Digest
 
 				imageManifestData, err := rc.getProtoImageMeta(ctx, manifestDigest)
@@ -1028,8 +1025,7 @@ func (rc *RedisDB) SearchTags(ctx context.Context, searchText string) ([]mTypes.
 				}
 
 				protoImageMeta = imageManifestData
-			} else if descriptor.MediaType == ispec.MediaTypeImageIndex ||
-				compat.IsCompatibleManifestListMediaType(descriptor.MediaType) {
+			} else if compat.IsImageIndexMediaType(descriptor.MediaType) {
 				indexDigest := descriptor.Digest
 
 				imageIndexData, err := rc.getProtoImageMeta(ctx, indexDigest)
@@ -1098,8 +1094,7 @@ func (rc *RedisDB) FilterTags(ctx context.Context, filterRepoTag mTypes.FilterRe
 				continue
 			}
 
-			if descriptor.MediaType == ispec.MediaTypeImageManifest || //nolint:gocritic
-				compat.IsCompatibleManifestMediaType(descriptor.MediaType) {
+			if compat.IsImageManifestMediaType(descriptor.MediaType) { //nolint:gocritic
 				manifestDigest := descriptor.Digest
 
 				imageManifestData, err := rc.getProtoImageMeta(ctx, manifestDigest)
@@ -1114,8 +1109,7 @@ func (rc *RedisDB) FilterTags(ctx context.Context, filterRepoTag mTypes.FilterRe
 				if filterFunc(repoMeta, imageMeta) {
 					images = append(images, mConvert.GetFullImageMetaFromProto(tag, protoRepoMeta, imageManifestData))
 				}
-			} else if descriptor.MediaType == ispec.MediaTypeImageIndex ||
-				compat.IsCompatibleManifestListMediaType(descriptor.MediaType) {
+			} else if compat.IsImageIndexMediaType(descriptor.MediaType) {
 				indexDigest := descriptor.Digest
 
 				protoImageIndexMeta, err := rc.getProtoImageMeta(ctx, indexDigest)
@@ -1219,6 +1213,33 @@ func (rc *RedisDB) GetRepoMeta(ctx context.Context, repo string) (mTypes.RepoMet
 	return mConvert.GetRepoMeta(protoRepoMeta), nil
 }
 
+func (rc *RedisDB) GetRepoSizeWithCandidate(ctx context.Context, repo string, references []string,
+	imageMeta mTypes.ImageMeta,
+) (int64, int64, error) {
+	var current, projected int64
+	protoRepoMeta, metaErr := rc.getProtoRepoMeta(ctx, repo)
+	if metaErr != nil && !errors.Is(metaErr, zerr.ErrRepoMetaNotFound) {
+		return 0, 0, metaErr
+	}
+
+	repoBlobsBytes, blobsErr := rc.Client.HGet(ctx, rc.RepoBlobsKey, repo).Bytes()
+	if blobsErr != nil && !errors.Is(blobsErr, redis.Nil) {
+		return 0, 0, blobsErr
+	}
+
+	repoBlobs, blobsErr := unmarshalProtoRepoBlobs(repo, repoBlobsBytes)
+	if blobsErr != nil {
+		return 0, 0, blobsErr
+	}
+
+	current, projected, err := common.ProjectRepoSize(protoRepoMeta, repoBlobs, references, imageMeta)
+	if err != nil {
+		return current, projected, err
+	}
+
+	return current, projected, nil
+}
+
 // GetFullImageMeta returns the full information about an image.
 func (rc *RedisDB) GetFullImageMeta(ctx context.Context, repo string, tag string) (mTypes.FullImageMeta, error) {
 	protoImageMeta := &proto_go.ImageMeta{}
@@ -1245,8 +1266,7 @@ func (rc *RedisDB) GetFullImageMeta(ctx context.Context, repo string, tag string
 		return mConvert.GetFullImageMetaFromProto(tag, protoRepoMeta, protoImageMeta), err
 	}
 
-	if protoImageMeta.MediaType == ispec.MediaTypeImageIndex ||
-		compat.IsCompatibleManifestListMediaType(protoImageMeta.MediaType) {
+	if compat.IsImageIndexMediaType(protoImageMeta.MediaType) {
 		_, manifestDataList, err := rc.getAllContainedMeta(ctx, protoImageMeta)
 		if err != nil {
 			return mConvert.GetFullImageMetaFromProto(tag, protoRepoMeta, protoImageMeta), err
@@ -1268,8 +1288,7 @@ func (rc *RedisDB) GetImageMeta(digest godigest.Digest) (mTypes.ImageMeta, error
 		return imageMeta, err
 	}
 
-	if protoImageMeta.MediaType == ispec.MediaTypeImageIndex ||
-		compat.IsCompatibleManifestListMediaType(protoImageMeta.MediaType) {
+	if compat.IsImageIndexMediaType(protoImageMeta.MediaType) {
 		_, manifestDataList, err := rc.getAllContainedMeta(ctx, protoImageMeta)
 		if err != nil {
 			return imageMeta, err
@@ -1458,7 +1477,12 @@ func (rc *RedisDB) DeleteSignature(repo string, signedManifestDigest godigest.Di
 			return zerr.ErrImageMetaNotFound
 		}
 
-		signatureSlice := manifestSignatures.Map[sigMeta.SignatureType]
+		// SetRepoReference pre-creates Signatures[digest] without typed entries; missing
+		// types (e.g. signature layer never parsed into meta) are already cleaned.
+		signatureSlice, found := manifestSignatures.Map[sigMeta.SignatureType]
+		if !found || signatureSlice == nil {
+			return nil
+		}
 
 		newSignatureSlice := make([]*proto_go.SignatureInfo, 0, len(signatureSlice.List))
 
@@ -1498,65 +1522,58 @@ func (rc *RedisDB) UpdateSignaturesValidity(ctx context.Context, repo string, ma
 		return nil
 	}
 
-	err := rc.withRSLocks(ctx, []string{rc.getRepoLockKey(repo)}, func() error {
-		// get ManifestData of signed manifest
-		protoImageMeta, err := rc.getProtoImageMeta(ctx, manifestDigest.String())
-		if err != nil {
-			if errors.Is(err, zerr.ErrImageMetaNotFound) {
-				// manifest meta not found, updating signatures with details about validity and author will not be performed
-				return nil
-			}
+	// Read the signatures, verify them without holding the repo lock, then write the results back.
+	// get ManifestData of signed manifest
+	protoImageMeta, err := rc.getProtoImageMeta(ctx, manifestDigest.String())
+	if err != nil {
+		if errors.Is(err, zerr.ErrImageMetaNotFound) {
+			// manifest meta not found, updating signatures with details about validity and author will not be performed
+			return nil
+		}
 
+		return err
+	}
+
+	verifyImageMeta := mConvert.GetImageMeta(protoImageMeta)
+
+	protoRepoMeta, err := rc.getProtoRepoMeta(ctx, repo)
+	if err != nil {
+		return err
+	}
+
+	signatures := protoRepoMeta.Signatures[manifestDigest.String()]
+	if signatures == nil {
+		return nil
+	}
+
+	validity, err := common.VerifyManifestSignatures(ctx, imgTrustStore, repo, manifestDigest, verifyImageMeta,
+		signatures, rc.Log)
+	if err != nil {
+		return err
+	}
+
+	return rc.withRSLocks(ctx, []string{rc.getRepoLockKey(repo)}, func() error {
+		repoMetaBlob, err := rc.Client.HGet(ctx, rc.RepoMetaKey, repo).Bytes()
+		if errors.Is(err, redis.Nil) {
+			// the repo was removed while its signatures were verified
+			return nil
+		}
+
+		if err != nil {
+			rc.Log.Error().Err(err).Str("hget", rc.RepoMetaKey).Str("repo", repo).
+				Msg("failed to get repo meta record")
+
+			return fmt.Errorf("failed to get repo meta record for repo %s: %w", repo, err)
+		}
+
+		protoRepoMeta, err := unmarshalProtoRepoMeta(repo, repoMetaBlob)
+		if err != nil {
 			return err
 		}
 
-		// update signatures with details about validity and author
-		protoRepoMeta, err := rc.getProtoRepoMeta(ctx, repo)
-		if err != nil {
-			return err
-		}
+		common.ApplySignaturesValidity(protoRepoMeta.Signatures[manifestDigest.String()], validity)
 
-		manifestSignatures := proto_go.ManifestSignatures{Map: map[string]*proto_go.SignaturesInfo{"": {}}}
-
-		for sigType, sigs := range protoRepoMeta.Signatures[manifestDigest.String()].Map {
-			if zcommon.IsContextDone(ctx) {
-				return ctx.Err()
-			}
-
-			signaturesInfo := []*proto_go.SignatureInfo{}
-
-			for _, sigInfo := range sigs.List {
-				layersInfo := []*proto_go.LayersInfo{}
-
-				for _, layerInfo := range sigInfo.LayersInfo {
-					author, date, isTrusted, _ := imgTrustStore.VerifySignature(sigType, layerInfo.LayerContent,
-						layerInfo.SignatureKey, manifestDigest, mConvert.GetImageMeta(protoImageMeta), repo)
-
-					if isTrusted {
-						layerInfo.Signer = author
-					} else {
-						layerInfo.Signer = ""
-					}
-
-					if !date.IsZero() {
-						layerInfo.Date = timestamppb.New(date)
-					}
-
-					layersInfo = append(layersInfo, layerInfo)
-				}
-
-				signaturesInfo = append(signaturesInfo, &proto_go.SignatureInfo{
-					SignatureManifestDigest: sigInfo.SignatureManifestDigest,
-					LayersInfo:              layersInfo,
-				})
-			}
-
-			manifestSignatures.Map[sigType] = &proto_go.SignaturesInfo{List: signaturesInfo}
-		}
-
-		protoRepoMeta.Signatures[manifestDigest.String()] = &manifestSignatures
-
-		repoMetaBlob, err := proto.Marshal(protoRepoMeta)
+		repoMetaBlob, err = proto.Marshal(protoRepoMeta)
 		if err != nil {
 			return err
 		}
@@ -1571,8 +1588,6 @@ func (rc *RedisDB) UpdateSignaturesValidity(ctx context.Context, repo string, ma
 
 		return nil
 	})
-
-	return err
 }
 
 // IncrementRepoStars adds 1 to the star count of an image.
@@ -1845,8 +1860,7 @@ func (rc *RedisDB) FilterImageMeta(ctx context.Context,
 			return imageMetaMap, err
 		}
 
-		if protoImageMeta.MediaType == ispec.MediaTypeImageIndex ||
-			compat.IsCompatibleManifestListMediaType(protoImageMeta.MediaType) {
+		if compat.IsImageIndexMediaType(protoImageMeta.MediaType) {
 			_, manifestDataList, err := rc.getAllContainedMeta(ctx, protoImageMeta)
 			if err != nil {
 				return imageMetaMap, err
@@ -1927,8 +1941,10 @@ func (rc *RedisDB) RemoveRepoReference(repo, reference string, manifestDigest go
 			}
 		}
 
-		/* try to find at least one tag pointing to manifestDigest
-		if not found then we can also remove everything related to this digest */
+		// No remaining tag points at this digest. Signatures and referrers are
+		// deleted either way. Statistics stay when reference is a tag, because that
+		// caller left the manifest in the index. They are deleted when reference is
+		// a digest, because the manifest itself is gone.
 		var foundTag bool
 
 		for _, desc := range protoRepoMeta.Tags {
@@ -1938,7 +1954,10 @@ func (rc *RedisDB) RemoveRepoReference(repo, reference string, manifestDigest go
 		}
 
 		if !foundTag {
-			delete(protoRepoMeta.Statistics, manifestDigest.String())
+			if common.ReferenceIsDigest(reference) {
+				delete(protoRepoMeta.Statistics, manifestDigest.String())
+			}
+
 			delete(protoRepoMeta.Signatures, manifestDigest.String())
 			delete(protoRepoMeta.Referrers, manifestDigest.String())
 		}
@@ -2307,10 +2326,7 @@ func (rc *RedisDB) getAllContainedMeta(ctx context.Context, imageIndexData *prot
 	imageMetaList := make([]*proto_go.ImageMeta, 0, len(imageIndexData.Index.Index.Manifests))
 
 	for _, manifest := range imageIndexData.Index.Index.Manifests {
-		if manifest.MediaType != ispec.MediaTypeImageManifest &&
-			manifest.MediaType != ispec.MediaTypeImageIndex &&
-			!compat.IsCompatibleManifestMediaType(manifest.MediaType) &&
-			!compat.IsCompatibleManifestListMediaType(manifest.MediaType) {
+		if !compat.IsImageManifestMediaType(manifest.MediaType) && !compat.IsImageIndexMediaType(manifest.MediaType) {
 			// filter out unexpected media types from the manifest lists,
 			// this could be the case of buildkit cache entries for example
 			continue
@@ -2326,12 +2342,10 @@ func (rc *RedisDB) getAllContainedMeta(ctx context.Context, imageIndexData *prot
 			return imageMetaList, manifestDataList, err
 		}
 
-		if imageManifestData.MediaType == ispec.MediaTypeImageManifest ||
-			compat.IsCompatibleManifestMediaType(imageManifestData.MediaType) {
+		if compat.IsImageManifestMediaType(imageManifestData.MediaType) {
 			imageMetaList = append(imageMetaList, imageManifestData)
 			manifestDataList = append(manifestDataList, imageManifestData.Manifests[0])
-		} else if imageManifestData.MediaType == ispec.MediaTypeImageIndex ||
-			compat.IsCompatibleManifestListMediaType(imageManifestData.MediaType) {
+		} else if compat.IsImageIndexMediaType(imageManifestData.MediaType) {
 			partialImageDataList, partialManifestDataList, err := rc.getAllContainedMeta(ctx, imageManifestData)
 			if err != nil {
 				// getAllContainedMeta skips missing items internally, so any error returned
@@ -2407,6 +2421,8 @@ func unmarshalProtoRepoMeta(repo string, repoMetaBlob []byte) (*proto_go.RepoMet
 		if err != nil {
 			return protoRepoMeta, err
 		}
+
+		common.StripSignatureLayerContent(protoRepoMeta)
 	}
 
 	if protoRepoMeta.Tags == nil {

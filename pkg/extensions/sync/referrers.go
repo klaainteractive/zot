@@ -9,10 +9,7 @@ import (
 	"zotregistry.dev/zot/v2/pkg/common"
 )
 
-const (
-	cosignSignatureTagSuffix = "sig"
-	SBOMTagSuffix            = "sbom"
-)
+const SBOMTagSuffix = "sbom"
 
 func hasSignatureReferrers(refs referrer.ReferrerList) bool {
 	for _, desc := range refs.Descriptors {
@@ -26,7 +23,7 @@ func hasSignatureReferrers(refs referrer.ReferrerList) bool {
 			return true
 		}
 
-		if common.IsArtifactTypeCosign(desc.ArtifactType) {
+		if common.IsCosignSignatureArtifact(desc.ArtifactType, desc.Annotations) {
 			return true
 		}
 	}

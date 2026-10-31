@@ -24,7 +24,10 @@ mkdir -p ${TEST_DATA_DIR}
 function zot_serve() {
     local zot_path=${1}
     local config_file=${2}
-    ${zot_path} serve ${config_file} &
+    # Capture stdout/stderr separately from log.output so panics / early errors remain
+    # available even when the configured log file is under (or missing from) storage.
+    local stdout_log=${BATS_FILE_TMPDIR}/zot-stdout-$$-${RANDOM}.log
+    ${zot_path} serve ${config_file} >>"${stdout_log}" 2>&1 &
     # zot.pid file keeps a list of zot server PIDs (in case multiple zot servers are started)
     echo -n "$! " >> ${BATS_FILE_TMPDIR}/zot.pid
 }
@@ -157,7 +160,10 @@ function zot_stop_all() {
 # Exits with 1 and a clear message if zot did not start or response is not from zot.
 function wait_zot_reachable() {
     local zot_port=${1}
-    local zot_url=http://127.0.0.1:${zot_port}/v2/_catalog
+    local zot_scheme=${2:-http}
+    local zot_url=${zot_scheme}://127.0.0.1:${zot_port}/v2/_catalog
+    local curl_insecure=()
+    [ "${zot_scheme}" = "https" ] && curl_insecure=(-k)
 
     # If we have zot PIDs, ensure at least one process is still running (zot didn't exit on startup, e.g. bind failure).
     # When multiple zots run in the same test (e.g. sync.bats), zot.pid holds all PIDs; we only require one alive here.
@@ -179,19 +185,17 @@ function wait_zot_reachable() {
     local start_ts=$SECONDS
     while true; do
         curl_err_file="$(mktemp "${BATS_FILE_TMPDIR}/curl_err.XXXXXX")"
-        # Be robust if the test harness enables `set -e` (errexit): a failing `curl` inside
-        # command substitution can otherwise abort the function before we can retry.
-        local errexit_was_set=0
-        case "$-" in
-            *e*) errexit_was_set=1 ;;
-        esac
-        set +e
-        response="$(curl -sS --connect-timeout 3 \
+        # curl fails until zot is listening. Running it as an if condition exempts it from bats'
+        # ERR trap, which a set +e/set -e toggle does not reliably do.
+        if response="$(curl -sS --connect-timeout 3 \
             --max-time 5 \
+            "${curl_insecure[@]}" \
             -w "\n%{http_code}" \
-            "${zot_url}" 2>"${curl_err_file}")"
-        curl_ret=$?
-        [ "$errexit_was_set" -eq 1 ] && set -e
+            "${zot_url}" 2>"${curl_err_file}")"; then
+            curl_ret=0
+        else
+            curl_ret=$?
+        fi
         curl_err="$(cat "${curl_err_file}" 2>/dev/null || true)"
         rm -f "${curl_err_file}"
 
@@ -260,4 +264,36 @@ function zb_run() {
 function log_output() {
     local zot_log_file=${1:-${BATS_FILE_TMPDIR}/zot/zot-log.json}
     cat ${zot_log_file} | jq ' .["message"] '
+}
+
+# Dump named zot log files when a bats test fails. Call from teardown();
+# BATS_TEST_COMPLETED is set only after a successful test body.
+# Logs should live outside storage.rootDirectory so GC/sync cannot remove them.
+# Usage: dump_zot_logs_on_failure path [path...]
+function dump_zot_logs_on_failure() {
+    if [ -n "${BATS_TEST_COMPLETED:-}" ]; then
+        return 0
+    fi
+
+    local log_file
+    for log_file in "$@"; do
+        if [ -f "${log_file}" ]; then
+            echo "--- zot log (tail): ${log_file} ---"
+            # Cap dump size so repeated failures do not flood CI with the whole history.
+            tail -n 500 "${log_file}"
+            echo "--- end zot log: ${log_file} ---"
+        else
+            echo "--- zot log missing: ${log_file} ---"
+        fi
+    done
+
+    # Also dump any stdout captures from zot_serve (panics, pre-config errors).
+    local stdout_log
+    for stdout_log in "${BATS_FILE_TMPDIR}"/zot-stdout-*.log; do
+        if [ -f "${stdout_log}" ]; then
+            echo "--- zot stdout (tail): ${stdout_log} ---"
+            tail -n 200 "${stdout_log}"
+            echo "--- end zot stdout: ${stdout_log} ---"
+        fi
+    done
 }

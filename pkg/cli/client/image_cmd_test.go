@@ -53,7 +53,7 @@ func TestSignature(t *testing.T) {
 		conf.HTTP.Port = "0"
 		defaultVal := true
 		conf.Extensions = &extconf.ExtensionConfig{
-			Search: &extconf.SearchConfig{BaseConfig: extconf.BaseConfig{Enable: &defaultVal}},
+			Search: &extconf.SearchConfig{Enable: &defaultVal},
 		}
 		ctlr := api.NewController(conf)
 		ctlr.Config.Storage.RootDirectory = currentDir
@@ -84,9 +84,9 @@ func TestSignature(t *testing.T) {
 			&options.RootOptions{Verbose: true, Timeout: 1 * time.Minute},
 			options.KeyOpts{KeyRef: path.Join(currentDir, "cosign.key"), PassFunc: generate.GetPass},
 			options.SignOptions{
-				Registry:          options.RegistryOptions{AllowInsecure: true},
-				AnnotationOptions: options.AnnotationOptions{Annotations: []string{"tag=test:1.0"}},
-				Upload:            true,
+				Registry:    options.RegistryOptions{AllowInsecure: true},
+				Annotations: []string{"tag=test:1.0"},
+				Upload:      true,
 			},
 			[]string{fmt.Sprintf("localhost:%s/%s@%s", port, "repo7", image.DigestStr())})
 		So(err, ShouldBeNil)
@@ -130,7 +130,7 @@ func TestSignature(t *testing.T) {
 		conf.HTTP.Port = "0"
 		defaultVal := true
 		conf.Extensions = &extconf.ExtensionConfig{
-			Search: &extconf.SearchConfig{BaseConfig: extconf.BaseConfig{Enable: &defaultVal}},
+			Search: &extconf.SearchConfig{Enable: &defaultVal},
 		}
 		ctlr := api.NewController(conf)
 		ctlr.Config.Storage.RootDirectory = currentDir
@@ -185,7 +185,7 @@ func TestSignature(t *testing.T) {
 		conf.HTTP.Port = "0"
 		defaultVal := true
 		conf.Extensions = &extconf.ExtensionConfig{
-			Search: &extconf.SearchConfig{BaseConfig: extconf.BaseConfig{Enable: &defaultVal}},
+			Search: &extconf.SearchConfig{Enable: &defaultVal},
 		}
 		ctlr := api.NewController(conf)
 		ctlr.Config.Storage.RootDirectory = currentDir
@@ -233,7 +233,7 @@ func TestDerivedImageList(t *testing.T) {
 	conf.HTTP.Port = "0"
 	defaultVal := true
 	conf.Extensions = &extconf.ExtensionConfig{
-		Search: &extconf.SearchConfig{BaseConfig: extconf.BaseConfig{Enable: &defaultVal}},
+		Search: &extconf.SearchConfig{Enable: &defaultVal},
 	}
 	ctlr := api.NewController(conf)
 	ctlr.Config.Storage.RootDirectory = t.TempDir()
@@ -259,12 +259,12 @@ func TestDerivedImageList(t *testing.T) {
 
 			buff := &bytes.Buffer{}
 			searchConfig.ResultWriter = buff
-			err := client.SearchDerivedImageListGQL(searchConfig, "repo7:test:2.0")
+			err := client.SearchDerivedImageListGQL(searchConfig, "repo7:2.0")
 			So(err, ShouldBeNil)
 
 			actual := strings.TrimSpace(space.ReplaceAllString(buff.String(), " "))
 			So(actual, ShouldContainSubstring, "REPOSITORY TAG OS/ARCH DIGEST SIGNED SIZE")
-			So(actual, ShouldContainSubstring, "repo7 test:1.0 linux/amd64 9d9461ed false 860B")
+			So(actual, ShouldContainSubstring, "repo7 1.0 linux/amd64 9d9461ed false 860B")
 		})
 
 		Convey("Test derived images list fails", func() {
@@ -278,7 +278,7 @@ func TestDerivedImageList(t *testing.T) {
 			buff := &bytes.Buffer{}
 			searchConfig.ResultWriter = buff
 			searchConfig.OutputFormat = "random"
-			err := client.SearchDerivedImageListGQL(searchConfig, "repo7:test:2.0")
+			err := client.SearchDerivedImageListGQL(searchConfig, "repo7:2.0")
 			So(err, ShouldNotBeNil)
 		})
 	})
@@ -290,7 +290,7 @@ func TestBaseImageList(t *testing.T) {
 	conf.HTTP.Port = "0"
 	defaultVal := true
 	conf.Extensions = &extconf.ExtensionConfig{
-		Search: &extconf.SearchConfig{BaseConfig: extconf.BaseConfig{Enable: &defaultVal}},
+		Search: &extconf.SearchConfig{Enable: &defaultVal},
 	}
 	ctlr := api.NewController(conf)
 	ctlr.Config.Storage.RootDirectory = t.TempDir()
@@ -315,11 +315,11 @@ func TestBaseImageList(t *testing.T) {
 
 			buff := &bytes.Buffer{}
 			searchConfig.ResultWriter = buff
-			err := client.SearchBaseImageListGQL(searchConfig, "repo7:test:1.0")
+			err := client.SearchBaseImageListGQL(searchConfig, "repo7:1.0")
 			So(err, ShouldBeNil)
 			actual := strings.TrimSpace(space.ReplaceAllString(buff.String(), " "))
 			So(actual, ShouldContainSubstring, "REPOSITORY TAG OS/ARCH DIGEST SIGNED SIZE")
-			So(actual, ShouldContainSubstring, "repo7 test:2.0 linux/amd64 214e4bed false 530B")
+			So(actual, ShouldContainSubstring, "repo7 2.0 linux/amd64 214e4bed false 530B")
 		})
 
 		Convey("Test base images list fail", func() {
@@ -346,7 +346,7 @@ func TestOutputFormatGQL(t *testing.T) {
 		conf.HTTP.Port = "0"
 		defaultVal := true
 		conf.Extensions = &extconf.ExtensionConfig{
-			Search: &extconf.SearchConfig{BaseConfig: extconf.BaseConfig{Enable: &defaultVal}},
+			Search: &extconf.SearchConfig{Enable: &defaultVal},
 		}
 		ctlr := api.NewController(conf)
 		ctlr.Config.Storage.RootDirectory = t.TempDir()
@@ -373,7 +373,7 @@ func TestOutputFormatGQL(t *testing.T) {
 			cmd.SetArgs(args)
 			err := cmd.Execute()
 			So(err, ShouldBeNil)
-			expectedStr := `{"repoName":"repo7","tag":"test:1.0",` +
+			expectedStr := `{"repoName":"repo7","tag":"1.0",` +
 				`"digest":"sha256:51e18f508fd7125b0831ff9a22ba74cd79f0b934e77661ff72cfb54896951a06",` +
 				`"mediaType":"application/vnd.oci.image.manifest.v1+json",` +
 				`"manifests":[{"digest":"sha256:51e18f508fd7125b0831ff9a22ba74cd79f0b934e77661ff72cfb54896951a06",` +
@@ -390,7 +390,7 @@ func TestOutputFormatGQL(t *testing.T) {
 				`"licenses":"","labels":"","title":"","source":"","documentation":"","authors":"","vendor":"",` +
 				`"vulnerabilities":{"maxSeverity":"","unknownCount":0,"lowCount":0,"mediumCount":0,` +
 				`"highCount":0,"criticalCount":0,"count":0},"referrers":null,"signatureInfo":null,"artifactType":""}` + "\n" +
-				`{"repoName":"repo7","tag":"test:2.0",` +
+				`{"repoName":"repo7","tag":"2.0",` +
 				`"digest":"sha256:51e18f508fd7125b0831ff9a22ba74cd79f0b934e77661ff72cfb54896951a06",` +
 				`"mediaType":"application/vnd.oci.image.manifest.v1+json",` +
 				`"manifests":[{"digest":"sha256:51e18f508fd7125b0831ff9a22ba74cd79f0b934e77661ff72cfb54896951a06",` +
@@ -426,7 +426,7 @@ func TestOutputFormatGQL(t *testing.T) {
 			So(err, ShouldBeNil)
 			space := regexp.MustCompile(`\s+`)
 			str := space.ReplaceAllString(buff.String(), " ")
-			expectedStr := `--- reponame: repo7 tag: test:1.0 ` +
+			expectedStr := `--- reponame: repo7 tag: "1.0" ` +
 				`digest: sha256:51e18f508fd7125b0831ff9a22ba74cd79f0b934e77661ff72cfb54896951a06 ` +
 				`mediatype: application/vnd.oci.image.manifest.v1+json manifests: - ` +
 				`digest: sha256:51e18f508fd7125b0831ff9a22ba74cd79f0b934e77661ff72cfb54896951a06 ` +
@@ -444,7 +444,7 @@ func TestOutputFormatGQL(t *testing.T) {
 				`authors: "" vendor: "" vulnerabilities: maxseverity: "" ` +
 				`unknowncount: 0 lowcount: 0 mediumcount: 0 highcount: 0 criticalcount: 0 count: 0 ` +
 				`referrers: [] signatureinfo: [] artifacttype: "" ` +
-				`--- reponame: repo7 tag: test:2.0 ` +
+				`--- reponame: repo7 tag: "2.0" ` +
 				`digest: sha256:51e18f508fd7125b0831ff9a22ba74cd79f0b934e77661ff72cfb54896951a06 ` +
 				`mediatype: application/vnd.oci.image.manifest.v1+json manifests: - ` +
 				`digest: sha256:51e18f508fd7125b0831ff9a22ba74cd79f0b934e77661ff72cfb54896951a06 ` +
@@ -480,7 +480,7 @@ func TestOutputFormatGQL(t *testing.T) {
 			So(err, ShouldBeNil)
 			space := regexp.MustCompile(`\s+`)
 			str := space.ReplaceAllString(buff.String(), " ")
-			expectedStr := `--- reponame: repo7 tag: test:1.0 ` +
+			expectedStr := `--- reponame: repo7 tag: "1.0" ` +
 				`digest: sha256:51e18f508fd7125b0831ff9a22ba74cd79f0b934e77661ff72cfb54896951a06 ` +
 				`mediatype: application/vnd.oci.image.manifest.v1+json manifests: - ` +
 				`digest: sha256:51e18f508fd7125b0831ff9a22ba74cd79f0b934e77661ff72cfb54896951a06 ` +
@@ -498,7 +498,7 @@ func TestOutputFormatGQL(t *testing.T) {
 				`authors: "" vendor: "" vulnerabilities: maxseverity: "" ` +
 				`unknowncount: 0 lowcount: 0 mediumcount: 0 highcount: 0 criticalcount: 0 count: 0 ` +
 				`referrers: [] signatureinfo: [] artifacttype: "" ` +
-				`--- reponame: repo7 tag: test:2.0 ` +
+				`--- reponame: repo7 tag: "2.0" ` +
 				`digest: sha256:51e18f508fd7125b0831ff9a22ba74cd79f0b934e77661ff72cfb54896951a06 ` +
 				`mediatype: application/vnd.oci.image.manifest.v1+json manifests: - ` +
 				`digest: sha256:51e18f508fd7125b0831ff9a22ba74cd79f0b934e77661ff72cfb54896951a06 ` +
@@ -543,7 +543,7 @@ func TestServerResponseGQL(t *testing.T) {
 		conf.HTTP.Port = "0"
 		defaultVal := true
 		conf.Extensions = &extconf.ExtensionConfig{
-			Search: &extconf.SearchConfig{BaseConfig: extconf.BaseConfig{Enable: &defaultVal}},
+			Search: &extconf.SearchConfig{Enable: &defaultVal},
 		}
 		ctlr := api.NewController(conf)
 		ctlr.Config.Storage.RootDirectory = t.TempDir()
@@ -574,8 +574,8 @@ func TestServerResponseGQL(t *testing.T) {
 			str := space.ReplaceAllString(buff.String(), " ")
 			actual := strings.TrimSpace(str)
 			So(actual, ShouldContainSubstring, "REPOSITORY TAG OS/ARCH DIGEST SIGNED SIZE")
-			So(actual, ShouldContainSubstring, "repo7 test:2.0 linux/amd64 51e18f50 false 528B")
-			So(actual, ShouldContainSubstring, "repo7 test:1.0 linux/amd64 51e18f50 false 528B")
+			So(actual, ShouldContainSubstring, "repo7 2.0 linux/amd64 51e18f50 false 528B")
+			So(actual, ShouldContainSubstring, "repo7 1.0 linux/amd64 51e18f50 false 528B")
 			Convey("Test all images invalid output format", func() {
 				args := []string{"list", "--config", "imagetest", "-f", "random"}
 
@@ -609,13 +609,13 @@ func TestServerResponseGQL(t *testing.T) {
 			actual := strings.TrimSpace(str)
 			// Actual cli output should be something similar to (order of images may differ):
 			// REPOSITORY    TAG       OS/ARCH     DIGEST    CONFIG    SIGNED  LAYERS    SIZE
-			// repo7         test:2.0  linux/amd64 51e18f50  d14faead  false             528B
+			// repo7         2.0  linux/amd64 51e18f50  d14faead  false             528B
 			//                                                                 b8781e88  15B
-			// repo7         test:1.0  linux/amd64 51e18f50  d14faead  false             528B
+			// repo7         1.0  linux/amd64 51e18f50  d14faead  false             528B
 			//                                                                 b8781e88  15B
 			So(actual, ShouldContainSubstring, "REPOSITORY TAG OS/ARCH DIGEST CONFIG SIGNED LAYERS SIZE")
-			So(actual, ShouldContainSubstring, "repo7 test:2.0 linux/amd64 51e18f50 d14faead false 528B b8781e88 15B")
-			So(actual, ShouldContainSubstring, "repo7 test:1.0 linux/amd64 51e18f50 d14faead false 528B b8781e88 15B")
+			So(actual, ShouldContainSubstring, "repo7 2.0 linux/amd64 51e18f50 d14faead false 528B b8781e88 15B")
+			So(actual, ShouldContainSubstring, "repo7 1.0 linux/amd64 51e18f50 d14faead false 528B b8781e88 15B")
 		})
 
 		Convey("Test all images with debug flag", func() {
@@ -638,8 +638,8 @@ func TestServerResponseGQL(t *testing.T) {
 			actual := strings.TrimSpace(str)
 			So(actual, ShouldContainSubstring, "GET")
 			So(actual, ShouldContainSubstring, "REPOSITORY TAG OS/ARCH DIGEST SIGNED SIZE")
-			So(actual, ShouldContainSubstring, "repo7 test:2.0 linux/amd64 51e18f50 false 528B")
-			So(actual, ShouldContainSubstring, "repo7 test:1.0 linux/amd64 51e18f50 false 528B")
+			So(actual, ShouldContainSubstring, "repo7 2.0 linux/amd64 51e18f50 false 528B")
+			So(actual, ShouldContainSubstring, "repo7 1.0 linux/amd64 51e18f50 false 528B")
 		})
 
 		Convey("Test image by name config url", func() {
@@ -661,8 +661,8 @@ func TestServerResponseGQL(t *testing.T) {
 
 			actual := strings.TrimSpace(str)
 			So(actual, ShouldContainSubstring, "REPOSITORY TAG OS/ARCH DIGEST SIGNED SIZE")
-			So(actual, ShouldContainSubstring, "repo7 test:2.0 linux/amd64 51e18f50 false 528B")
-			So(actual, ShouldContainSubstring, "repo7 test:1.0 linux/amd64 51e18f50 false 528B")
+			So(actual, ShouldContainSubstring, "repo7 2.0 linux/amd64 51e18f50 false 528B")
+			So(actual, ShouldContainSubstring, "repo7 1.0 linux/amd64 51e18f50 false 528B")
 
 			Convey("invalid output format", func() {
 				args := []string{"name", "repo7", "--config", "imagetest", "-f", "random"}
@@ -697,11 +697,11 @@ func TestServerResponseGQL(t *testing.T) {
 			actual := strings.TrimSpace(str)
 			// Actual cli output should be something similar to (order of images may differ):
 			// REPOSITORY    TAG       OS/ARCH DIGEST    SIZE
-			// repo7         test:2.0          a0ca253b  15B
-			// repo7         test:1.0          a0ca253b  15B
+			// repo7         2.0          a0ca253b  15B
+			// repo7         1.0          a0ca253b  15B
 			So(actual, ShouldContainSubstring, "REPOSITORY TAG OS/ARCH DIGEST SIGNED SIZE")
-			So(actual, ShouldContainSubstring, "repo7 test:2.0 linux/amd64 51e18f50 false 528B")
-			So(actual, ShouldContainSubstring, "repo7 test:1.0 linux/amd64 51e18f50 false 528B")
+			So(actual, ShouldContainSubstring, "repo7 2.0 linux/amd64 51e18f50 false 528B")
+			So(actual, ShouldContainSubstring, "repo7 1.0 linux/amd64 51e18f50 false 528B")
 
 			Convey("nonexistent digest", func() {
 				args := []string{"digest", "d1g35t", "--config", "imagetest"}
@@ -776,7 +776,7 @@ func TestServerResponse(t *testing.T) {
 	conf.HTTP.Port = "0"
 	defaultVal := true
 	conf.Extensions = &extconf.ExtensionConfig{
-		Search: &extconf.SearchConfig{BaseConfig: extconf.BaseConfig{Enable: &defaultVal}},
+		Search: &extconf.SearchConfig{Enable: &defaultVal},
 	}
 	ctlr := api.NewController(conf)
 	ctlr.Config.Storage.RootDirectory = t.TempDir()
@@ -804,8 +804,8 @@ func TestServerResponse(t *testing.T) {
 			str := space.ReplaceAllString(buff.String(), " ")
 			actual := strings.TrimSpace(str)
 			So(actual, ShouldContainSubstring, "REPOSITORY TAG OS/ARCH DIGEST SIGNED SIZE")
-			So(actual, ShouldContainSubstring, "repo7 test:2.0 linux/amd64 51e18f50 false 528B")
-			So(actual, ShouldContainSubstring, "repo7 test:1.0 linux/amd64 51e18f50 false 528B")
+			So(actual, ShouldContainSubstring, "repo7 2.0 linux/amd64 51e18f50 false 528B")
+			So(actual, ShouldContainSubstring, "repo7 1.0 linux/amd64 51e18f50 false 528B")
 		})
 
 		Convey("Test all images verbose", func() {
@@ -822,13 +822,13 @@ func TestServerResponse(t *testing.T) {
 			actual := strings.TrimSpace(str)
 			// Actual cli output should be something similar to (order of images may differ):
 			// REPOSITORY    TAG        OS/ARCH     DIGEST    CONFIG     SIGNED  LAYERS    SIZE
-			// repo7         test:2.0   linux/amd64 51e18f50  d14faead   false             528B
+			// repo7         2.0   linux/amd64 51e18f50  d14faead   false             528B
 			//                                                                    b8781e88  15B
-			// repo7         test:1.0   linux/amd64 51e18f50  d14faead   false             528B
+			// repo7         1.0   linux/amd64 51e18f50  d14faead   false             528B
 			//                                                                    b8781e88  15B
 			So(actual, ShouldContainSubstring, "REPOSITORY TAG OS/ARCH DIGEST CONFIG SIGNED LAYERS SIZE")
-			So(actual, ShouldContainSubstring, "repo7 test:2.0 linux/amd64 51e18f50 d14faead false 528B b8781e88 15B")
-			So(actual, ShouldContainSubstring, "repo7 test:1.0 linux/amd64 51e18f50 d14faead false 528B b8781e88 15B")
+			So(actual, ShouldContainSubstring, "repo7 2.0 linux/amd64 51e18f50 d14faead false 528B b8781e88 15B")
+			So(actual, ShouldContainSubstring, "repo7 1.0 linux/amd64 51e18f50 d14faead false 528B b8781e88 15B")
 		})
 
 		Convey("Test image by name", func() {
@@ -840,8 +840,8 @@ func TestServerResponse(t *testing.T) {
 			str := space.ReplaceAllString(buff.String(), " ")
 			actual := strings.TrimSpace(str)
 			So(actual, ShouldContainSubstring, "REPOSITORY TAG OS/ARCH DIGEST SIGNED SIZE")
-			So(actual, ShouldContainSubstring, "repo7 test:2.0 linux/amd64 51e18f50 false 528B")
-			So(actual, ShouldContainSubstring, "repo7 test:1.0 linux/amd64 51e18f50 false 528B")
+			So(actual, ShouldContainSubstring, "repo7 2.0 linux/amd64 51e18f50 false 528B")
+			So(actual, ShouldContainSubstring, "repo7 1.0 linux/amd64 51e18f50 false 528B")
 		})
 
 		Convey("Test image by digest", func() {
@@ -854,11 +854,11 @@ func TestServerResponse(t *testing.T) {
 			actual := strings.TrimSpace(str)
 			// Actual cli output should be something similar to (order of images may differ):
 			// REPOSITORY    TAG       OS/ARCH      DIGEST     SIZE
-			// repo7         test:2.0  linux/amd64  51e18f50   528B
-			// repo7         test:1.0  linux/amd64  51e18f50   528B
+			// repo7         2.0  linux/amd64  51e18f50   528B
+			// repo7         1.0  linux/amd64  51e18f50   528B
 			So(actual, ShouldContainSubstring, "REPOSITORY TAG OS/ARCH DIGEST SIGNED SIZE")
-			So(actual, ShouldContainSubstring, "repo7 test:2.0 linux/amd64 51e18f50 false 528B")
-			So(actual, ShouldContainSubstring, "repo7 test:1.0 linux/amd64 51e18f50 false 528B")
+			So(actual, ShouldContainSubstring, "repo7 2.0 linux/amd64 51e18f50 false 528B")
+			So(actual, ShouldContainSubstring, "repo7 1.0 linux/amd64 51e18f50 false 528B")
 
 			Convey("nonexistent digest", func() {
 				buff := &bytes.Buffer{}
@@ -905,7 +905,7 @@ func TestServerResponseGQLWithoutPermissions(t *testing.T) {
 		conf.Storage.RootDirectory = dir
 		defaultVal := true
 		searchConfig := &extconf.SearchConfig{
-			BaseConfig: extconf.BaseConfig{Enable: &defaultVal},
+			Enable: &defaultVal,
 		}
 		conf.Extensions = &extconf.ExtensionConfig{
 			Search: searchConfig,
@@ -926,7 +926,7 @@ func TestDisplayIndex(t *testing.T) {
 		Convey("No GQL", func() {
 			defaultVal := false
 			conf.Extensions = &extconf.ExtensionConfig{
-				Search: &extconf.SearchConfig{BaseConfig: extconf.BaseConfig{Enable: &defaultVal}},
+				Search: &extconf.SearchConfig{Enable: &defaultVal},
 			}
 			ctlr := api.NewController(conf)
 			ctlr.Config.Storage.RootDirectory = t.TempDir()
@@ -941,7 +941,7 @@ func TestDisplayIndex(t *testing.T) {
 		Convey("With GQL", func() {
 			defaultVal := true
 			conf.Extensions = &extconf.ExtensionConfig{
-				Search: &extconf.SearchConfig{BaseConfig: extconf.BaseConfig{Enable: &defaultVal}},
+				Search: &extconf.SearchConfig{Enable: &defaultVal},
 			}
 			ctlr := api.NewController(conf)
 			ctlr.Config.Storage.RootDirectory = t.TempDir()
@@ -1017,8 +1017,8 @@ func TestImagesSortFlag(t *testing.T) {
 	defaultVal := true
 	conf.Extensions = &extconf.ExtensionConfig{
 		Search: &extconf.SearchConfig{
-			BaseConfig: extconf.BaseConfig{Enable: &defaultVal},
-			CVE:        nil,
+			Enable: &defaultVal,
+			CVE:    nil,
 		},
 	}
 	ctlr := api.NewController(conf)
@@ -1097,7 +1097,7 @@ func uploadTestMultiarch(baseURL string) {
 		}).
 		ImageConfig(
 			ispec.Image{
-				Platform: ispec.Platform{OS: "linux", Architecture: "amd64"},
+				OS: "linux", Architecture: "amd64",
 			},
 		).Build()
 
@@ -1110,7 +1110,7 @@ func uploadTestMultiarch(baseURL string) {
 		}).
 		ImageConfig(
 			ispec.Image{
-				Platform: ispec.Platform{OS: "windows", Architecture: "arm64", Variant: "v6"},
+				OS: "windows", Architecture: "arm64", Variant: "v6",
 			},
 		).Build()
 
@@ -1136,11 +1136,9 @@ func uploadManifest(url string) error {
 	createdTime := time.Date(2023, 1, 1, 12, 0, 0, 0, time.UTC)
 
 	config := ispec.Image{
-		Created: &createdTime,
-		Platform: ispec.Platform{
-			Architecture: "amd64",
-			OS:           "linux",
-		},
+		Created:      &createdTime,
+		Architecture: "amd64",
+		OS:           "linux",
 		RootFS: ispec.RootFS{
 			Type:    "layers",
 			DiffIDs: []godigest.Digest{},
@@ -1169,6 +1167,7 @@ func uploadManifest(url string) error {
 
 	// create a manifest
 	manifest := ispec.Manifest{
+		SchemaVersion: 2,
 		Config: ispec.Descriptor{
 			MediaType: "application/vnd.oci.image.config.v1+json",
 			Digest:    cdigest,
@@ -1182,7 +1181,6 @@ func uploadManifest(url string) error {
 			},
 		},
 	}
-	manifest.SchemaVersion = 2
 
 	content, err = json.Marshal(manifest)
 	if err != nil {
@@ -1190,12 +1188,13 @@ func uploadManifest(url string) error {
 	}
 
 	_, _ = resty.R().SetHeader("Content-Type", "application/vnd.oci.image.manifest.v1+json").
-		SetBody(content).Put(url + "/v2/repo7/manifests/test:1.0")
+		SetBody(content).Put(url + "/v2/repo7/manifests/1.0")
 
 	content = []byte("this is a blob5")
 	digest = godigest.FromBytes(content)
 	// create a manifest with same blob but a different tag
 	manifest = ispec.Manifest{
+		SchemaVersion: 2,
 		Config: ispec.Descriptor{
 			MediaType: "application/vnd.oci.image.config.v1+json",
 			Digest:    cdigest,
@@ -1209,14 +1208,13 @@ func uploadManifest(url string) error {
 			},
 		},
 	}
-	manifest.SchemaVersion = 2
 
 	content, err = json.Marshal(manifest)
 	if err != nil {
 		return err
 	}
 	_, _ = resty.R().SetHeader("Content-Type", "application/vnd.oci.image.manifest.v1+json").
-		SetBody(content).Put(url + "/v2/repo7/manifests/test:2.0")
+		SetBody(content).Put(url + "/v2/repo7/manifests/2.0")
 
 	return nil
 }
@@ -1242,11 +1240,9 @@ func uploadManifestDerivedBase(url string) error {
 	createdTime := time.Date(2023, 1, 1, 12, 0, 0, 0, time.UTC)
 
 	config := ispec.Image{
-		Created: &createdTime,
-		Platform: ispec.Platform{
-			Architecture: "amd64",
-			OS:           "linux",
-		},
+		Created:      &createdTime,
+		Architecture: "amd64",
+		OS:           "linux",
 		RootFS: ispec.RootFS{
 			Type:    "layers",
 			DiffIDs: []godigest.Digest{},
@@ -1295,8 +1291,9 @@ func uploadManifestDerivedBase(url string) error {
 				Size:      int64(len(content3)),
 			},
 		},
+
+		SchemaVersion: 2,
 	}
-	manifest.SchemaVersion = 2
 
 	content, err := json.Marshal(manifest)
 	if err != nil {
@@ -1304,7 +1301,7 @@ func uploadManifestDerivedBase(url string) error {
 	}
 
 	_, _ = resty.R().SetHeader("Content-Type", "application/vnd.oci.image.manifest.v1+json").
-		SetBody(content).Put(url + "/v2/repo7/manifests/test:1.0")
+		SetBody(content).Put(url + "/v2/repo7/manifests/1.0")
 
 	content1 = []byte("this is a blob5.0")
 	digest1 = godigest.FromBytes(content1)
@@ -1322,15 +1319,16 @@ func uploadManifestDerivedBase(url string) error {
 				Size:      int64(len(content1)),
 			},
 		},
+
+		SchemaVersion: 2,
 	}
-	manifest.SchemaVersion = 2
 
 	content, err = json.Marshal(manifest)
 	if err != nil {
 		return err
 	}
 	_, _ = resty.R().SetHeader("Content-Type", "application/vnd.oci.image.manifest.v1+json").
-		SetBody(content).Put(url + "/v2/repo7/manifests/test:2.0")
+		SetBody(content).Put(url + "/v2/repo7/manifests/2.0")
 
 	return nil
 }

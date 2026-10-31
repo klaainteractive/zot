@@ -317,11 +317,7 @@ func TestServeExtensions(t *testing.T) {
 	defer func() { os.Args = oldArgs }()
 
 	Convey("config file with no extensions", t, func(c C) {
-		logPath := MakeTempFilePath(t, "zot-log.txt")
-
-		tmpFile := t.TempDir()
-
-		content := fmt.Sprintf(`{
+		content := `{
 			"storage": {
 				"rootDirectory": "%s"
 			},
@@ -333,21 +329,10 @@ func TestServeExtensions(t *testing.T) {
 				"level": "debug",
 				"output": "%s"
 			}
-		}`, tmpFile, logPath)
+		}`
 
-		cfgfile := MakeTempFileWithContent(t, "zot-test.json", content)
-
-		os.Args = []string{"cli_test", "serve", cfgfile}
-
-		go func() {
-			Convey("run", t, func() {
-				err := cli.NewServerRootCmd().Execute()
-				So(err, ShouldBeNil)
-			})
-		}()
-
-		baseURL := waitForKernelChosenPortBaseURL(logPath)
-		WaitTillServerReady(baseURL)
+		logPath, _, err := runCLIWithConfig(t, content)
+		So(err, ShouldBeNil)
 
 		data, err := os.ReadFile(logPath)
 
@@ -356,11 +341,7 @@ func TestServeExtensions(t *testing.T) {
 	})
 
 	Convey("config file with empty extensions", t, func(c C) {
-		logPath := MakeTempFilePath(t, "zot-log.txt")
-
-		tmpFile := t.TempDir()
-
-		content := fmt.Sprintf(`{
+		content := `{
 			"storage": {
 				"rootDirectory": "%s"
 			},
@@ -374,21 +355,11 @@ func TestServeExtensions(t *testing.T) {
 			},
 			"extensions": {
 			}
-		}`, tmpFile, logPath)
+		}`
 
-		cfgfile := MakeTempFileWithContent(t, "zot-test.json", content)
+		logPath, _, err := runCLIWithConfig(t, content)
+		So(err, ShouldBeNil)
 
-		os.Args = []string{"cli_test", "serve", cfgfile}
-
-		go func() {
-			Convey("run", t, func() {
-				err := cli.NewServerRootCmd().Execute()
-				So(err, ShouldBeNil)
-			})
-		}()
-
-		baseURL := waitForKernelChosenPortBaseURL(logPath)
-		WaitTillServerReady(baseURL)
 		data, err := os.ReadFile(logPath)
 		So(err, ShouldBeNil)
 		So(string(data), ShouldContainSubstring,
@@ -396,24 +367,13 @@ func TestServeExtensions(t *testing.T) {
 	})
 }
 
-func testWithMetricsEnabled(t *testing.T, rootDir string, cfgContentFormat string) {
+func testWithMetricsEnabled(t *testing.T, cfgContentFormat string) {
 	t.Helper()
-	logPath := MakeTempFilePath(t, "zot-log.txt")
 
-	content := fmt.Sprintf(cfgContentFormat, rootDir, logPath)
-	cfgfile := MakeTempFileWithContent(t, "zot-test.json", content)
+	logPath, _, err := runCLIWithConfig(t, cfgContentFormat)
+	So(err, ShouldBeNil)
 
-	os.Args = []string{"cli_test", "serve", cfgfile}
-
-	go func() {
-		Convey("run", t, func() {
-			err := cli.NewServerRootCmd().Execute()
-			So(err, ShouldBeNil)
-		})
-	}()
-
-	baseURL := waitForKernelChosenPortBaseURL(logPath)
-	WaitTillServerReady(baseURL)
+	baseURL := WaitForKernelChosenPortBaseURL(logPath)
 
 	resp, err := resty.R().Get(baseURL + "/metrics")
 	So(err, ShouldBeNil)
@@ -435,8 +395,6 @@ func TestServeMetricsExtension(t *testing.T) {
 	defer func() { os.Args = oldArgs }()
 
 	Convey("no explicit enable", t, func(c C) {
-		tmpFile := t.TempDir()
-
 		content := `{
 			"storage": {
 				"rootDirectory": "%s"
@@ -454,12 +412,10 @@ func TestServeMetricsExtension(t *testing.T) {
 				}
 			}
 		}`
-		testWithMetricsEnabled(t, tmpFile, content)
+		testWithMetricsEnabled(t, content)
 	})
 
 	Convey("no explicit enable but with prometheus parameter", t, func(c C) {
-		tmpFile := t.TempDir()
-
 		content := `{
 			"storage": {
 				"rootDirectory": "%s"
@@ -480,12 +436,10 @@ func TestServeMetricsExtension(t *testing.T) {
 				}
 			}
 		}`
-		testWithMetricsEnabled(t, tmpFile, content)
+		testWithMetricsEnabled(t, content)
 	})
 
 	Convey("with explicit enable, but without prometheus parameter", t, func(c C) {
-		tmpFile := t.TempDir()
-
 		content := `{
 			"storage": {
 				"rootDirectory": "%s"
@@ -504,15 +458,11 @@ func TestServeMetricsExtension(t *testing.T) {
 				}
 			}
 		}`
-		testWithMetricsEnabled(t, tmpFile, content)
+		testWithMetricsEnabled(t, content)
 	})
 
 	Convey("with explicit disable", t, func(c C) {
-		logPath := MakeTempFilePath(t, "zot-log.txt")
-
-		tmpFile := t.TempDir()
-
-		content := fmt.Sprintf(`{
+		content := `{
 					"storage": {
 						"rootDirectory": "%s"
 					},
@@ -529,21 +479,12 @@ func TestServeMetricsExtension(t *testing.T) {
 							"enable": false
 						}
 					}
-				}`, tmpFile, logPath)
+				}`
 
-		cfgfile := MakeTempFileWithContent(t, "zot-test.json", content)
+		logPath, _, err := runCLIWithConfig(t, content)
+		So(err, ShouldBeNil)
 
-		os.Args = []string{"cli_test", "serve", cfgfile}
-
-		go func() {
-			Convey("run", t, func() {
-				err := cli.NewServerRootCmd().Execute()
-				So(err, ShouldBeNil)
-			})
-		}()
-
-		baseURL := waitForKernelChosenPortBaseURL(logPath)
-		WaitTillServerReady(baseURL)
+		baseURL := WaitForKernelChosenPortBaseURL(logPath)
 
 		resp, err := resty.R().Get(baseURL + "/metrics")
 		So(err, ShouldBeNil)
@@ -858,7 +799,7 @@ func TestServeLintExtension(t *testing.T) {
 			"\"Extensions\":{\"Search\":null,\"Sync\":null,\"Metrics\":null,\"Scrub\":null,\"Lint\":{\"Enable\":true,\"MandatoryAnnotations\":") //nolint:lll // gofumpt conflicts with lll
 	})
 
-	Convey("lint enabled", t, func(c C) {
+	Convey("lint disabled", t, func(c C) {
 		content := `{
 					"storage": {
 						"rootDirectory": "%s"
@@ -932,6 +873,8 @@ func TestServeSearchEnabled(t *testing.T) {
 }
 
 func TestServeSearchEnabledDefaultCVEDB(t *testing.T) {
+	const ignoreFileContent = "# Add one reviewed vulnerability ID per line.\nGO-2026-5932\n"
+
 	oldArgs := os.Args
 
 	defer func() { os.Args = oldArgs }()
@@ -967,7 +910,8 @@ func TestServeSearchEnabledDefaultCVEDB(t *testing.T) {
 		// The default config handling logic will convert the 1h interval to a 2h interval
 		substring := "\"Search\":{\"Enable\":true,\"CVE\":{\"UpdateInterval\":7200000000000,\"Trivy\":" +
 			"{\"DBRepository\":\"ghcr.io/aquasecurity/trivy-db\",\"JavaDBRepository\":\"ghcr.io/aquasecurity/trivy-java-db\"," +
-			"\"VulnSeveritySources\":[\"auto\"],\"SBOM\":null}}}"
+			"\"IgnoreFile\":\"\",\"VulnSeveritySources\":[\"auto\"],\"DetectionPriority\":\"precise\"," +
+			"\"ScanRemovedPkgs\":false,\"IncludeDevDeps\":false,\"SBOM\":null}}}"
 
 		found, err := ReadLogFileAndSearchString(logPath, substring, readLogFileTimeout)
 
@@ -1033,6 +977,74 @@ func TestServeSearchEnabledDefaultCVEDB(t *testing.T) {
 		So(err, ShouldBeNil)
 
 		So(cfg.Extensions.Search.CVE.Trivy.VulnSeveritySources, ShouldResemble, []string{"nvd", "ghsa"})
+	})
+
+	Convey("IgnoreFile accepts an existing readable file", t, func(c C) {
+		cfg := config.New()
+		ignoreFile := MakeTempFileWithContent(t, ".trivyignore", ignoreFileContent)
+
+		content := fmt.Sprintf(`{
+				"storage": { "rootDirectory": "/tmp/zot" },
+				"http": { "address": "127.0.0.1", "port": "8080" },
+				"extensions": {
+					"search": {
+						"enable": true,
+						"cve": { "trivy": { "ignoreFile": %q } }
+					}
+				}
+			}`, ignoreFile)
+		configPath := MakeTempFileWithContent(t, "zot-test.json", content)
+
+		err := cli.LoadConfiguration(cfg, configPath)
+		So(err, ShouldBeNil)
+
+		So(cfg.Extensions.Search.CVE.Trivy.IgnoreFile, ShouldEqual, ignoreFile)
+	})
+
+	Convey("IgnoreFile rejects a missing file", t, func(c C) {
+		cfg := config.New()
+		ignoreFile := MakeTempFilePath(t, ".trivyignore")
+
+		content := fmt.Sprintf(`{
+				"storage": { "rootDirectory": "/tmp/zot" },
+				"http": { "address": "127.0.0.1", "port": "8080" },
+				"extensions": {
+					"search": {
+						"enable": true,
+						"cve": { "trivy": { "ignoreFile": %q } }
+					}
+				}
+			}`, ignoreFile)
+		configPath := MakeTempFileWithContent(t, "zot-test.json", content)
+
+		err := cli.LoadConfiguration(cfg, configPath)
+		So(err, ShouldNotBeNil)
+		So(err, ShouldWrap, zerr.ErrBadConfig)
+	})
+
+	Convey("IgnoreFile rejects an unreadable file", t, func(c C) {
+		cfg := config.New()
+		ignoreFile := MakeTempFileWithContent(t, ".trivyignore", ignoreFileContent)
+		So(os.Chmod(ignoreFile, 0o000), ShouldBeNil)
+		defer func() {
+			So(os.Chmod(ignoreFile, 0o600), ShouldBeNil)
+		}()
+
+		content := fmt.Sprintf(`{
+				"storage": { "rootDirectory": "/tmp/zot" },
+				"http": { "address": "127.0.0.1", "port": "8080" },
+				"extensions": {
+					"search": {
+						"enable": true,
+						"cve": { "trivy": { "ignoreFile": %q } }
+					}
+				}
+			}`, ignoreFile)
+		configPath := MakeTempFileWithContent(t, "zot-test.json", content)
+
+		err := cli.LoadConfiguration(cfg, configPath)
+		So(err, ShouldNotBeNil)
+		So(err, ShouldWrap, zerr.ErrBadConfig)
 	})
 
 	Convey("CVE with only updateInterval (no trivy key) gets VulnSeveritySources [auto]", t, func(c C) {
@@ -1736,8 +1748,8 @@ func TestSyncWithRemoteStorageConfig(t *testing.T) {
 
 		tmpfile := MakeTempFileWithContent(t, "zot-test.json", content)
 
-		os.Args = []string{"cli_test", "serve", tmpfile}
-		err := cli.NewServerRootCmd().Execute()
+		conf := config.New()
+		err := cli.LoadConfiguration(conf, tmpfile)
 		So(err, ShouldNotBeNil)
 
 		data, err := os.ReadFile(logPath)
@@ -1800,8 +1812,8 @@ func TestSyncWithRemoteStorageConfig(t *testing.T) {
 
 		tmpfile := MakeTempFileWithContent(t, "zot-test.json", content)
 
-		os.Args = []string{"cli_test", "serve", tmpfile}
-		err := cli.NewServerRootCmd().Execute()
+		conf := config.New()
+		err := cli.LoadConfiguration(conf, tmpfile)
 		So(err, ShouldNotBeNil)
 
 		data, err := os.ReadFile(logPath)

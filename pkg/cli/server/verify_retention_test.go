@@ -345,7 +345,7 @@ func TestRetentionCheckWithRetentionEnabledAndRedisDriver(t *testing.T) {
 		So(err, ShouldBeNil)
 
 		// Initialize storage and metaDB using the same approach as gc tests
-		metricsServer := monitoring.NewMetricsServer(false, zlog.NewLogger("info", ""))
+		metricsServer := monitoring.NewNopMetricServer()
 		// Create ImageStore directly (like gc tests)
 		imgStore := local.NewImageStore(storageDir, false, false, zlog.NewLogger("info", ""), metricsServer,
 			nil, nil, nil, nil)
@@ -475,7 +475,10 @@ func TestRetentionCheckWithRetentionEnabledAndRedisDriver(t *testing.T) {
 
 		defer ctrlManager.StopServer()
 
-		os.Args = []string{"cli_test", "verify-feature", "retention", "-l", logFile, "-t", "2s", configFile}
+		// -t is a fixed blocking wait (not poll-with-cap), and this is the only test in the file
+		// running verify-feature retention concurrently against a live controller with a
+		// Redis-backed metaDB, so it needs more headroom than the 2s used elsewhere.
+		os.Args = []string{"cli_test", "verify-feature", "retention", "-l", logFile, "-t", "10s", configFile}
 		err = cli.NewServerRootCmd().Execute()
 		So(err, ShouldBeNil)
 
@@ -501,7 +504,7 @@ func TestRetentionCheckWithRetentionEnabledAndRedisDriver(t *testing.T) {
 			"garbage collection and retention tasks will be submitted to the scheduler")
 		So(logStr, ShouldContainSubstring, "waiting for garbage collection tasks to complete...")
 		So(logStr, ShouldContainSubstring, "executing gc of orphaned blobs")
-		So(logStr, ShouldContainSubstring, "garbage collected blobs")
+		So(logStr, ShouldNotContainSubstring, "garbage collected blobs")
 		So(logStr, ShouldContainSubstring, "gc successfully completed")
 		So(logStr, ShouldContainSubstring, "retention check completed successfully")
 
@@ -575,7 +578,7 @@ func TestRetentionCheckWithRetentionEnabled(t *testing.T) {
 		So(err, ShouldBeNil)
 
 		// Initialize storage and metaDB using the same approach as gc tests
-		metricsServer := monitoring.NewMetricsServer(false, zlog.NewLogger("info", ""))
+		metricsServer := monitoring.NewNopMetricServer()
 		// Create ImageStore directly (like gc tests)
 		imgStore := local.NewImageStore(storageDir, false, false, zlog.NewLogger("info", ""), metricsServer,
 			nil, nil, nil, nil)
@@ -746,7 +749,7 @@ func TestRetentionCheckWithRetentionEnabled(t *testing.T) {
 			"garbage collection and retention tasks will be submitted to the scheduler")
 		So(logStr, ShouldContainSubstring, "waiting for garbage collection tasks to complete...")
 		So(logStr, ShouldContainSubstring, "executing gc of orphaned blobs")
-		So(logStr, ShouldContainSubstring, "garbage collected blobs")
+		So(logStr, ShouldNotContainSubstring, "garbage collected blobs")
 		So(logStr, ShouldContainSubstring, "gc successfully completed")
 		So(logStr, ShouldContainSubstring, "retention check completed successfully")
 
@@ -864,7 +867,7 @@ func TestRetentionCheckWithDeleteReferrers(t *testing.T) {
 		So(err, ShouldBeNil)
 
 		// Initialize storage and metaDB
-		metricsServer := monitoring.NewMetricsServer(false, zlog.NewLogger("info", ""))
+		metricsServer := monitoring.NewNopMetricServer()
 		imgStore := local.NewImageStore(storageDir, false, false, zlog.NewLogger("info", ""), metricsServer,
 			nil, nil, nil, nil)
 		params := boltdb.DBParameters{
@@ -960,7 +963,7 @@ func TestRetentionCheckWithDeleteReferrers(t *testing.T) {
 			"garbage collection and retention tasks will be submitted to the scheduler")
 		So(logStr, ShouldContainSubstring, "waiting for garbage collection tasks to complete...")
 		So(logStr, ShouldContainSubstring, "executing gc of orphaned blobs")
-		So(logStr, ShouldContainSubstring, "garbage collected blobs")
+		So(logStr, ShouldNotContainSubstring, "garbage collected blobs")
 		So(logStr, ShouldContainSubstring, "gc successfully completed")
 		So(logStr, ShouldContainSubstring, "retention check completed successfully")
 
@@ -1027,7 +1030,7 @@ func TestRetentionCheckWithRetentionDisabled(t *testing.T) {
 		So(err, ShouldBeNil)
 
 		// Initialize storage only (no MetaDB needed when retention is disabled)
-		metricsServer := monitoring.NewMetricsServer(false, zlog.NewLogger("info", ""))
+		metricsServer := monitoring.NewNopMetricServer()
 		imgStore := local.NewImageStore(storageDir, false, false, zlog.NewLogger("info", ""), metricsServer,
 			nil, nil, nil, nil)
 		storeController := storage.StoreController{}
@@ -1219,7 +1222,7 @@ func TestRetentionCheckWithSubpaths(t *testing.T) {
 		So(err, ShouldBeNil)
 
 		// Initialize storage and metaDB
-		metricsServer := monitoring.NewMetricsServer(false, zlog.NewLogger("info", ""))
+		metricsServer := monitoring.NewNopMetricServer()
 		imgStore := local.NewImageStore(storageDir, false, false, zlog.NewLogger("info", ""), metricsServer,
 			nil, nil, nil, nil)
 		subpathStore := local.NewImageStore(subpathStoreDir, false, false,
@@ -1377,7 +1380,7 @@ func TestRetentionCheckWithSubpaths(t *testing.T) {
 			"garbage collection and retention tasks will be submitted to the scheduler")
 		So(logStr, ShouldContainSubstring, "waiting for garbage collection tasks to complete...")
 		So(logStr, ShouldContainSubstring, "executing gc of orphaned blobs")
-		So(logStr, ShouldContainSubstring, "garbage collected blobs")
+		So(logStr, ShouldNotContainSubstring, "garbage collected blobs")
 		So(logStr, ShouldContainSubstring, "gc successfully completed")
 		So(logStr, ShouldContainSubstring, "retention check completed successfully")
 

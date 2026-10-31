@@ -13,7 +13,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	godigest "github.com/opencontainers/go-digest"
-	ispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
@@ -276,10 +275,7 @@ func (dwr *DynamoDB) getAllContainedMeta(ctx context.Context, imageIndexData *pr
 	manifestDigests := make([]string, 0, len(imageIndexData.Index.Index.Manifests))
 
 	for _, manifest := range imageIndexData.Index.Index.Manifests {
-		if manifest.MediaType != ispec.MediaTypeImageManifest &&
-			manifest.MediaType != ispec.MediaTypeImageIndex &&
-			!compat.IsCompatibleManifestMediaType(manifest.MediaType) &&
-			!compat.IsCompatibleManifestListMediaType(manifest.MediaType) {
+		if !compat.IsImageManifestMediaType(manifest.MediaType) && !compat.IsImageIndexMediaType(manifest.MediaType) {
 			// filter out unexpected media types from the manifest lists,
 			// this could be the case of buildkit cache entries for example
 			continue
@@ -299,12 +295,10 @@ func (dwr *DynamoDB) getAllContainedMeta(ctx context.Context, imageIndexData *pr
 			return imageMetaList, manifestDataList, err
 		}
 
-		if imageManifestData.MediaType == ispec.MediaTypeImageManifest ||
-			compat.IsCompatibleManifestMediaType(imageManifestData.MediaType) {
+		if compat.IsImageManifestMediaType(imageManifestData.MediaType) {
 			imageMetaList = append(imageMetaList, imageManifestData)
 			manifestDataList = append(manifestDataList, imageManifestData.Manifests[0])
-		} else if imageManifestData.MediaType == ispec.MediaTypeImageIndex ||
-			compat.IsCompatibleManifestListMediaType(imageManifestData.MediaType) {
+		} else if compat.IsImageIndexMediaType(imageManifestData.MediaType) {
 			partialImageDataList, partialManifestDataList, err := dwr.getAllContainedMeta(ctx, imageManifestData)
 			if err != nil {
 				return imageMetaList, manifestDataList, err
@@ -351,12 +345,23 @@ func (dwr *DynamoDB) setProtoRepoMeta(repo string, repoMeta *proto_go.RepoMeta) 
 }
 
 func (dwr *DynamoDB) getProtoRepoMeta(ctx context.Context, repo string) (*proto_go.RepoMeta, error) {
-	resp, err := dwr.Client.GetItem(ctx, &dynamodb.GetItemInput{
+	return dwr.getProtoRepoMetaWithConsistency(ctx, repo, false)
+}
+
+func (dwr *DynamoDB) getProtoRepoMetaWithConsistency(ctx context.Context, repo string,
+	consistentRead bool,
+) (*proto_go.RepoMeta, error) {
+	input := &dynamodb.GetItemInput{
 		TableName: aws.String(dwr.RepoMetaTablename),
 		Key: map[string]types.AttributeValue{
 			"TableKey": &types.AttributeValueMemberS{Value: repo},
 		},
-	})
+	}
+	if consistentRead {
+		input.ConsistentRead = aws.Bool(true)
+	}
+
+	resp, err := dwr.Client.GetItem(ctx, input)
 	if err != nil {
 		return nil, err
 	}
@@ -377,6 +382,8 @@ func (dwr *DynamoDB) getProtoRepoMeta(ctx context.Context, repo string) (*proto_
 		if err != nil {
 			return nil, err
 		}
+
+		common.StripSignatureLayerContent(protoRepoMeta)
 	}
 
 	if protoRepoMeta.Tags == nil {
@@ -567,12 +574,23 @@ func (dwr *DynamoDB) updateRepoLastUpdated(ctx context.Context, repo string, tim
 }
 
 func (dwr *DynamoDB) getProtoRepoBlobs(ctx context.Context, repo string) (*proto_go.RepoBlobs, error) {
-	resp, err := dwr.Client.GetItem(ctx, &dynamodb.GetItemInput{
+	return dwr.getProtoRepoBlobsWithConsistency(ctx, repo, false)
+}
+
+func (dwr *DynamoDB) getProtoRepoBlobsWithConsistency(ctx context.Context, repo string,
+	consistentRead bool,
+) (*proto_go.RepoBlobs, error) {
+	input := &dynamodb.GetItemInput{
 		TableName: aws.String(dwr.RepoBlobsTablename),
 		Key: map[string]types.AttributeValue{
 			"TableKey": &types.AttributeValueMemberS{Value: repo},
 		},
-	})
+	}
+	if consistentRead {
+		input.ConsistentRead = aws.Bool(true)
+	}
+
+	resp, err := dwr.Client.GetItem(ctx, input)
 	if err != nil {
 		return nil, err
 	}
@@ -740,8 +758,7 @@ func (dwr *DynamoDB) SearchTags(ctx context.Context, searchText string) ([]mType
 
 		var protoImageMeta *proto_go.ImageMeta
 
-		if descriptor.MediaType == ispec.MediaTypeImageManifest || //nolint:gocritic
-			compat.IsCompatibleManifestMediaType(descriptor.MediaType) {
+		if compat.IsImageManifestMediaType(descriptor.MediaType) { //nolint:gocritic
 			manifestDigest := descriptor.Digest
 
 			imageManifestData, err := dwr.GetProtoImageMeta(ctx, godigest.Digest(manifestDigest))
@@ -751,8 +768,7 @@ func (dwr *DynamoDB) SearchTags(ctx context.Context, searchText string) ([]mType
 			}
 
 			protoImageMeta = imageManifestData
-		} else if descriptor.MediaType == ispec.MediaTypeImageIndex ||
-			compat.IsCompatibleManifestListMediaType(descriptor.MediaType) {
+		} else if compat.IsImageIndexMediaType(descriptor.MediaType) {
 			indexDigest := godigest.Digest(descriptor.Digest)
 
 			imageIndexData, err := dwr.GetProtoImageMeta(ctx, indexDigest)
@@ -823,8 +839,7 @@ func (dwr *DynamoDB) FilterTags(ctx context.Context, filterRepoTag mTypes.Filter
 				continue
 			}
 
-			if descriptor.MediaType == ispec.MediaTypeImageManifest || //nolint:gocritic
-				compat.IsCompatibleManifestMediaType(descriptor.MediaType) {
+			if compat.IsImageManifestMediaType(descriptor.MediaType) { //nolint:gocritic
 				manifestDigest := descriptor.Digest
 
 				imageManifestData, err := dwr.GetProtoImageMeta(ctx, godigest.Digest(manifestDigest))
@@ -839,8 +854,7 @@ func (dwr *DynamoDB) FilterTags(ctx context.Context, filterRepoTag mTypes.Filter
 				if filterFunc(repoMeta, imageMeta) {
 					images = append(images, mConvert.GetFullImageMetaFromProto(tag, protoRepoMeta, imageManifestData))
 				}
-			} else if descriptor.MediaType == ispec.MediaTypeImageIndex ||
-				compat.IsCompatibleManifestListMediaType(descriptor.MediaType) {
+			} else if compat.IsImageIndexMediaType(descriptor.MediaType) {
 				indexDigest := descriptor.Digest
 
 				protoImageIndexMeta, err := dwr.GetProtoImageMeta(ctx, godigest.Digest(indexDigest))
@@ -976,6 +990,28 @@ func (dwr *DynamoDB) GetRepoMeta(ctx context.Context, repo string) (mTypes.RepoM
 	return mConvert.GetRepoMeta(protoRepoMeta), nil
 }
 
+func (dwr *DynamoDB) GetRepoSizeWithCandidate(ctx context.Context, repo string, references []string,
+	imageMeta mTypes.ImageMeta,
+) (int64, int64, error) {
+	var current, projected int64
+	protoRepoMeta, metaErr := dwr.getProtoRepoMetaWithConsistency(ctx, repo, true)
+	if metaErr != nil && !errors.Is(metaErr, zerr.ErrRepoMetaNotFound) {
+		return 0, 0, metaErr
+	}
+
+	repoBlobs, blobsErr := dwr.getProtoRepoBlobsWithConsistency(ctx, repo, true)
+	if blobsErr != nil {
+		return 0, 0, blobsErr
+	}
+
+	current, projected, err := common.ProjectRepoSize(protoRepoMeta, repoBlobs, references, imageMeta)
+	if err != nil {
+		return current, projected, err
+	}
+
+	return current, projected, nil
+}
+
 func (dwr *DynamoDB) GetFullImageMeta(ctx context.Context, repo string, tag string) (mTypes.FullImageMeta, error) {
 	protoRepoMeta, err := dwr.getProtoRepoMeta(ctx, repo)
 	if err != nil {
@@ -999,8 +1035,7 @@ func (dwr *DynamoDB) GetFullImageMeta(ctx context.Context, repo string, tag stri
 		return mTypes.FullImageMeta{}, err
 	}
 
-	if protoImageMeta.MediaType == ispec.MediaTypeImageIndex ||
-		compat.IsCompatibleManifestListMediaType(protoImageMeta.MediaType) {
+	if compat.IsImageIndexMediaType(protoImageMeta.MediaType) {
 		_, manifestDataList, err := dwr.getAllContainedMeta(ctx, protoImageMeta)
 		if err != nil {
 			return mTypes.FullImageMeta{}, err
@@ -1027,8 +1062,7 @@ func (dwr *DynamoDB) GetImageMeta(digest godigest.Digest) (mTypes.ImageMeta, err
 		return mTypes.ImageMeta{}, err
 	}
 
-	if protoImageMeta.MediaType == ispec.MediaTypeImageIndex ||
-		compat.IsCompatibleManifestListMediaType(protoImageMeta.MediaType) {
+	if compat.IsImageIndexMediaType(protoImageMeta.MediaType) {
 		_, manifestDataList, err := dwr.getAllContainedMeta(context.Background(), protoImageMeta)
 		if err != nil {
 			return mTypes.ImageMeta{}, err
@@ -1292,51 +1326,37 @@ func (dwr *DynamoDB) UpdateSignaturesValidity(ctx context.Context, repo string, 
 		return err
 	}
 
-	// update signatures with details about validity and author
+	verifyImageMeta := mConvert.GetImageMeta(protoImageMeta)
+
 	protoRepoMeta, err := dwr.getProtoRepoMeta(ctx, repo)
 	if err != nil {
 		return err
 	}
 
-	manifestSignatures := proto_go.ManifestSignatures{Map: map[string]*proto_go.SignaturesInfo{"": {}}}
-
-	for sigType, sigs := range protoRepoMeta.Signatures[manifestDigest.String()].Map {
-		if zcommon.IsContextDone(ctx) {
-			return ctx.Err()
-		}
-
-		signaturesInfo := []*proto_go.SignatureInfo{}
-
-		for _, sigInfo := range sigs.List {
-			layersInfo := []*proto_go.LayersInfo{}
-
-			for _, layerInfo := range sigInfo.LayersInfo {
-				author, date, isTrusted, _ := imgTrustStore.VerifySignature(sigType, layerInfo.LayerContent,
-					layerInfo.SignatureKey, manifestDigest, mConvert.GetImageMeta(protoImageMeta), repo)
-
-				if isTrusted {
-					layerInfo.Signer = author
-				} else {
-					layerInfo.Signer = ""
-				}
-
-				if !date.IsZero() {
-					layerInfo.Date = timestamppb.New(date)
-				}
-
-				layersInfo = append(layersInfo, layerInfo)
-			}
-
-			signaturesInfo = append(signaturesInfo, &proto_go.SignatureInfo{
-				SignatureManifestDigest: sigInfo.SignatureManifestDigest,
-				LayersInfo:              layersInfo,
-			})
-		}
-
-		manifestSignatures.Map[sigType] = &proto_go.SignaturesInfo{List: signaturesInfo}
+	signatures := protoRepoMeta.Signatures[manifestDigest.String()]
+	if signatures == nil {
+		return nil
 	}
 
-	protoRepoMeta.Signatures[manifestDigest.String()] = &manifestSignatures
+	validity, err := common.VerifyManifestSignatures(ctx, imgTrustStore, repo, manifestDigest, verifyImageMeta, signatures,
+		dwr.Log)
+	if err != nil {
+		return err
+	}
+
+	// re-read, so that changes made while the signatures were verified are not overwritten
+	protoRepoMeta, err = dwr.getProtoRepoMeta(ctx, repo)
+	if err != nil {
+		return err
+	}
+
+	currentSignatures := protoRepoMeta.Signatures[manifestDigest.String()]
+	if currentSignatures == nil {
+		// the signatures, or the whole repo, were removed while they were verified
+		return nil
+	}
+
+	common.ApplySignaturesValidity(currentSignatures, validity)
 
 	return dwr.setProtoRepoMeta(protoRepoMeta.Name, protoRepoMeta) //nolint: contextcheck
 }
@@ -1448,9 +1468,14 @@ func (dwr *DynamoDB) DeleteSignature(repo string, signedManifestDigest godigest.
 		return zerr.ErrImageMetaNotFound
 	}
 
-	signatureSlice := manifestSignatures.Map[sigType]
+	// SetRepoReference pre-creates Signatures[digest] without typed entries; missing
+	// types (e.g. signature layer never parsed into meta) are already cleaned.
+	signatureSlice, found := manifestSignatures.Map[sigType]
+	if !found || signatureSlice == nil {
+		return nil
+	}
 
-	newSignatureSlice := make([]*proto_go.SignatureInfo, 0, len(signatureSlice.List)-1)
+	newSignatureSlice := make([]*proto_go.SignatureInfo, 0, len(signatureSlice.List))
 
 	for _, sigDigest := range signatureSlice.List {
 		if sigDigest.SignatureManifestDigest != sigMeta.SignatureDigest {
@@ -1501,8 +1526,7 @@ func (dwr *DynamoDB) FilterImageMeta(ctx context.Context, digests []string,
 			return nil, err
 		}
 
-		if protoImageMeta.MediaType == ispec.MediaTypeImageIndex ||
-			compat.IsCompatibleManifestListMediaType(protoImageMeta.MediaType) {
+		if compat.IsImageIndexMediaType(protoImageMeta.MediaType) {
 			_, manifestDataList, err := dwr.getAllContainedMeta(context.Background(), protoImageMeta)
 			if err != nil {
 				return nil, err
@@ -1585,8 +1609,10 @@ func (dwr *DynamoDB) RemoveRepoReference(repo, reference string, manifestDigest 
 		}
 	}
 
-	/* try to find at least one tag pointing to manifestDigest
-	if not found then we can also remove everything related to this digest */
+	// No remaining tag points at this digest. Signatures and referrers are
+	// deleted either way. Statistics stay when reference is a tag, because that
+	// caller left the manifest in the index. They are deleted when reference is
+	// a digest, because the manifest itself is gone.
 	var foundTag bool
 
 	for _, desc := range protoRepoMeta.Tags {
@@ -1596,7 +1622,10 @@ func (dwr *DynamoDB) RemoveRepoReference(repo, reference string, manifestDigest 
 	}
 
 	if !foundTag {
-		delete(protoRepoMeta.Statistics, manifestDigest.String())
+		if common.ReferenceIsDigest(reference) {
+			delete(protoRepoMeta.Statistics, manifestDigest.String())
+		}
+
 		delete(protoRepoMeta.Signatures, manifestDigest.String())
 		delete(protoRepoMeta.Referrers, manifestDigest.String())
 	}
@@ -2354,8 +2383,7 @@ func (dwr *DynamoDB) tableExists(tableName string) (bool, error) {
 		return true, nil
 	}
 
-	var notFoundErr *types.ResourceNotFoundException
-	if errors.As(err, &notFoundErr) {
+	if _, ok := errors.AsType[*types.ResourceNotFoundException](err); ok {
 		return false, nil
 	}
 
@@ -2380,8 +2408,7 @@ func ignoreResourceInUseError(err error) error {
 		return nil
 	}
 
-	var inUseException *types.ResourceInUseException
-	if errors.As(err, &inUseException) {
+	if _, ok := errors.AsType[*types.ResourceInUseException](err); ok {
 		return nil
 	}
 

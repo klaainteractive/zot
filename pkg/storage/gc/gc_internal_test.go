@@ -8,12 +8,16 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"slices"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/distribution/distribution/v3/registry/storage/driver"
 	"github.com/go-viper/mapstructure/v2"
 	godigest "github.com/opencontainers/go-digest"
+	specs "github.com/opencontainers/image-spec/specs-go"
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
 	. "github.com/smartystreets/goconvey/convey"
 
@@ -25,17 +29,46 @@ import (
 	"zotregistry.dev/zot/v2/pkg/meta/types"
 	"zotregistry.dev/zot/v2/pkg/storage"
 	"zotregistry.dev/zot/v2/pkg/storage/cache"
-	common "zotregistry.dev/zot/v2/pkg/storage/common"
+	storageCommon "zotregistry.dev/zot/v2/pkg/storage/common"
 	storageConstants "zotregistry.dev/zot/v2/pkg/storage/constants"
+	"zotregistry.dev/zot/v2/pkg/storage/errclass"
 	"zotregistry.dev/zot/v2/pkg/storage/local"
+	storageTypes "zotregistry.dev/zot/v2/pkg/storage/types"
 	. "zotregistry.dev/zot/v2/pkg/test/image-utils"
 	"zotregistry.dev/zot/v2/pkg/test/mocks"
+	"zotregistry.dev/zot/v2/pkg/test/storageerrclass"
 )
+
+// concurrentReadSafeStore enables Prefetch in GC tests that need cancel-aware warm-up.
+type concurrentReadSafeStore struct {
+	mocks.MockedImageStore
+}
+
+func (s concurrentReadSafeStore) ConcurrentReadSafe() bool {
+	return true
+}
 
 var (
 	errGC    = errors.New("gc error")
 	repoName = "test" //nolint: gochecknoglobals
 )
+
+// statBlobMissingUnlessPresent returns a StatBlobFn that treats digests in present as
+// existing and every other digest as ErrBlobNotFound (used to drive stale-prune confirms).
+func statBlobMissingUnlessPresent(present ...godigest.Digest) func(string, godigest.Digest) (bool, int64, time.Time, error) {
+	alive := make(map[string]struct{}, len(present))
+	for _, d := range present {
+		alive[d.String()] = struct{}{}
+	}
+
+	return func(_ string, digest godigest.Digest) (bool, int64, time.Time, error) {
+		if _, ok := alive[digest.String()]; ok {
+			return true, 0, time.Time{}, nil
+		}
+
+		return false, -1, time.Time{}, zerr.ErrBlobNotFound
+	}
+}
 
 type retentionPolicyMock struct {
 	retainedUntagged []string
@@ -73,138 +106,6 @@ func (rpm retentionPolicyMock) GetRetainedUntaggedFromMetaDB(ctx context.Context
 	return rpm.retainedUntagged
 }
 
-func TestGarbageCollectManifestErrors(t *testing.T) {
-	Convey("Make imagestore and upload manifest", t, func(c C) {
-		dir := t.TempDir()
-
-		log := zlog.NewTestLogger()
-		audit := zlog.NewAuditLogger("debug", "")
-
-		metrics := monitoring.NewMetricsServer(false, log)
-		defer metrics.Stop() // Clean up metrics server to prevent resource leaks
-
-		cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
-			RootDir:     dir,
-			Name:        "cache",
-			UseRelPaths: true,
-		}, log)
-		imgStore := local.NewImageStore(dir, true, true, log, metrics, nil, cacheDriver, nil, nil)
-
-		gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, Options{
-			Delay: storageConstants.DefaultGCDelay,
-			ImageRetention: config.ImageRetention{
-				Delay: storageConstants.DefaultGCDelay,
-				Policies: []config.RetentionPolicy{
-					{
-						Repositories:    []string{"**"},
-						DeleteReferrers: true,
-					},
-				},
-			},
-		}, audit, log, metrics)
-
-		Convey("trigger missing blob in addImageIndexBlobsToReferences()", func() {
-			// GC should continue when blobs are missing (not found), not return an error
-			err := gc.addIndexBlobsToReferences(repoName, ispec.Index{
-				Manifests: []ispec.Descriptor{
-					{
-						Digest:    godigest.FromString("miss"),
-						MediaType: ispec.MediaTypeImageIndex,
-					},
-				},
-			}, map[string]bool{})
-			So(err, ShouldBeNil)
-		})
-
-		Convey("trigger missing blob in addImageManifestBlobsToReferences()", func() {
-			// GC should continue when blobs are missing (not found), not return an error
-			err := gc.addIndexBlobsToReferences(repoName, ispec.Index{
-				Manifests: []ispec.Descriptor{
-					{
-						Digest:    godigest.FromString("miss"),
-						MediaType: ispec.MediaTypeImageManifest,
-					},
-				},
-			}, map[string]bool{})
-			So(err, ShouldBeNil)
-		})
-
-		content := []byte("this is a blob")
-		digest := godigest.FromBytes(content)
-		So(digest, ShouldNotBeNil)
-
-		_, blen, err := imgStore.FullBlobUpload(context.Background(), repoName, bytes.NewReader(content), digest)
-		So(err, ShouldBeNil)
-		So(blen, ShouldEqual, len(content))
-
-		cblob, cdigest := GetRandomImageConfig()
-		_, clen, err := imgStore.FullBlobUpload(context.Background(), repoName, bytes.NewReader(cblob), cdigest)
-		So(err, ShouldBeNil)
-		So(clen, ShouldEqual, len(cblob))
-
-		manifest := ispec.Manifest{
-			Config: ispec.Descriptor{
-				MediaType: ispec.MediaTypeImageConfig,
-				Digest:    cdigest,
-				Size:      int64(len(cblob)),
-			},
-			Layers: []ispec.Descriptor{
-				{
-					MediaType: ispec.MediaTypeImageLayer,
-					Digest:    digest,
-					Size:      int64(len(content)),
-				},
-			},
-		}
-
-		manifest.SchemaVersion = 2
-
-		body, err := json.Marshal(manifest)
-		So(err, ShouldBeNil)
-
-		manifestDigest := godigest.FromBytes(body)
-
-		_, _, err = imgStore.PutImageManifest(context.Background(), repoName, "1.0", ispec.MediaTypeImageManifest, body, nil)
-		So(err, ShouldBeNil)
-
-		Convey("trigger GetIndex error in GetReferencedBlobs", func() {
-			index, err := common.GetIndex(imgStore, repoName, log)
-			So(err, ShouldBeNil)
-
-			err = os.Chmod(path.Join(imgStore.RootDir(), repoName), 0o000)
-			So(err, ShouldBeNil)
-
-			defer func() {
-				err := os.Chmod(path.Join(imgStore.RootDir(), repoName), 0o755)
-				So(err, ShouldBeNil)
-			}()
-
-			// Note: Permission denied from Stat() is converted to ErrBlobNotFound in originalBlobInfo,
-			// so we can't distinguish it from missing blobs. GC treats missing blobs gracefully,
-			// so permission denied from Stat() will also be treated as missing (return nil).
-			// Permission denied from ReadFile() will still return an error.
-			err = gc.addIndexBlobsToReferences(repoName, index, map[string]bool{})
-			So(err, ShouldBeNil)
-		})
-
-		Convey("trigger GetImageManifest error in AddIndexBlobsToReferences", func() {
-			index, err := common.GetIndex(imgStore, repoName, log)
-			So(err, ShouldBeNil)
-
-			err = os.Chmod(path.Join(imgStore.RootDir(), repoName, "blobs", "sha256", manifestDigest.Encoded()), 0o000)
-			So(err, ShouldBeNil)
-
-			defer func() {
-				err := os.Chmod(path.Join(imgStore.RootDir(), repoName, "blobs", "sha256", manifestDigest.Encoded()), 0o755)
-				So(err, ShouldBeNil)
-			}()
-
-			err = gc.addIndexBlobsToReferences(repoName, index, map[string]bool{})
-			So(err, ShouldNotBeNil)
-		})
-	})
-}
-
 func TestRemoveUntaggedManifestsWithRetention(t *testing.T) {
 	Convey("removeUntaggedManifests keeps untagged manifests retained by policy", t, func() {
 		digest := godigest.FromString("retained")
@@ -238,130 +139,6 @@ func TestRemoveUntaggedManifestsWithRetention(t *testing.T) {
 	})
 }
 
-func TestGarbageCollectIndexErrors(t *testing.T) {
-	Convey("Make imagestore and upload manifest", t, func(c C) {
-		dir := t.TempDir()
-
-		log := zlog.NewTestLogger()
-		audit := zlog.NewAuditLogger("debug", "")
-
-		metrics := monitoring.NewMetricsServer(false, log)
-		defer metrics.Stop() // Clean up metrics server to prevent resource leaks
-		cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
-			RootDir:     dir,
-			Name:        "cache",
-			UseRelPaths: true,
-		}, log)
-		imgStore := local.NewImageStore(dir, true, true, log, metrics, nil, cacheDriver, nil, nil)
-
-		gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, Options{
-			Delay: storageConstants.DefaultGCDelay,
-			ImageRetention: config.ImageRetention{
-				Delay: storageConstants.DefaultGCDelay,
-				Policies: []config.RetentionPolicy{
-					{
-						Repositories:    []string{"**"},
-						DeleteReferrers: true,
-					},
-				},
-			},
-		}, audit, log, metrics)
-
-		content := []byte("this is a blob")
-		bdgst := godigest.FromBytes(content)
-		So(bdgst, ShouldNotBeNil)
-
-		_, bsize, err := imgStore.FullBlobUpload(context.Background(), repoName, bytes.NewReader(content), bdgst)
-		So(err, ShouldBeNil)
-		So(bsize, ShouldEqual, len(content))
-
-		var index ispec.Index
-		index.SchemaVersion = 2
-		index.MediaType = ispec.MediaTypeImageIndex
-
-		var digest godigest.Digest
-
-		for i := 0; i < 4; i++ {
-			// upload image config blob
-			upload, err := imgStore.NewBlobUpload(context.Background(), repoName)
-			So(err, ShouldBeNil)
-			So(upload, ShouldNotBeEmpty)
-
-			cblob, cdigest := GetRandomImageConfig()
-			buf := bytes.NewBuffer(cblob)
-			buflen := buf.Len()
-			blob, err := imgStore.PutBlobChunkStreamed(context.Background(), repoName, upload, buf)
-			So(err, ShouldBeNil)
-			So(blob, ShouldEqual, buflen)
-
-			err = imgStore.FinishBlobUpload(repoName, upload, buf, cdigest)
-			So(err, ShouldBeNil)
-			So(blob, ShouldEqual, buflen)
-
-			// create a manifest
-			manifest := ispec.Manifest{
-				Config: ispec.Descriptor{
-					MediaType: ispec.MediaTypeImageConfig,
-					Digest:    cdigest,
-					Size:      int64(len(cblob)),
-				},
-				Layers: []ispec.Descriptor{
-					{
-						MediaType: ispec.MediaTypeImageLayer,
-						Digest:    bdgst,
-						Size:      bsize,
-					},
-				},
-			}
-			manifest.SchemaVersion = 2
-			content, err = json.Marshal(manifest)
-			So(err, ShouldBeNil)
-
-			digest = godigest.FromBytes(content)
-			So(digest, ShouldNotBeNil)
-
-			_, _, err = imgStore.PutImageManifest(
-				context.Background(), repoName, digest.String(), ispec.MediaTypeImageManifest, content, nil)
-			So(err, ShouldBeNil)
-
-			index.Manifests = append(index.Manifests, ispec.Descriptor{
-				Digest:    digest,
-				MediaType: ispec.MediaTypeImageManifest,
-				Size:      int64(len(content)),
-			})
-		}
-
-		// upload index image
-		indexContent, err := json.Marshal(index)
-		So(err, ShouldBeNil)
-
-		indexDigest := godigest.FromBytes(indexContent)
-		So(indexDigest, ShouldNotBeNil)
-
-		_, _, err = imgStore.PutImageManifest(context.Background(), repoName, "1.0", ispec.MediaTypeImageIndex, indexContent, nil)
-		So(err, ShouldBeNil)
-
-		index, err = common.GetIndex(imgStore, repoName, log)
-		So(err, ShouldBeNil)
-
-		err = gc.addIndexBlobsToReferences(repoName, index, map[string]bool{})
-		So(err, ShouldBeNil)
-
-		Convey("trigger GetImageIndex error in GetReferencedBlobsInImageIndex", func() {
-			err := os.Chmod(path.Join(imgStore.RootDir(), repoName, "blobs", "sha256", indexDigest.Encoded()), 0o000)
-			So(err, ShouldBeNil)
-
-			defer func() {
-				err := os.Chmod(path.Join(imgStore.RootDir(), repoName, "blobs", "sha256", indexDigest.Encoded()), 0o755)
-				So(err, ShouldBeNil)
-			}()
-
-			err = gc.addIndexBlobsToReferences(repoName, index, map[string]bool{})
-			So(err, ShouldNotBeNil)
-		})
-	})
-}
-
 func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 	trueVal := true
 
@@ -370,8 +147,7 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 	Convey("Cover gc error paths", t, func(c C) {
 		log := zlog.NewTestLogger()
 		audit := zlog.NewAuditLogger("debug", "")
-		metrics := monitoring.NewMetricsServer(false, log)
-		defer metrics.Stop()
+		metrics := monitoring.NewNopMetricServer()
 
 		gcOptions := Options{
 			Delay: storageConstants.DefaultGCDelay,
@@ -397,25 +173,74 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 			So(err, ShouldNotBeNil)
 		})
 
-		Convey("Error on GetIndex in gc.removeUnreferencedBlobs()", func() {
+		Convey("Error on RemoveIdleRepository in gc.cleanRepo()", func() {
+			imgStore := mocks.MockedImageStore{
+				GetIndexContentFn: func(repo string) ([]byte, error) {
+					return []byte(`{"schemaVersion":2,"manifests":[]}`), nil
+				},
+				RemoveIdleRepositoryFn: func(repo string, maxBlobAge time.Duration) (bool, error) {
+					return false, errGC
+				},
+			}
+
+			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
+
+			err := gc.cleanRepo(ctx, repoName)
+			So(err, ShouldNotBeNil)
+		})
+
+		Convey("Meta delete failure after idle repo removal is logged, not returned", func() {
+			metaCalled := false
+
+			imgStore := mocks.MockedImageStore{
+				GetIndexContentFn: func(repo string) ([]byte, error) {
+					return []byte(`{"schemaVersion":2,"manifests":[]}`), nil
+				},
+				RemoveIdleRepositoryFn: func(repo string, maxBlobAge time.Duration) (bool, error) {
+					return true, nil
+				},
+			}
+
+			metaDB := mocks.MetaDBMock{
+				DeleteRepoMetaFn: func(repo string) error {
+					metaCalled = true
+
+					return errGC
+				},
+			}
+
+			gc := NewGarbageCollect(imgStore, metaDB, gcOptions, audit, log, metrics)
+
+			err := gc.cleanRepo(ctx, repoName)
+			So(err, ShouldBeNil)
+			So(metaCalled, ShouldBeTrue)
+		})
+
+		Convey("Error on GetIndex in gc.deleteUnreferencedBlobs()", func() {
 			gc := NewGarbageCollect(mocks.MockedImageStore{}, mocks.MetaDBMock{
 				GetRepoMetaFn: func(ctx context.Context, repo string) (types.RepoMeta, error) {
 					return types.RepoMeta{}, errGC
 				},
 			}, gcOptions, audit, log, metrics)
 
-			_, err := gc.removeUnreferencedBlobs("repo", time.Hour, log)
+			_, err := gc.deleteUnreferencedBlobs(context.Background(), "repo", time.Hour, log)
 			So(err, ShouldNotBeNil)
 		})
 
 		Convey("Error on gc.removeManifest()", func() {
-			gc := NewGarbageCollect(mocks.MockedImageStore{}, mocks.MetaDBMock{
-				GetRepoMetaFn: func(ctx context.Context, repo string) (types.RepoMeta, error) {
-					return types.RepoMeta{}, errGC
+			metaDB := mocks.MetaDBMock{
+				RemoveRepoReferenceFn: func(repo, reference string, manifestDigest godigest.Digest) error {
+					return errGC
 				},
-			}, gcOptions, audit, log, metrics)
+			}
+			gc := NewGarbageCollect(mocks.MockedImageStore{}, metaDB, gcOptions, audit, log, metrics)
 
-			_, err := gc.removeManifest("", &ispec.Index{}, ispec.DescriptorEmptyJSON, "tag", "", "")
+			desc := ispec.Descriptor{
+				MediaType: ispec.MediaTypeImageManifest,
+				Digest:    godigest.FromString("digest"),
+			}
+			index := &ispec.Index{Manifests: []ispec.Descriptor{desc}}
+			_, err := gc.removeManifest(repoName, index, desc, desc.Digest.String(), "", "")
 			So(err, ShouldNotBeNil)
 		})
 
@@ -494,12 +319,54 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 				GetIndexContentFn: func(repo string) ([]byte, error) {
 					return returnedIndexJSONBuf, nil
 				},
+				ListBlobUploadsFn: func(repo string) ([]string, error) {
+					return nil, nil
+				},
 			}
 
 			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
 
 			err = gc.cleanRepo(ctx, repoName)
 			So(err, ShouldNotBeNil)
+		})
+
+		Convey("cleanRepo deletes stale uploads before PutIndexContent fails", func() {
+			returnedIndexJSON := ispec.Index{}
+
+			returnedIndexJSONBuf, err := json.Marshal(returnedIndexJSON)
+			So(err, ShouldBeNil)
+
+			uploadUUID := "stale-upload"
+			deletedUpload := false
+
+			imgStore := mocks.MockedImageStore{
+				GetIndexContentFn: func(repo string) ([]byte, error) {
+					return returnedIndexJSONBuf, nil
+				},
+				ListBlobUploadsFn: func(repo string) ([]string, error) {
+					return []string{uploadUUID}, nil
+				},
+				StatBlobUploadFn: func(repo, uuid string) (bool, int64, time.Time, error) {
+					return true, 1024, time.Now().Add(-2 * time.Hour), nil
+				},
+				DeleteBlobUploadIfIdleFn: func(repo, uuid string) (bool, error) {
+					So(uuid, ShouldEqual, uploadUUID)
+					deletedUpload = true
+
+					return true, nil
+				},
+				PutIndexContentFn: func(repo string, index ispec.Index) error {
+					So(deletedUpload, ShouldBeTrue)
+
+					return zerr.ErrStoragePermanent
+				},
+			}
+
+			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
+
+			err = gc.cleanRepo(ctx, repoName)
+			So(errors.Is(err, zerr.ErrStoragePermanent), ShouldBeTrue)
+			So(deletedUpload, ShouldBeTrue)
 		})
 
 		Convey("Error on gc.cleanBlobs() in gc.cleanRepo()", func() {
@@ -526,17 +393,32 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 			So(err, ShouldNotBeNil)
 		})
 
-		Convey("False on imgStore.DirExists() in gc.cleanRepo()", func() {
+		Convey("GetIndex Transient propagates from cleanRepo (not ErrRepoNotFound)", func() {
 			imgStore := mocks.MockedImageStore{
-				DirExistsFn: func(d string) bool {
-					return false
+				GetIndexContentFn: func(repo string) ([]byte, error) {
+					return nil, zerr.ErrStorageTransient
 				},
 			}
 
 			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
 
 			err := gc.cleanRepo(ctx, repoName)
-			So(err, ShouldNotBeNil)
+			So(errors.Is(err, zerr.ErrStorageTransient), ShouldBeTrue)
+			So(errors.Is(err, zerr.ErrRepoNotFound), ShouldBeFalse)
+		})
+
+		Convey("GetIndex Missing maps to ErrRepoNotFound from cleanRepo", func() {
+			imgStore := mocks.MockedImageStore{
+				GetIndexContentFn: func(repo string) ([]byte, error) {
+					return nil, errclass.MarkMissing(errors.New("gone")) //nolint:err113 // test
+				},
+			}
+
+			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
+
+			err := gc.cleanRepo(ctx, repoName)
+			So(errors.Is(err, zerr.ErrRepoNotFound), ShouldBeTrue)
+			So(errors.Is(err, zerr.ErrStorageTransient), ShouldBeFalse)
 		})
 
 		Convey("Error on gc.identifyManifestsReferencedInIndex in gc.cleanManifests() with multiarch image", func() {
@@ -643,7 +525,7 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 			So(err, ShouldNotBeNil)
 		})
 
-		Convey("Error on gc.gcManifest() in gc.cleanManifests() with image", func() {
+		Convey("Error on gc.removeManifestIfOlderThan() in gc.cleanManifests() with image", func() {
 			returnedImage := ispec.Manifest{
 				MediaType: ispec.MediaTypeImageManifest,
 			}
@@ -683,7 +565,7 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 			})
 			So(err, ShouldNotBeNil)
 		})
-		Convey("Error on gc.gcManifest() in gc.cleanManifests() with signature", func() {
+		Convey("Error on gc.removeManifestIfOlderThan() in gc.cleanManifests() with signature", func() {
 			returnedImage := ispec.Manifest{
 				MediaType:    ispec.MediaTypeImageManifest,
 				ArtifactType: zcommon.NotationSignature,
@@ -721,7 +603,30 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 			So(err, ShouldNotBeNil)
 		})
 
-		Convey("Error on gc.gcReferrer() in gc.cleanManifests() with image index", func() {
+		Convey("removeManifest treats DeleteSignature ErrImageMetaNotFound as already cleaned", func() {
+			imgStore := mocks.MockedImageStore{}
+			metaDB := mocks.MetaDBMock{
+				DeleteSignatureFn: func(repo string, signedManifestDigest godigest.Digest, sm types.SignatureMetadata) error {
+					return zerr.ErrImageMetaNotFound
+				},
+			}
+
+			gcOptions.ImageRetention = config.ImageRetention{}
+			gc := NewGarbageCollect(imgStore, metaDB, gcOptions, audit, log, metrics)
+
+			desc := ispec.Descriptor{
+				MediaType: ispec.MediaTypeImageManifest,
+				Digest:    godigest.FromBytes([]byte("sig-digest")),
+			}
+			index := &ispec.Index{Manifests: []ispec.Descriptor{desc}}
+
+			gced, err := gc.removeManifest(repoName, index, desc, desc.Digest.String(), storage.NotationType,
+				godigest.FromBytes([]byte("subject-digest")))
+			So(err, ShouldBeNil)
+			So(gced, ShouldBeTrue)
+		})
+
+		Convey("StatBlob failure in gcReferrer skips age check and continues (image index)", func() {
 			manifestDesc := ispec.Descriptor{
 				MediaType: ispec.MediaTypeImageIndex,
 				Digest:    godigest.FromBytes([]byte("digest")),
@@ -752,10 +657,11 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
 
 			err = gc.removeManifestsPerRepoPolicy(ctx, repoName, &returnedIndexImage)
-			So(err, ShouldNotBeNil)
+			So(err, ShouldBeNil)
+			So(len(returnedIndexImage.Manifests), ShouldEqual, 1)
 		})
 
-		Convey("Error on gc.gcReferrer() in gc.cleanManifests() with image", func() {
+		Convey("StatBlob failure in gcReferrer skips age check and continues (image)", func() {
 			manifestDesc := ispec.Descriptor{
 				MediaType: ispec.MediaTypeImageManifest,
 				Digest:    godigest.FromBytes([]byte("digest")),
@@ -780,17 +686,20 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 				},
 			}
 
-			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
-
-			err = gc.removeManifestsPerRepoPolicy(ctx, repoName, &ispec.Index{
+			index := &ispec.Index{
 				Manifests: []ispec.Descriptor{
 					manifestDesc,
 				},
-			})
-			So(err, ShouldNotBeNil)
+			}
+
+			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
+
+			err = gc.removeManifestsPerRepoPolicy(ctx, repoName, index)
+			So(err, ShouldBeNil)
+			So(len(index.Manifests), ShouldEqual, 1)
 		})
 
-		Convey("Missing nested index blob in removeIndexReferrers is skipped gracefully", func() {
+		Convey("Missing nested index blob in removeReferrersWithMissingSubject is skipped gracefully", func() {
 			// Create a top-level index that contains a nested index
 			// The nested index blob will be missing
 			topLevelIndex := ispec.Index{
@@ -822,10 +731,196 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 
 			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
 
-			// removeIndexReferrers should skip the missing nested index and continue
-			gced, err := gc.removeIndexReferrers(repoName, &topLevelIndex, topLevelIndex)
+			// removeReferrersWithMissingSubject should skip the missing nested index and continue
+			gced, err := gc.removeReferrersWithMissingSubject(repoName, &topLevelIndex)
 			So(err, ShouldBeNil)
 			So(gced, ShouldBeFalse)
+		})
+
+		Convey("removeReferrersWithMissingSubject skips unknown media types", func() {
+			parentIndex := ispec.Index{
+				MediaType: ispec.MediaTypeImageIndex,
+				Manifests: []ispec.Descriptor{
+					{
+						MediaType: "application/vnd.unknown.manifest.v1+json",
+						Digest:    godigest.FromString("unknown-media"),
+						Size:      10,
+					},
+				},
+			}
+
+			readCount := 0
+			imgStore := mocks.MockedImageStore{
+				GetBlobContentFn: func(repo string, digest godigest.Digest) ([]byte, error) {
+					readCount++
+
+					return nil, zerr.ErrBlobNotFound
+				},
+			}
+
+			gcOptions.ImageRetention = config.ImageRetention{
+				Policies: []config.RetentionPolicy{
+					{
+						Repositories:    []string{"**"},
+						DeleteReferrers: true,
+					},
+				},
+			}
+
+			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
+
+			gced, err := gc.removeReferrersWithMissingSubject(repoName, &parentIndex)
+			So(err, ShouldBeNil)
+			So(gced, ShouldBeFalse)
+			So(readCount, ShouldEqual, 0)
+			So(len(parentIndex.Manifests), ShouldEqual, 1)
+		})
+
+		Convey("removeReferrersWithMissingSubject continues when index blob read fails", func() {
+			parentIndex := ispec.Index{
+				MediaType: ispec.MediaTypeImageIndex,
+				Manifests: []ispec.Descriptor{
+					{
+						MediaType: ispec.MediaTypeImageIndex,
+						Digest:    godigest.FromString("bad-index"),
+						Size:      10,
+					},
+				},
+			}
+
+			imgStore := mocks.MockedImageStore{
+				GetBlobContentFn: func(repo string, digest godigest.Digest) ([]byte, error) {
+					return nil, errGC
+				},
+			}
+
+			gcOptions.ImageRetention = config.ImageRetention{
+				Policies: []config.RetentionPolicy{
+					{
+						Repositories:    []string{"**"},
+						DeleteReferrers: true,
+					},
+				},
+			}
+
+			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
+
+			gced, err := gc.removeReferrersWithMissingSubject(repoName, &parentIndex)
+			So(err, ShouldBeNil)
+			So(gced, ShouldBeFalse)
+			So(len(parentIndex.Manifests), ShouldEqual, 1)
+		})
+
+		Convey("removeReferrersWithMissingSubject continues when manifest blob read fails", func() {
+			parentIndex := ispec.Index{
+				MediaType: ispec.MediaTypeImageIndex,
+				Manifests: []ispec.Descriptor{
+					{
+						MediaType: ispec.MediaTypeImageManifest,
+						Digest:    godigest.FromString("bad-manifest"),
+						Size:      10,
+					},
+				},
+			}
+
+			imgStore := mocks.MockedImageStore{
+				GetBlobContentFn: func(repo string, digest godigest.Digest) ([]byte, error) {
+					return nil, errGC
+				},
+			}
+
+			gcOptions.ImageRetention = config.ImageRetention{
+				Policies: []config.RetentionPolicy{
+					{
+						Repositories:    []string{"**"},
+						DeleteReferrers: true,
+					},
+				},
+			}
+
+			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
+
+			gced, err := gc.removeReferrersWithMissingSubject(repoName, &parentIndex)
+			So(err, ShouldBeNil)
+			So(gced, ShouldBeFalse)
+			So(len(parentIndex.Manifests), ShouldEqual, 1)
+		})
+
+		Convey("removeReferrer GCs orphaned notation signature via subject path", func() {
+			missingSubject := godigest.FromString("missing-subject")
+
+			desc := ispec.Descriptor{
+				MediaType: ispec.MediaTypeImageManifest,
+				Digest:    godigest.FromString("notation-sig"),
+				Size:      10,
+			}
+			parentIndex := ispec.Index{
+				MediaType: ispec.MediaTypeImageIndex,
+				Manifests: []ispec.Descriptor{desc},
+			}
+
+			imgStore := mocks.MockedImageStore{
+				StatBlobFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+					return true, 10, time.Now().Add(-24 * time.Hour), nil
+				},
+			}
+
+			deletedSig := false
+			metaDB := mocks.MetaDBMock{
+				DeleteSignatureFn: func(repo string, signedManifestDigest godigest.Digest, sm types.SignatureMetadata) error {
+					deletedSig = signedManifestDigest == missingSubject &&
+						sm.SignatureDigest == desc.Digest.String() &&
+						sm.SignatureType == storage.NotationType
+
+					return nil
+				},
+			}
+
+			gcOptions.ImageRetention = config.ImageRetention{Delay: 0}
+			gc := NewGarbageCollect(imgStore, metaDB, gcOptions, audit, log, metrics)
+
+			subject := &ispec.Descriptor{
+				MediaType: ispec.MediaTypeImageManifest,
+				Digest:    missingSubject,
+				Size:      1,
+			}
+			gced, err := gc.removeReferrer(repoName, &parentIndex, desc, subject, zcommon.ArtifactTypeNotation, nil)
+			So(err, ShouldBeNil)
+			So(gced, ShouldBeTrue)
+			So(deletedSig, ShouldBeTrue)
+			So(len(parentIndex.Manifests), ShouldEqual, 0)
+		})
+
+		Convey("removeReferrer skips cosign row when StatBlob fails (fail-closed age check)", func() {
+			missingSubject := godigest.FromString("missing-subject")
+			cosignTag := "sha256-" + missingSubject.Encoded() + ".sig"
+
+			desc := ispec.Descriptor{
+				MediaType: ispec.MediaTypeImageManifest,
+				Digest:    godigest.FromString("cosign-sig"),
+				Size:      10,
+				Annotations: map[string]string{
+					ispec.AnnotationRefName: cosignTag,
+				},
+			}
+			parentIndex := ispec.Index{
+				MediaType: ispec.MediaTypeImageIndex,
+				Manifests: []ispec.Descriptor{desc},
+			}
+
+			imgStore := mocks.MockedImageStore{
+				StatBlobFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+					return false, 0, time.Time{}, errGC
+				},
+			}
+
+			gcOptions.Delay = 0
+			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
+
+			gced, err := gc.removeReferrer(repoName, &parentIndex, desc, nil, "", nil)
+			So(err, ShouldBeNil)
+			So(gced, ShouldBeFalse)
+			So(len(parentIndex.Manifests), ShouldEqual, 1)
 		})
 
 		Convey("Missing nested index blob in identifyManifestsReferencedInIndex is skipped gracefully", func() {
@@ -853,17 +948,1130 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 
 			// identifyManifestsReferencedInIndex should skip the missing nested index and continue
 			referenced := make(map[godigest.Digest]bool)
-			err := gc.identifyManifestsReferencedInIndex(topLevelIndex, repoName, referenced)
+			err := gc.identifyManifestsReferencedInIndex(context.Background(), topLevelIndex, repoName, referenced,
+				map[godigest.Digest]struct{}{})
 			So(err, ShouldBeNil)
 			// No manifests should be marked as referenced since the nested index is missing
 			So(len(referenced), ShouldEqual, 0)
 		})
 
-		Convey("Error on ListBlobUploads in removeBlobUploads", func() {
-			imgStore := mocks.MockedImageStore{
-				DirExistsFn: func(d string) bool {
-					return true
+		Convey("memo returns nil when memos map is unset", func() {
+			gc := GarbageCollect{}
+			So(gc.memo(repoName), ShouldBeNil)
+		})
+
+		Convey("identifyManifestsReferencedInIndex returns canceled context immediately", func() {
+			gc := NewGarbageCollect(mocks.MockedImageStore{}, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+
+			err := gc.identifyManifestsReferencedInIndex(ctx, ispec.Index{}, repoName,
+				map[godigest.Digest]bool{}, map[godigest.Digest]struct{}{})
+			So(errors.Is(err, context.Canceled), ShouldBeTrue)
+		})
+
+		Convey("identifyManifestsReferencedInIndex returns after Prefetch sees cancel", func() {
+			const descs = 8
+
+			emptyIndex, err := json.Marshal(ispec.Index{SchemaVersion: 2})
+			So(err, ShouldBeNil)
+
+			rootManifests := make([]ispec.Descriptor, 0, descs)
+			for i := range descs {
+				rootManifests = append(rootManifests, ispec.Descriptor{
+					MediaType: ispec.MediaTypeImageIndex,
+					Digest:    godigest.FromString(fmt.Sprintf("identify-cancel-%d", i)),
+				})
+			}
+
+			release := make(chan struct{})
+			var inFlight, maxInFlight atomic.Int64
+
+			imgStore := concurrentReadSafeStore{
+				MockedImageStore: mocks.MockedImageStore{
+					GetBlobContentFn: func(repo string, digest godigest.Digest) ([]byte, error) {
+						cur := inFlight.Add(1)
+						for {
+							old := maxInFlight.Load()
+							if cur <= old || maxInFlight.CompareAndSwap(old, cur) {
+								break
+							}
+						}
+
+						<-release
+						inFlight.Add(-1)
+
+						return emptyIndex, nil
+					},
 				},
+			}
+
+			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
+			gc.memos.Store(repoName, storageCommon.NewWalkMemo())
+
+			ctx, cancel := context.WithCancel(context.Background())
+			errCh := make(chan error, 1)
+
+			go func() {
+				errCh <- gc.identifyManifestsReferencedInIndex(ctx, ispec.Index{Manifests: rootManifests},
+					repoName, map[godigest.Digest]bool{}, map[godigest.Digest]struct{}{})
+			}()
+
+			deadline := time.Now().Add(2 * time.Second)
+			for maxInFlight.Load() < 2 && time.Now().Before(deadline) {
+				time.Sleep(time.Millisecond)
+			}
+
+			ready := maxInFlight.Load() >= 2
+			cancel()
+			close(release)
+			identifyErr := <-errCh
+
+			So(ready, ShouldBeTrue)
+			So(errors.Is(identifyErr, context.Canceled), ShouldBeTrue)
+		})
+
+		Convey("identifyManifestsReferencedInIndex reads a shared nested index once", func() {
+			childManifestDigest := godigest.FromString("leaf-manifest")
+			subjectDigest := godigest.FromString("referrer-subject")
+
+			sharedIndex := ispec.Index{
+				MediaType: ispec.MediaTypeImageIndex,
+				Subject: &ispec.Descriptor{
+					MediaType: ispec.MediaTypeImageManifest,
+					Digest:    subjectDigest,
+					Size:      1,
+				},
+				Manifests: []ispec.Descriptor{
+					{
+						MediaType: ispec.MediaTypeImageManifest,
+						Digest:    childManifestDigest,
+						Size:      10,
+					},
+				},
+			}
+			sharedIndexBuf, err := json.Marshal(sharedIndex)
+			So(err, ShouldBeNil)
+			sharedIndexDigest := godigest.FromBytes(sharedIndexBuf)
+
+			// Parent index names the same nested index digest twice (duplicate sibling refs).
+			parentIndex := ispec.Index{
+				MediaType: ispec.MediaTypeImageIndex,
+				Manifests: []ispec.Descriptor{
+					{
+						MediaType: ispec.MediaTypeImageIndex,
+						Digest:    sharedIndexDigest,
+						Size:      int64(len(sharedIndexBuf)),
+					},
+					{
+						MediaType: ispec.MediaTypeImageIndex,
+						Digest:    sharedIndexDigest,
+						Size:      int64(len(sharedIndexBuf)),
+					},
+				},
+			}
+
+			readCount := 0
+			imgStore := mocks.MockedImageStore{
+				GetBlobContentFn: func(repo string, digest godigest.Digest) ([]byte, error) {
+					if digest == sharedIndexDigest {
+						readCount++
+
+						return sharedIndexBuf, nil
+					}
+
+					return nil, zerr.ErrBlobNotFound
+				},
+			}
+
+			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
+
+			referenced := make(map[godigest.Digest]bool)
+			err = gc.identifyManifestsReferencedInIndex(context.Background(), parentIndex, repoName, referenced,
+				map[godigest.Digest]struct{}{})
+			So(err, ShouldBeNil)
+			So(readCount, ShouldEqual, 1)
+			So(referenced[childManifestDigest], ShouldBeTrue)
+			// Nested index with a subject is itself marked as referenced (referrer).
+			So(referenced[sharedIndexDigest], ShouldBeTrue)
+		})
+
+		Convey("removeReferrersWithMissingSubject keeps a shared referrer whose subject is present", func() {
+			subjectDigest := godigest.FromString("present-subject")
+
+			sharedIndex := ispec.Index{
+				MediaType: ispec.MediaTypeImageIndex,
+				Subject: &ispec.Descriptor{
+					MediaType: ispec.MediaTypeImageManifest,
+					Digest:    subjectDigest,
+					Size:      1,
+				},
+				Manifests: []ispec.Descriptor{},
+			}
+			sharedIndexBuf, err := json.Marshal(sharedIndex)
+			So(err, ShouldBeNil)
+			sharedIndexDigest := godigest.FromBytes(sharedIndexBuf)
+
+			// rootIndex / parent lists the subject and duplicate refs to the shared referrer index.
+			parentIndex := ispec.Index{
+				MediaType: ispec.MediaTypeImageIndex,
+				Manifests: []ispec.Descriptor{
+					{
+						MediaType: ispec.MediaTypeImageManifest,
+						Digest:    subjectDigest,
+						Size:      1,
+					},
+					{
+						MediaType: ispec.MediaTypeImageIndex,
+						Digest:    sharedIndexDigest,
+						Size:      int64(len(sharedIndexBuf)),
+					},
+					{
+						MediaType: ispec.MediaTypeImageIndex,
+						Digest:    sharedIndexDigest,
+						Size:      int64(len(sharedIndexBuf)),
+					},
+				},
+			}
+
+			readCount := 0
+			imgStore := mocks.MockedImageStore{
+				GetBlobContentFn: func(repo string, digest godigest.Digest) ([]byte, error) {
+					if digest == sharedIndexDigest {
+						readCount++
+
+						return sharedIndexBuf, nil
+					}
+
+					return nil, zerr.ErrBlobNotFound
+				},
+			}
+
+			gcOptions.ImageRetention = config.ImageRetention{
+				Delay: 0,
+				Policies: []config.RetentionPolicy{
+					{
+						Repositories:    []string{"**"},
+						DeleteReferrers: true,
+					},
+				},
+			}
+
+			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
+
+			gced, err := gc.removeReferrersWithMissingSubject(repoName, &parentIndex)
+			So(err, ShouldBeNil)
+			So(gced, ShouldBeFalse)
+			So(readCount, ShouldEqual, 1)
+			So(len(parentIndex.Manifests), ShouldEqual, 3)
+		})
+
+		Convey("removeReferrersWithMissingSubject GCs an orphaned referrer with missing subject", func() {
+			missingSubject := godigest.FromString("missing-subject")
+
+			orphanedReferrer := ispec.Index{
+				MediaType: ispec.MediaTypeImageIndex,
+				Subject: &ispec.Descriptor{
+					MediaType: ispec.MediaTypeImageManifest,
+					Digest:    missingSubject,
+					Size:      1,
+				},
+				Manifests: []ispec.Descriptor{},
+			}
+			orphanedBuf, err := json.Marshal(orphanedReferrer)
+			So(err, ShouldBeNil)
+			orphanedDigest := godigest.FromBytes(orphanedBuf)
+
+			parentIndex := ispec.Index{
+				MediaType: ispec.MediaTypeImageIndex,
+				Manifests: []ispec.Descriptor{
+					{
+						MediaType: ispec.MediaTypeImageIndex,
+						Digest:    orphanedDigest,
+						Size:      int64(len(orphanedBuf)),
+					},
+				},
+			}
+
+			readCount := 0
+			statCount := 0
+			imgStore := mocks.MockedImageStore{
+				GetBlobContentFn: func(repo string, digest godigest.Digest) ([]byte, error) {
+					if digest == orphanedDigest {
+						readCount++
+
+						return orphanedBuf, nil
+					}
+
+					return nil, zerr.ErrBlobNotFound
+				},
+				StatBlobFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+					if digest == orphanedDigest {
+						statCount++
+					}
+
+					// Old enough to pass the retention delay check.
+					return true, int64(len(orphanedBuf)), time.Now().Add(-24 * time.Hour), nil
+				},
+			}
+
+			gcOptions.ImageRetention = config.ImageRetention{
+				Delay: 0,
+				Policies: []config.RetentionPolicy{
+					{
+						Repositories:    []string{"**"},
+						DeleteReferrers: true,
+					},
+				},
+			}
+
+			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
+
+			gced, err := gc.removeReferrersWithMissingSubject(repoName, &parentIndex)
+			So(err, ShouldBeNil)
+			So(gced, ShouldBeTrue)
+			So(readCount, ShouldEqual, 1)
+			So(statCount, ShouldEqual, 1)
+			So(len(parentIndex.Manifests), ShouldEqual, 0)
+		})
+
+		Convey("removeReferrer removes cosign .sig by tag when digest is also listed untagged", func() {
+			missingSubject := godigest.FromString("missing-subject")
+			cosignTag := "sha256-" + missingSubject.Encoded() + ".sig"
+
+			sharedManifest := ispec.Manifest{
+				MediaType: ispec.MediaTypeImageManifest,
+				Config:    ispec.Descriptor{Digest: godigest.FromString("cfg"), Size: 1},
+			}
+			sharedBuf, err := json.Marshal(sharedManifest)
+			So(err, ShouldBeNil)
+			sharedDigest := godigest.FromBytes(sharedBuf)
+
+			parentIndex := ispec.Index{
+				MediaType: ispec.MediaTypeImageIndex,
+				Manifests: []ispec.Descriptor{
+					{
+						MediaType: ispec.MediaTypeImageManifest,
+						Digest:    sharedDigest,
+						Size:      int64(len(sharedBuf)),
+					},
+					{
+						MediaType: ispec.MediaTypeImageManifest,
+						Digest:    sharedDigest,
+						Size:      int64(len(sharedBuf)),
+						Annotations: map[string]string{
+							ispec.AnnotationRefName: cosignTag,
+						},
+					},
+				},
+			}
+			cosignDesc := parentIndex.Manifests[1]
+
+			imgStore := mocks.MockedImageStore{
+				StatBlobFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+					return true, int64(len(sharedBuf)), time.Now().Add(-24 * time.Hour), nil
+				},
+			}
+
+			deletedSig := false
+			metaDB := mocks.MetaDBMock{
+				DeleteSignatureFn: func(repo string, signedManifestDigest godigest.Digest, sm types.SignatureMetadata) error {
+					deletedSig = signedManifestDigest == missingSubject &&
+						sm.SignatureDigest == sharedDigest.String() &&
+						sm.SignatureType == storage.CosignType
+
+					return nil
+				},
+			}
+
+			gcOptions.Delay = 0
+			gc := NewGarbageCollect(imgStore, metaDB, gcOptions, audit, log, metrics)
+
+			gced, err := gc.removeReferrer(repoName, &parentIndex, cosignDesc, nil, "", nil)
+			So(err, ShouldBeNil)
+			So(gced, ShouldBeTrue)
+			So(deletedSig, ShouldBeTrue)
+			So(len(parentIndex.Manifests), ShouldEqual, 1)
+			_, hasTag := parentIndex.Manifests[0].Annotations[ispec.AnnotationRefName]
+			So(hasTag, ShouldBeFalse)
+		})
+
+		Convey("removeReferrer skips legacy cosign tag prune when subject digest is malformed", func() {
+			malformedCosignTag := "sha256-not-a-valid-digest.sig"
+
+			sharedManifest := ispec.Manifest{
+				MediaType: ispec.MediaTypeImageManifest,
+				Config:    ispec.Descriptor{Digest: godigest.FromString("cfg"), Size: 1},
+			}
+			sharedBuf, err := json.Marshal(sharedManifest)
+			So(err, ShouldBeNil)
+			sharedDigest := godigest.FromBytes(sharedBuf)
+
+			parentIndex := ispec.Index{
+				MediaType: ispec.MediaTypeImageIndex,
+				Manifests: []ispec.Descriptor{
+					{
+						MediaType: ispec.MediaTypeImageManifest,
+						Digest:    sharedDigest,
+						Size:      int64(len(sharedBuf)),
+						Annotations: map[string]string{
+							ispec.AnnotationRefName: malformedCosignTag,
+						},
+					},
+				},
+			}
+			cosignDesc := parentIndex.Manifests[0]
+
+			statCalled := false
+			imgStore := mocks.MockedImageStore{
+				StatBlobFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+					statCalled = true
+
+					return true, int64(len(sharedBuf)), time.Now().Add(-24 * time.Hour), nil
+				},
+			}
+
+			deletedSig := false
+			removedRef := false
+			metaDB := mocks.MetaDBMock{
+				DeleteSignatureFn: func(repo string, signedManifestDigest godigest.Digest, sm types.SignatureMetadata) error {
+					deletedSig = true
+
+					return nil
+				},
+				RemoveRepoReferenceFn: func(repo, reference string, manifestDigest godigest.Digest) error {
+					removedRef = true
+
+					return nil
+				},
+			}
+
+			gcOptions.Delay = 0
+			gc := NewGarbageCollect(imgStore, metaDB, gcOptions, audit, log, metrics)
+
+			gced, err := gc.removeReferrer(repoName, &parentIndex, cosignDesc, nil, "", nil)
+			So(err, ShouldBeNil)
+			So(gced, ShouldBeFalse)
+			So(statCalled, ShouldBeFalse)
+			So(deletedSig, ShouldBeFalse)
+			So(removedRef, ShouldBeFalse)
+			So(len(parentIndex.Manifests), ShouldEqual, 1)
+			So(parentIndex.Manifests[0].Annotations[ispec.AnnotationRefName], ShouldEqual, malformedCosignTag)
+		})
+
+		Convey("removeReferrersWithMissingSubject GCs cosign .sig when digest is also listed untagged", func() {
+			missingSubject := godigest.FromString("missing-subject")
+			cosignTag := "sha256-" + missingSubject.Encoded() + ".sig"
+
+			sharedManifest := ispec.Manifest{
+				MediaType: ispec.MediaTypeImageManifest,
+				Config:    ispec.Descriptor{Digest: godigest.FromString("cfg"), Size: 1},
+			}
+			sharedBuf, err := json.Marshal(sharedManifest)
+			So(err, ShouldBeNil)
+			sharedDigest := godigest.FromBytes(sharedBuf)
+
+			parentIndex := ispec.Index{
+				MediaType: ispec.MediaTypeImageIndex,
+				Manifests: []ispec.Descriptor{
+					{
+						MediaType: ispec.MediaTypeImageManifest,
+						Digest:    sharedDigest,
+						Size:      int64(len(sharedBuf)),
+					},
+					{
+						MediaType: ispec.MediaTypeImageManifest,
+						Digest:    sharedDigest,
+						Size:      int64(len(sharedBuf)),
+						Annotations: map[string]string{
+							ispec.AnnotationRefName: cosignTag,
+						},
+					},
+				},
+			}
+
+			readCount := 0
+			imgStore := mocks.MockedImageStore{
+				GetBlobContentFn: func(repo string, digest godigest.Digest) ([]byte, error) {
+					if digest == sharedDigest {
+						readCount++
+
+						return sharedBuf, nil
+					}
+
+					return nil, zerr.ErrBlobNotFound
+				},
+				StatBlobFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+					return true, int64(len(sharedBuf)), time.Now().Add(-24 * time.Hour), nil
+				},
+			}
+
+			deletedSig := false
+			metaDB := mocks.MetaDBMock{
+				DeleteSignatureFn: func(repo string, signedManifestDigest godigest.Digest, sm types.SignatureMetadata) error {
+					deletedSig = signedManifestDigest == missingSubject &&
+						sm.SignatureDigest == sharedDigest.String() &&
+						sm.SignatureType == storage.CosignType
+
+					return nil
+				},
+			}
+
+			gcOptions.ImageRetention = config.ImageRetention{
+				Delay: 0,
+				Policies: []config.RetentionPolicy{
+					{
+						Repositories:    []string{"**"},
+						DeleteReferrers: true,
+					},
+				},
+			}
+
+			gc := NewGarbageCollect(imgStore, metaDB, gcOptions, audit, log, metrics)
+
+			gced, err := gc.removeReferrersWithMissingSubject(repoName, &parentIndex)
+			So(err, ShouldBeNil)
+			So(gced, ShouldBeTrue)
+			So(deletedSig, ShouldBeTrue)
+			So(readCount, ShouldEqual, 1)
+			So(len(parentIndex.Manifests), ShouldEqual, 1)
+			_, hasTag := parentIndex.Manifests[0].Annotations[ispec.AnnotationRefName]
+			So(hasTag, ShouldBeFalse)
+		})
+
+		Convey("removeReferrer removes a cosign bundle attestation with a missing subject as a referrer", func() {
+			missingSubject := godigest.FromString("missing-subject")
+			annotations := map[string]string{zcommon.CosignBundlePredicateTypeAnnotation: "https://spdx.dev/Document"}
+
+			referrer := ispec.Manifest{
+				MediaType:    ispec.MediaTypeImageManifest,
+				ArtifactType: zcommon.ArtifactTypeCosignBundle,
+				Config:       ispec.Descriptor{Digest: godigest.FromString("cfg"), Size: 1},
+				Subject: &ispec.Descriptor{
+					MediaType: ispec.MediaTypeImageManifest,
+					Digest:    missingSubject,
+					Size:      1,
+				},
+				Annotations: annotations,
+			}
+			referrerBuf, err := json.Marshal(referrer)
+			So(err, ShouldBeNil)
+			referrerDigest := godigest.FromBytes(referrerBuf)
+
+			parentIndex := ispec.Index{
+				MediaType: ispec.MediaTypeImageIndex,
+				Manifests: []ispec.Descriptor{
+					{
+						MediaType: ispec.MediaTypeImageManifest,
+						Digest:    referrerDigest,
+						Size:      int64(len(referrerBuf)),
+					},
+				},
+			}
+			attestationDesc := parentIndex.Manifests[0]
+
+			imgStore := mocks.MockedImageStore{
+				StatBlobFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+					return true, int64(len(referrerBuf)), time.Now().Add(-24 * time.Hour), nil
+				},
+			}
+
+			removedReferences := 0
+			metaDB := mocks.MetaDBMock{
+				DeleteSignatureFn: func(repo string, signedManifestDigest godigest.Digest, sm types.SignatureMetadata) error {
+					So("an attestation is not a signature", ShouldBeEmpty)
+
+					return nil
+				},
+				RemoveRepoReferenceFn: func(repo, reference string, manifestDigest godigest.Digest) error {
+					removedReferences++
+					So(manifestDigest, ShouldEqual, referrerDigest)
+
+					return nil
+				},
+			}
+
+			gcOptions.ImageRetention = config.ImageRetention{Delay: 0}
+			gcOptions.Delay = 0
+			gc := NewGarbageCollect(imgStore, metaDB, gcOptions, audit, log, metrics)
+
+			gced, err := gc.removeReferrer(repoName, &parentIndex, attestationDesc, referrer.Subject,
+				zcommon.ArtifactTypeCosignBundle, annotations)
+			So(err, ShouldBeNil)
+			So(gced, ShouldBeTrue)
+			So(removedReferences, ShouldEqual, 1)
+			So(parentIndex.Manifests, ShouldBeEmpty)
+		})
+
+		Convey("removeReferrer skips cosign path after subject path already GCd the row", func() {
+			// OCI cosign referrer: subject in blob AND legacy .sig tag on the descriptor.
+			// Subject path removes by tag first; cosign path must not retry the same tag
+			// (ErrManifestNotFound would abort GC).
+			missingSubject := godigest.FromString("missing-subject")
+			cosignTag := "sha256-" + missingSubject.Encoded() + ".sig"
+
+			referrer := ispec.Manifest{
+				MediaType:    ispec.MediaTypeImageManifest,
+				ArtifactType: zcommon.ArtifactTypeCosign,
+				Config:       ispec.Descriptor{Digest: godigest.FromString("cfg"), Size: 1},
+				Subject: &ispec.Descriptor{
+					MediaType: ispec.MediaTypeImageManifest,
+					Digest:    missingSubject,
+					Size:      1,
+				},
+			}
+			referrerBuf, err := json.Marshal(referrer)
+			So(err, ShouldBeNil)
+			referrerDigest := godigest.FromBytes(referrerBuf)
+
+			parentIndex := ispec.Index{
+				MediaType: ispec.MediaTypeImageIndex,
+				Manifests: []ispec.Descriptor{
+					{
+						MediaType: ispec.MediaTypeImageManifest,
+						Digest:    referrerDigest,
+						Size:      int64(len(referrerBuf)),
+						Annotations: map[string]string{
+							ispec.AnnotationRefName: cosignTag,
+						},
+					},
+				},
+			}
+			cosignDesc := parentIndex.Manifests[0]
+
+			imgStore := mocks.MockedImageStore{
+				StatBlobFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+					return true, int64(len(referrerBuf)), time.Now().Add(-24 * time.Hour), nil
+				},
+			}
+
+			deleteSignatureCalls := 0
+			metaDB := mocks.MetaDBMock{
+				DeleteSignatureFn: func(repo string, signedManifestDigest godigest.Digest, sm types.SignatureMetadata) error {
+					deleteSignatureCalls++
+					So(signedManifestDigest, ShouldEqual, missingSubject)
+					So(sm.SignatureDigest, ShouldEqual, referrerDigest.String())
+					So(sm.SignatureType, ShouldEqual, storage.CosignType)
+
+					return nil
+				},
+			}
+
+			gcOptions.ImageRetention = config.ImageRetention{Delay: 0}
+			gcOptions.Delay = 0
+			gc := NewGarbageCollect(imgStore, metaDB, gcOptions, audit, log, metrics)
+
+			gced, err := gc.removeReferrer(repoName, &parentIndex, cosignDesc, referrer.Subject, zcommon.ArtifactTypeCosign, nil)
+			So(err, ShouldBeNil)
+			So(gced, ShouldBeTrue)
+			So(deleteSignatureCalls, ShouldEqual, 1)
+			// Last-tag delete re-adds an untagged row.
+			So(len(parentIndex.Manifests), ShouldEqual, 1)
+			_, hasTag := parentIndex.Manifests[0].Annotations[ispec.AnnotationRefName]
+			So(hasTag, ShouldBeFalse)
+		})
+
+		Convey("removeReferrersWithMissingSubject GCs OCI cosign referrer that also has a .sig tag", func() {
+			missingSubject := godigest.FromString("missing-subject")
+			cosignTag := "sha256-" + missingSubject.Encoded() + ".sig"
+
+			referrer := ispec.Manifest{
+				MediaType:    ispec.MediaTypeImageManifest,
+				ArtifactType: zcommon.ArtifactTypeCosign,
+				Config:       ispec.Descriptor{Digest: godigest.FromString("cfg"), Size: 1},
+				Subject: &ispec.Descriptor{
+					MediaType: ispec.MediaTypeImageManifest,
+					Digest:    missingSubject,
+					Size:      1,
+				},
+			}
+			referrerBuf, err := json.Marshal(referrer)
+			So(err, ShouldBeNil)
+			referrerDigest := godigest.FromBytes(referrerBuf)
+
+			parentIndex := ispec.Index{
+				MediaType: ispec.MediaTypeImageIndex,
+				Manifests: []ispec.Descriptor{
+					{
+						MediaType: ispec.MediaTypeImageManifest,
+						Digest:    referrerDigest,
+						Size:      int64(len(referrerBuf)),
+					},
+					{
+						MediaType: ispec.MediaTypeImageManifest,
+						Digest:    referrerDigest,
+						Size:      int64(len(referrerBuf)),
+						Annotations: map[string]string{
+							ispec.AnnotationRefName: cosignTag,
+						},
+					},
+				},
+			}
+
+			imgStore := mocks.MockedImageStore{
+				GetBlobContentFn: func(repo string, digest godigest.Digest) ([]byte, error) {
+					if digest == referrerDigest {
+						return referrerBuf, nil
+					}
+
+					return nil, zerr.ErrBlobNotFound
+				},
+				StatBlobFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+					return true, int64(len(referrerBuf)), time.Now().Add(-24 * time.Hour), nil
+				},
+			}
+
+			deleteSignatureCalls := 0
+			metaDB := mocks.MetaDBMock{
+				DeleteSignatureFn: func(repo string, signedManifestDigest godigest.Digest, sm types.SignatureMetadata) error {
+					deleteSignatureCalls++
+
+					return nil
+				},
+			}
+
+			gcOptions.ImageRetention = config.ImageRetention{
+				Delay: 0,
+				Policies: []config.RetentionPolicy{
+					{
+						Repositories:    []string{"**"},
+						DeleteReferrers: true,
+					},
+				},
+			}
+			gcOptions.Delay = 0
+
+			gc := NewGarbageCollect(imgStore, metaDB, gcOptions, audit, log, metrics)
+
+			gced, err := gc.removeReferrersWithMissingSubject(repoName, &parentIndex)
+			So(err, ShouldBeNil)
+			So(gced, ShouldBeTrue)
+			So(deleteSignatureCalls, ShouldBeGreaterThan, 0)
+			// Untagged sibling remains; tagged .sig row is gone.
+			So(len(parentIndex.Manifests), ShouldEqual, 1)
+			_, hasTag := parentIndex.Manifests[0].Annotations[ispec.AnnotationRefName]
+			So(hasTag, ShouldBeFalse)
+		})
+
+		Convey("removeManifestsPerRepoPolicy GCs both tags when orphaned referrer shares a digest", func() {
+			// Last-tag delete re-adds an untagged row (RemoveManifestDescByReference).
+			// A single removeReferrersWithMissingSubject pass leaves that row; the outer
+			// removeManifestsPerRepoPolicy loop clears it on a later referrer pass.
+			missingSubject := godigest.FromString("missing-subject")
+
+			referrer := ispec.Manifest{
+				MediaType: ispec.MediaTypeImageManifest,
+				Config:    ispec.Descriptor{Digest: godigest.FromString("cfg"), Size: 1},
+				Subject: &ispec.Descriptor{
+					MediaType: ispec.MediaTypeImageManifest,
+					Digest:    missingSubject,
+					Size:      1,
+				},
+			}
+			referrerBuf, err := json.Marshal(referrer)
+			So(err, ShouldBeNil)
+			referrerDigest := godigest.FromBytes(referrerBuf)
+
+			parentIndex := ispec.Index{
+				MediaType: ispec.MediaTypeImageIndex,
+				Manifests: []ispec.Descriptor{
+					{
+						MediaType: ispec.MediaTypeImageManifest,
+						Digest:    referrerDigest,
+						Size:      int64(len(referrerBuf)),
+						Annotations: map[string]string{
+							ispec.AnnotationRefName: "referrer-v1",
+						},
+					},
+					{
+						MediaType: ispec.MediaTypeImageManifest,
+						Digest:    referrerDigest,
+						Size:      int64(len(referrerBuf)),
+						Annotations: map[string]string{
+							ispec.AnnotationRefName: "referrer-v2",
+						},
+					},
+				},
+			}
+
+			imgStore := mocks.MockedImageStore{
+				GetBlobContentFn: func(repo string, digest godigest.Digest) ([]byte, error) {
+					if digest == referrerDigest {
+						return referrerBuf, nil
+					}
+
+					return nil, zerr.ErrBlobNotFound
+				},
+				StatBlobFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+					return true, int64(len(referrerBuf)), time.Now().Add(-24 * time.Hour), nil
+				},
+			}
+
+			gcOptions.ImageRetention = config.ImageRetention{
+				Delay: 0,
+				Policies: []config.RetentionPolicy{
+					{
+						Repositories:    []string{"**"},
+						DeleteReferrers: true,
+					},
+				},
+			}
+
+			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
+
+			err = gc.removeManifestsPerRepoPolicy(context.Background(), repoName, &parentIndex)
+			So(err, ShouldBeNil)
+			So(len(parentIndex.Manifests), ShouldEqual, 0)
+		})
+
+		Convey("removeReferrersWithMissingSubject keeps both tags when subject is present", func() {
+			subjectDigest := godigest.FromString("present-subject")
+
+			referrer := ispec.Manifest{
+				MediaType: ispec.MediaTypeImageManifest,
+				Config:    ispec.Descriptor{Digest: godigest.FromString("cfg"), Size: 1},
+				Subject: &ispec.Descriptor{
+					MediaType: ispec.MediaTypeImageManifest,
+					Digest:    subjectDigest,
+					Size:      1,
+				},
+			}
+			referrerBuf, err := json.Marshal(referrer)
+			So(err, ShouldBeNil)
+			referrerDigest := godigest.FromBytes(referrerBuf)
+
+			parentIndex := ispec.Index{
+				MediaType: ispec.MediaTypeImageIndex,
+				Manifests: []ispec.Descriptor{
+					{
+						MediaType: ispec.MediaTypeImageManifest,
+						Digest:    subjectDigest,
+						Size:      1,
+					},
+					{
+						MediaType: ispec.MediaTypeImageManifest,
+						Digest:    referrerDigest,
+						Size:      int64(len(referrerBuf)),
+						Annotations: map[string]string{
+							ispec.AnnotationRefName: "referrer-v1",
+						},
+					},
+					{
+						MediaType: ispec.MediaTypeImageManifest,
+						Digest:    referrerDigest,
+						Size:      int64(len(referrerBuf)),
+						Annotations: map[string]string{
+							ispec.AnnotationRefName: "referrer-v2",
+						},
+					},
+				},
+			}
+
+			readCount := 0
+			imgStore := mocks.MockedImageStore{
+				GetBlobContentFn: func(repo string, digest godigest.Digest) ([]byte, error) {
+					if digest == referrerDigest {
+						readCount++
+
+						return referrerBuf, nil
+					}
+
+					return nil, zerr.ErrBlobNotFound
+				},
+			}
+
+			gcOptions.ImageRetention = config.ImageRetention{
+				Delay: 0,
+				Policies: []config.RetentionPolicy{
+					{
+						Repositories:    []string{"**"},
+						DeleteReferrers: true,
+					},
+				},
+			}
+
+			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
+
+			gced, err := gc.removeReferrersWithMissingSubject(repoName, &parentIndex)
+			So(err, ShouldBeNil)
+			So(gced, ShouldBeFalse)
+			So(readCount, ShouldEqual, 1)
+			So(len(parentIndex.Manifests), ShouldEqual, 3)
+
+			tags := map[string]bool{}
+			for _, desc := range parentIndex.Manifests {
+				if tag, ok := desc.Annotations[ispec.AnnotationRefName]; ok {
+					tags[tag] = true
+				}
+			}
+			So(tags["referrer-v1"], ShouldBeTrue)
+			So(tags["referrer-v2"], ShouldBeTrue)
+		})
+
+		Convey("removeReferrersWithMissingSubject skips duplicate missing index blobs once", func() {
+			missingDigest := godigest.FromString("missing-nested-index")
+
+			parentIndex := ispec.Index{
+				MediaType: ispec.MediaTypeImageIndex,
+				Manifests: []ispec.Descriptor{
+					{
+						MediaType: ispec.MediaTypeImageIndex,
+						Digest:    missingDigest,
+						Size:      100,
+					},
+					{
+						MediaType: ispec.MediaTypeImageIndex,
+						Digest:    missingDigest,
+						Size:      100,
+					},
+				},
+			}
+
+			readCount := 0
+			imgStore := mocks.MockedImageStore{
+				GetBlobContentFn: func(repo string, digest godigest.Digest) ([]byte, error) {
+					if digest == missingDigest {
+						readCount++
+					}
+
+					return nil, zerr.ErrBlobNotFound
+				},
+			}
+
+			gcOptions.ImageRetention = config.ImageRetention{
+				Policies: []config.RetentionPolicy{
+					{
+						Repositories:    []string{"**"},
+						DeleteReferrers: true,
+					},
+				},
+			}
+
+			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
+
+			gced, err := gc.removeReferrersWithMissingSubject(repoName, &parentIndex)
+			So(err, ShouldBeNil)
+			So(gced, ShouldBeFalse)
+			So(readCount, ShouldEqual, 1)
+			So(len(parentIndex.Manifests), ShouldEqual, 2)
+		})
+
+		Convey("removeReferrersWithMissingSubject GCs cosign .sig after a sibling missing blob miss", func() {
+			missingSubject := godigest.FromString("missing-subject")
+			cosignTag := "sha256-" + missingSubject.Encoded() + ".sig"
+			missingDigest := godigest.FromString("missing-shared-manifest")
+
+			parentIndex := ispec.Index{
+				MediaType: ispec.MediaTypeImageIndex,
+				Manifests: []ispec.Descriptor{
+					{
+						MediaType: ispec.MediaTypeImageManifest,
+						Digest:    missingDigest,
+						Size:      10,
+					},
+					{
+						MediaType: ispec.MediaTypeImageManifest,
+						Digest:    missingDigest,
+						Size:      10,
+						Annotations: map[string]string{
+							ispec.AnnotationRefName: cosignTag,
+						},
+					},
+				},
+			}
+
+			readCount := 0
+			imgStore := mocks.MockedImageStore{
+				GetBlobContentFn: func(repo string, digest godigest.Digest) ([]byte, error) {
+					if digest == missingDigest {
+						readCount++
+					}
+
+					return nil, zerr.ErrBlobNotFound
+				},
+				// Age check is independent of GetBlobContent: mock Stat success so this
+				// case covers missing-cache + cosign sibling GC, not StatBlob fail-closed.
+				StatBlobFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+					return true, 10, time.Now().Add(-24 * time.Hour), nil
+				},
+			}
+
+			deletedSig := false
+			metaDB := mocks.MetaDBMock{
+				DeleteSignatureFn: func(repo string, signedManifestDigest godigest.Digest, sm types.SignatureMetadata) error {
+					deletedSig = signedManifestDigest == missingSubject &&
+						sm.SignatureDigest == missingDigest.String() &&
+						sm.SignatureType == storage.CosignType
+
+					return nil
+				},
+			}
+
+			gcOptions.ImageRetention = config.ImageRetention{
+				Delay: 0,
+				Policies: []config.RetentionPolicy{
+					{
+						Repositories:    []string{"**"},
+						DeleteReferrers: true,
+					},
+				},
+			}
+			gcOptions.Delay = 0
+
+			gc := NewGarbageCollect(imgStore, metaDB, gcOptions, audit, log, metrics)
+
+			gced, err := gc.removeReferrersWithMissingSubject(repoName, &parentIndex)
+			So(err, ShouldBeNil)
+			So(gced, ShouldBeTrue)
+			So(deletedSig, ShouldBeTrue)
+			So(readCount, ShouldEqual, 1)
+			So(len(parentIndex.Manifests), ShouldEqual, 1)
+			_, hasTag := parentIndex.Manifests[0].Annotations[ispec.AnnotationRefName]
+			So(hasTag, ShouldBeFalse)
+		})
+
+		Convey("removeReferrersWithMissingSubject continues when StatBlob reports missing", func() {
+			// StatBlob errors fail closed for age eligibility (do not delete the row here);
+			// CleanRepo must not abort so removeStaleManifestEntries can still run later.
+			missingSubject := godigest.FromString("missing-subject")
+			cosignTag := "sha256-" + missingSubject.Encoded() + ".sig"
+			missingDigest := godigest.FromString("missing-cosign-blob")
+
+			parentIndex := ispec.Index{
+				MediaType: ispec.MediaTypeImageIndex,
+				Manifests: []ispec.Descriptor{
+					{
+						MediaType: ispec.MediaTypeImageManifest,
+						Digest:    missingDigest,
+						Size:      10,
+						Annotations: map[string]string{
+							ispec.AnnotationRefName: cosignTag,
+						},
+					},
+				},
+			}
+
+			imgStore := mocks.MockedImageStore{
+				GetBlobContentFn: func(repo string, digest godigest.Digest) ([]byte, error) {
+					return nil, errclass.MarkMissing(driver.PathNotFoundError{Path: digest.String(), DriverName: "local"})
+				},
+				StatBlobFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+					return false, -1, time.Time{}, errclass.MarkMissing(
+						driver.PathNotFoundError{Path: digest.String(), DriverName: "local"})
+				},
+			}
+
+			gcOptions.ImageRetention = config.ImageRetention{
+				Delay: 0,
+				Policies: []config.RetentionPolicy{
+					{
+						Repositories:    []string{"**"},
+						DeleteReferrers: true,
+					},
+				},
+			}
+			gcOptions.Delay = 0
+
+			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
+
+			gced, err := gc.removeReferrersWithMissingSubject(repoName, &parentIndex)
+			So(err, ShouldBeNil)
+			So(gced, ShouldBeFalse)
+			So(len(parentIndex.Manifests), ShouldEqual, 1)
+		})
+
+		Convey("identifyManifestsReferencedInIndex walks a diamond DAG once per node", func() {
+			leafDigest := godigest.FromString("diamond-leaf")
+			subjectDigest := godigest.FromString("leaf-subject")
+
+			midLeft := ispec.Index{
+				MediaType: ispec.MediaTypeImageIndex,
+				Manifests: []ispec.Descriptor{{
+					MediaType: ispec.MediaTypeImageManifest,
+					Digest:    leafDigest,
+					Size:      1,
+				}},
+			}
+			midLeftBuf, err := json.Marshal(midLeft)
+			So(err, ShouldBeNil)
+			midLeftDigest := godigest.FromBytes(midLeftBuf)
+
+			midRight := ispec.Index{
+				MediaType: ispec.MediaTypeImageIndex,
+				Manifests: []ispec.Descriptor{{
+					MediaType:   ispec.MediaTypeImageManifest,
+					Digest:      leafDigest,
+					Size:        1,
+					Annotations: map[string]string{"branch": "right"},
+				}},
+			}
+			midRightBuf, err := json.Marshal(midRight)
+			So(err, ShouldBeNil)
+			midRightDigest := godigest.FromBytes(midRightBuf)
+
+			root := ispec.Index{
+				MediaType: ispec.MediaTypeImageIndex,
+				Manifests: []ispec.Descriptor{
+					{
+						MediaType: ispec.MediaTypeImageIndex,
+						Digest:    midLeftDigest,
+						Size:      int64(len(midLeftBuf)),
+					},
+					{
+						MediaType: ispec.MediaTypeImageIndex,
+						Digest:    midRightDigest,
+						Size:      int64(len(midRightBuf)),
+					},
+				},
+			}
+
+			leafManifest := ispec.Manifest{
+				MediaType: ispec.MediaTypeImageManifest,
+				Config:    ispec.Descriptor{Digest: godigest.FromString("cfg"), Size: 1},
+				Subject: &ispec.Descriptor{
+					MediaType: ispec.MediaTypeImageManifest,
+					Digest:    subjectDigest,
+					Size:      1,
+				},
+			}
+			leafBuf, err := json.Marshal(leafManifest)
+			So(err, ShouldBeNil)
+
+			reads := map[godigest.Digest]int{}
+			imgStore := mocks.MockedImageStore{
+				GetBlobContentFn: func(repo string, digest godigest.Digest) ([]byte, error) {
+					reads[digest]++
+
+					switch digest {
+					case midLeftDigest:
+						return midLeftBuf, nil
+					case midRightDigest:
+						return midRightBuf, nil
+					case leafDigest:
+						return leafBuf, nil
+					default:
+						return nil, zerr.ErrBlobNotFound
+					}
+				},
+			}
+
+			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
+
+			referenced := make(map[godigest.Digest]bool)
+			err = gc.identifyManifestsReferencedInIndex(context.Background(), root, repoName, referenced,
+				map[godigest.Digest]struct{}{})
+			So(err, ShouldBeNil)
+			So(midLeftDigest, ShouldNotEqual, midRightDigest)
+			So(reads[midLeftDigest], ShouldEqual, 1)
+			So(reads[midRightDigest], ShouldEqual, 1)
+			So(reads[leafDigest], ShouldEqual, 1)
+			// Leaf is referenced both as a nested manifest and as a referrer (has subject).
+			So(referenced[leafDigest], ShouldBeTrue)
+		})
+
+		Convey("Error on ListBlobUploads in deleteBlobUploads", func() {
+			imgStore := mocks.MockedImageStore{
 				ListBlobUploadsFn: func(repo string) ([]string, error) {
 					return nil, errGC
 				},
@@ -871,12 +2079,36 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 
 			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
 
-			deleted, err := gc.removeBlobUploads(repoName, time.Hour)
+			deleted, err := gc.deleteBlobUploads(repoName, time.Hour)
 			So(err, ShouldNotBeNil)
 			So(deleted, ShouldEqual, 0)
 		})
 
-		Convey("Error on addIndexBlobsToReferences in removeUnreferencedBlobs", func() {
+		Convey("deleteBlobUploads uses non-blocking upload cleanup", func() {
+			called := false
+			imgStore := mocks.MockedImageStore{
+				ListBlobUploadsFn: func(repo string) ([]string, error) {
+					return []string{"upload-1"}, nil
+				},
+				StatBlobUploadFn: func(repo, uuid string) (bool, int64, time.Time, error) {
+					return true, 1024, time.Now().Add(-2 * time.Hour), nil
+				},
+				DeleteBlobUploadIfIdleFn: func(repo, uuid string) (bool, error) {
+					called = true
+
+					return false, nil
+				},
+			}
+
+			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
+
+			deleted, err := gc.deleteBlobUploads(repoName, time.Hour)
+			So(err, ShouldBeNil)
+			So(deleted, ShouldEqual, 0)
+			So(called, ShouldBeTrue)
+		})
+
+		Convey("Error on GetReferencedBlobs in deleteUnreferencedBlobs", func() {
 			returnedIndex := ispec.Index{
 				Manifests: []ispec.Descriptor{
 					{
@@ -899,12 +2131,12 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 
 			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
 
-			deleted, err := gc.removeUnreferencedBlobs(repoName, time.Hour, log)
+			deleted, err := gc.deleteUnreferencedBlobs(context.Background(), repoName, time.Hour, log)
 			So(err, ShouldNotBeNil)
 			So(deleted, ShouldEqual, 0)
 		})
 
-		Convey("PathNotFoundError on GetAllBlobs in removeUnreferencedBlobs", func() {
+		Convey("ErrStorageMissing on GetAllBlobs in deleteUnreferencedBlobs", func() {
 			returnedIndex := ispec.Index{}
 			returnedIndexBuf, err := json.Marshal(returnedIndex)
 			So(err, ShouldBeNil)
@@ -914,18 +2146,19 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 					return returnedIndexBuf, nil
 				},
 				GetAllBlobsFn: func(repo string) ([]godigest.Digest, error) {
-					return nil, driver.PathNotFoundError{Path: "/blobs/sha256", DriverName: "local"}
+					return nil, errclass.MarkMissing(
+						driver.PathNotFoundError{Path: "/blobs/sha256", DriverName: "local"})
 				},
 			}
 
 			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
 
-			deleted, err := gc.removeUnreferencedBlobs(repoName, time.Hour, log)
+			deleted, err := gc.deleteUnreferencedBlobs(context.Background(), repoName, time.Hour, log)
 			So(err, ShouldBeNil)
 			So(deleted, ShouldEqual, 0)
 		})
 
-		Convey("Error on GetAllBlobs in removeUnreferencedBlobs", func() {
+		Convey("Error on GetAllBlobs in deleteUnreferencedBlobs", func() {
 			returnedIndex := ispec.Index{}
 			returnedIndexBuf, err := json.Marshal(returnedIndex)
 			So(err, ShouldBeNil)
@@ -941,16 +2174,13 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 
 			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
 
-			deleted, err := gc.removeUnreferencedBlobs(repoName, time.Hour, log)
+			deleted, err := gc.deleteUnreferencedBlobs(context.Background(), repoName, time.Hour, log)
 			So(err, ShouldNotBeNil)
 			So(deleted, ShouldEqual, 0)
 		})
 
-		Convey("StatBlobUpload error in removeBlobUploads", func() {
+		Convey("StatBlobUpload error in deleteBlobUploads", func() {
 			imgStore := mocks.MockedImageStore{
-				DirExistsFn: func(d string) bool {
-					return true
-				},
 				ListBlobUploadsFn: func(repo string) ([]string, error) {
 					return []string{"upload-1"}, nil
 				},
@@ -961,12 +2191,12 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 
 			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
 
-			deleted, err := gc.removeBlobUploads(repoName, time.Hour)
+			deleted, err := gc.deleteBlobUploads(repoName, time.Hour)
 			So(err, ShouldNotBeNil)
 			So(deleted, ShouldEqual, 0)
 		})
 
-		Convey("Invalid digest from GetAllBlobs in removeUnreferencedBlobs", func() {
+		Convey("Invalid digest from GetAllBlobs in deleteUnreferencedBlobs", func() {
 			returnedIndex := ispec.Index{}
 			returnedIndexBuf, err := json.Marshal(returnedIndex)
 			So(err, ShouldBeNil)
@@ -982,12 +2212,12 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 
 			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
 
-			deleted, err := gc.removeUnreferencedBlobs(repoName, time.Hour, log)
+			deleted, err := gc.deleteUnreferencedBlobs(context.Background(), repoName, time.Hour, log)
 			So(err, ShouldNotBeNil)
 			So(deleted, ShouldEqual, 0)
 		})
 
-		Convey("StatBlob error in removeUnreferencedBlobs", func() {
+		Convey("StatBlobEntry error in deleteUnreferencedBlobs skips candidate and continues", func() {
 			blobDigest := godigest.FromBytes([]byte("blob-content"))
 
 			returnedIndex := ispec.Index{}
@@ -1001,19 +2231,19 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 				GetAllBlobsFn: func(repo string) ([]godigest.Digest, error) {
 					return []godigest.Digest{blobDigest}, nil
 				},
-				StatBlobFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+				StatBlobEntryFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
 					return false, 0, time.Time{}, errGC
 				},
 			}
 
 			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
 
-			deleted, err := gc.removeUnreferencedBlobs(repoName, time.Hour, log)
-			So(err, ShouldNotBeNil)
+			deleted, err := gc.deleteUnreferencedBlobs(context.Background(), repoName, time.Hour, log)
+			So(err, ShouldBeNil)
 			So(deleted, ShouldEqual, 0)
 		})
 
-		Convey("CleanupRepo error in removeUnreferencedBlobs", func() {
+		Convey("fresh StatBlobEntry keeps orphan even when StatBlob reports an old original", func() {
 			blobDigest := godigest.FromBytes([]byte("blob-content"))
 
 			returnedIndex := ispec.Index{}
@@ -1027,25 +2257,61 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 				GetAllBlobsFn: func(repo string) ([]godigest.Digest, error) {
 					return []godigest.Digest{blobDigest}, nil
 				},
+				// Content original is weeks old (what StatBlob would return for a placeholder).
 				StatBlobFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+					return true, 100, time.Now().Add(-14 * 24 * time.Hour), nil
+				},
+				// Per-repo placeholder was written seconds ago.
+				StatBlobEntryFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+					return true, 0, time.Now().Add(-time.Second), nil
+				},
+				CleanupRepoFn: func(repo string, blobs []godigest.Digest) (int, error) {
+					So(blobs, ShouldBeEmpty)
+
+					return 0, nil
+				},
+			}
+
+			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
+
+			deleted, err := gc.deleteUnreferencedBlobs(context.Background(), repoName, time.Hour, log)
+			So(err, ShouldBeNil)
+			So(deleted, ShouldEqual, 0)
+		})
+
+		Convey("CleanupRepo error in deleteUnreferencedBlobs", func() {
+			blobDigest := godigest.FromBytes([]byte("blob-content"))
+
+			returnedIndex := ispec.Index{}
+			returnedIndexBuf, err := json.Marshal(returnedIndex)
+			So(err, ShouldBeNil)
+
+			imgStore := mocks.MockedImageStore{
+				GetIndexContentFn: func(repo string) ([]byte, error) {
+					return returnedIndexBuf, nil
+				},
+				GetAllBlobsFn: func(repo string) ([]godigest.Digest, error) {
+					return []godigest.Digest{blobDigest}, nil
+				},
+				StatBlobEntryFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
 					return true, 100, time.Now().Add(-2 * time.Hour), nil
 				},
-				CleanupRepoFn: func(repo string, blobs []godigest.Digest, removeRepo bool) (int, error) {
+				CleanupRepoFn: func(repo string, blobs []godigest.Digest) (int, error) {
 					return 0, errGC
 				},
 			}
 
 			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
 
-			deleted, err := gc.removeUnreferencedBlobs(repoName, time.Hour, log)
+			deleted, err := gc.deleteUnreferencedBlobs(context.Background(), repoName, time.Hour, log)
 			So(err, ShouldNotBeNil)
 			So(deleted, ShouldEqual, 0)
 		})
 
 		Convey("CleanRepo records error metrics when cleanRepo fails", func() {
 			imgStore := mocks.MockedImageStore{
-				DirExistsFn: func(d string) bool {
-					return false
+				GetIndexContentFn: func(repo string) ([]byte, error) {
+					return nil, errclass.MarkMissing(errors.New("gone")) //nolint:err113 // test
 				},
 			}
 
@@ -1056,6 +2322,20 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 			So(errors.Is(err, zerr.ErrRepoNotFound), ShouldBeTrue)
 		})
 
+		Convey("deleteBlobUploads propagates ListBlobUploads Transient", func() {
+			imgStore := mocks.MockedImageStore{
+				ListBlobUploadsFn: func(repo string) ([]string, error) {
+					return nil, zerr.ErrStorageTransient
+				},
+			}
+
+			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
+
+			deleted, err := gc.deleteBlobUploads(repoName, time.Hour)
+			So(deleted, ShouldEqual, 0)
+			So(errors.Is(err, zerr.ErrStorageTransient), ShouldBeTrue)
+		})
+
 		Convey("removeStaleManifestEntries removes entries whose blobs are missing", func() {
 			existingDigest := godigest.FromString("existing-blob")
 			missingDigest := godigest.FromString("missing-blob")
@@ -1064,6 +2344,7 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 				GetAllBlobsFn: func(repo string) ([]godigest.Digest, error) {
 					return []godigest.Digest{existingDigest}, nil
 				},
+				StatBlobFn: statBlobMissingUnlessPresent(existingDigest),
 			}
 
 			removedRef := ""
@@ -1104,12 +2385,13 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 				GetAllBlobsFn: func(repo string) ([]godigest.Digest, error) {
 					return nil, nil
 				},
+				StatBlobFn: statBlobMissingUnlessPresent(),
 			}
 
-			removedRef := ""
+			var removedRefs []string
 			metaDB := mocks.MetaDBMock{
 				RemoveRepoReferenceFn: func(repo, reference string, manifestDigest godigest.Digest) error {
-					removedRef = reference
+					removedRefs = append(removedRefs, reference)
 
 					return nil
 				},
@@ -1132,7 +2414,49 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 			err := gc.removeStaleManifestEntries(repoName, index)
 			So(err, ShouldBeNil)
 			So(len(index.Manifests), ShouldEqual, 0)
-			So(removedRef, ShouldEqual, "v1.0")
+			// The tag drops that index row. The digest call drops statistics, which a
+			// tag reference would keep.
+			So(removedRefs, ShouldResemble, []string{"v1.0", missingDigest.String()})
+		})
+
+		Convey("removeUnknownMediaTypeManifestEntries keeps statistics while another descriptor remains", func() {
+			sharedDigest := godigest.FromString("shared-blob")
+
+			var removedRefs []string
+			metaDB := mocks.MetaDBMock{
+				RemoveRepoReferenceFn: func(repo, reference string, manifestDigest godigest.Digest) error {
+					removedRefs = append(removedRefs, reference)
+
+					return nil
+				},
+			}
+
+			gc := NewGarbageCollect(mocks.MockedImageStore{}, metaDB, gcOptions, audit, log, metrics)
+
+			index := &ispec.Index{
+				Manifests: []ispec.Descriptor{
+					{
+						Digest:    sharedDigest,
+						MediaType: "application/unknown",
+						Annotations: map[string]string{
+							ispec.AnnotationRefName: "bad",
+						},
+					},
+					{
+						Digest:    sharedDigest,
+						MediaType: ispec.MediaTypeImageManifest,
+						Annotations: map[string]string{
+							ispec.AnnotationRefName: "good",
+						},
+					},
+				},
+			}
+
+			err := gc.removeUnknownMediaTypeManifestEntries(repoName, index)
+			So(err, ShouldBeNil)
+			So(len(index.Manifests), ShouldEqual, 1)
+			So(index.Manifests[0].Annotations[ispec.AnnotationRefName], ShouldEqual, "good")
+			So(removedRefs, ShouldResemble, []string{"bad"})
 		})
 
 		Convey("removeStaleManifestEntries removes cosign signature via DeleteSignature when blob is missing", func() {
@@ -1144,6 +2468,7 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 				GetAllBlobsFn: func(repo string) ([]godigest.Digest, error) {
 					return nil, nil
 				},
+				StatBlobFn: statBlobMissingUnlessPresent(),
 			}
 
 			deletedSig := false
@@ -1192,10 +2517,11 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 				GetAllBlobsFn: func(repo string) ([]godigest.Digest, error) {
 					return nil, nil
 				},
+				StatBlobFn: statBlobMissingUnlessPresent(),
 			}
 
 			deletedSig := false
-			removedRef := ""
+			var removedRefs []string
 			metaDB := mocks.MetaDBMock{
 				DeleteSignatureFn: func(repo string, signedManifestDigest godigest.Digest, sm types.SignatureMetadata) error {
 					deletedSig = true
@@ -1203,7 +2529,7 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 					return nil
 				},
 				RemoveRepoReferenceFn: func(repo, reference string, manifestDigest godigest.Digest) error {
-					removedRef = reference
+					removedRefs = append(removedRefs, reference)
 
 					return nil
 				},
@@ -1227,7 +2553,7 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 			So(err, ShouldBeNil)
 			So(len(index.Manifests), ShouldEqual, 0)
 			So(deletedSig, ShouldBeFalse)
-			So(removedRef, ShouldEqual, malformedCosignTag)
+			So(removedRefs, ShouldResemble, []string{malformedCosignTag, missingSigDigest.String()})
 		})
 
 		Convey("removeStaleManifestEntries skips in DryRun mode", func() {
@@ -1255,11 +2581,12 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 			So(len(index.Manifests), ShouldEqual, 1)
 		})
 
-		Convey("removeStaleManifestEntries treats GetAllBlobs PathNotFound as empty storage", func() {
+		Convey("removeStaleManifestEntries treats GetAllBlobs Missing as empty storage", func() {
 			imgStore := mocks.MockedImageStore{
 				GetAllBlobsFn: func(repo string) ([]godigest.Digest, error) {
-					return nil, driver.PathNotFoundError{}
+					return nil, errclass.MarkMissing(driver.PathNotFoundError{})
 				},
+				StatBlobFn: statBlobMissingUnlessPresent(),
 			}
 
 			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
@@ -1278,6 +2605,34 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 			So(len(index.Manifests), ShouldEqual, 0)
 		})
 
+		Convey("removeStaleManifestEntries aborts on GetAllBlobs Transient without pruning", func() {
+			transient := errclass.MarkTransient(errors.New("list blip")) //nolint:err113 // test
+
+			imgStore := mocks.MockedImageStore{
+				GetAllBlobsFn: func(repo string) ([]godigest.Digest, error) {
+					return nil, transient
+				},
+			}
+
+			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
+
+			keptDigest := godigest.FromString("still-present")
+			index := &ispec.Index{
+				Manifests: []ispec.Descriptor{
+					{
+						Digest:    keptDigest,
+						MediaType: ispec.MediaTypeImageManifest,
+					},
+				},
+			}
+
+			err := gc.removeStaleManifestEntries(repoName, index)
+			So(err, ShouldNotBeNil)
+			So(errors.Is(err, zerr.ErrStorageTransient), ShouldBeTrue)
+			So(len(index.Manifests), ShouldEqual, 1)
+			So(index.Manifests[0].Digest, ShouldEqual, keptDigest)
+		})
+
 		Convey("removeStaleManifestEntries continues despite metaDB errors", func() {
 			missingDigest := godigest.FromString("missing-blob")
 
@@ -1285,6 +2640,7 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 				GetAllBlobsFn: func(repo string) ([]godigest.Digest, error) {
 					return nil, nil
 				},
+				StatBlobFn: statBlobMissingUnlessPresent(),
 			}
 
 			metaDB := mocks.MetaDBMock{
@@ -1354,7 +2710,7 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 			So(index.Manifests[0].Digest, ShouldEqual, indexDigest)
 		})
 
-		Convey("removeStaleManifestEntries drops image index when all nested manifests are missing", func() {
+		Convey("removeStaleManifestEntries drops image index older than gcDelay when all nested manifests are missing", func() {
 			indexDigest := godigest.FromString("image-index-blob")
 			missingNested := godigest.FromString("missing-nested")
 
@@ -1377,6 +2733,9 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 
 					return nil, zerr.ErrBlobNotFound
 				},
+				StatBlobFn: statBlobMissingUnlessPresent(indexDigest),
+				// a zero modtime: the index is older than gcDelay
+				StatBlobEntryFn: statBlobMissingUnlessPresent(indexDigest),
 			}
 
 			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
@@ -1396,6 +2755,59 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 			So(len(index.Manifests), ShouldEqual, 0)
 		})
 
+		Convey("removeStaleManifestEntries keeps a new image index whose nested manifests are not stored yet", func() {
+			// a sparse on-demand sync stores the index first; its platform manifests follow when requested
+			indexDigest := godigest.FromString("image-index-blob")
+			missingNested := godigest.FromString("missing-nested")
+
+			indexBlob, err := json.Marshal(ispec.Index{
+				MediaType: ispec.MediaTypeImageIndex,
+				Manifests: []ispec.Descriptor{
+					{Digest: missingNested, MediaType: ispec.MediaTypeImageManifest},
+				},
+			})
+			So(err, ShouldBeNil)
+
+			imgStore := mocks.MockedImageStore{
+				GetAllBlobsFn: func(repo string) ([]godigest.Digest, error) {
+					return []godigest.Digest{indexDigest}, nil
+				},
+				GetBlobContentFn: func(repo string, digest godigest.Digest) ([]byte, error) {
+					if digest == indexDigest {
+						return indexBlob, nil
+					}
+
+					return nil, zerr.ErrBlobNotFound
+				},
+				StatBlobFn: statBlobMissingUnlessPresent(indexDigest),
+				// the index was just stored, so it is newer than gcDelay
+				StatBlobEntryFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+					if digest == indexDigest {
+						return true, int64(len(indexBlob)), time.Now(), nil
+					}
+
+					return false, -1, time.Time{}, zerr.ErrBlobNotFound
+				},
+			}
+
+			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
+
+			index := &ispec.Index{
+				Manifests: []ispec.Descriptor{
+					{
+						Digest:    indexDigest,
+						MediaType: ispec.MediaTypeImageIndex,
+						Size:      int64(len(indexBlob)),
+					},
+				},
+			}
+
+			err = gc.removeStaleManifestEntries(repoName, index)
+			So(err, ShouldBeNil)
+			So(len(index.Manifests), ShouldEqual, 1)
+			So(index.Manifests[0].Digest, ShouldEqual, indexDigest)
+		})
+
 		Convey("removeStaleManifestEntries skips metaDB sync when metaDB is nil", func() {
 			missingDigest := godigest.FromString("missing-blob")
 
@@ -1403,6 +2815,7 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 				GetAllBlobsFn: func(repo string) ([]godigest.Digest, error) {
 					return nil, nil
 				},
+				StatBlobFn: statBlobMissingUnlessPresent(),
 			}
 
 			gc := NewGarbageCollect(imgStore, nil, gcOptions, audit, log, metrics)
@@ -1526,6 +2939,7 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 				GetAllBlobsFn: func(repo string) ([]godigest.Digest, error) {
 					return nil, nil
 				},
+				StatBlobFn: statBlobMissingUnlessPresent(),
 			}
 
 			metaDB := mocks.MetaDBMock{
@@ -1587,6 +3001,7 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 
 					return nil, zerr.ErrBlobNotFound
 				},
+				StatBlobFn: statBlobMissingUnlessPresent(indexDigest),
 			}
 
 			gc := NewGarbageCollect(imgStore, metaDB, gcOptions, audit, log, metrics)
@@ -1606,6 +3021,169 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 			So(len(index.Manifests), ShouldEqual, 0)
 			So(removed, ShouldBeTrue)
 		})
+
+		Convey("removeStaleManifestEntries keeps inventory-miss when StatBlob still finds the blob", func() {
+			keptDigest := godigest.FromString("eventually-consistent")
+
+			imgStore := mocks.MockedImageStore{
+				GetAllBlobsFn: func(repo string) ([]godigest.Digest, error) {
+					return nil, nil
+				},
+				StatBlobFn: statBlobMissingUnlessPresent(keptDigest),
+			}
+
+			removed := false
+			metaDB := mocks.MetaDBMock{
+				RemoveRepoReferenceFn: func(repo, reference string, manifestDigest godigest.Digest) error {
+					removed = true
+
+					return nil
+				},
+			}
+
+			gc := NewGarbageCollect(imgStore, metaDB, gcOptions, audit, log, metrics)
+
+			index := &ispec.Index{
+				Manifests: []ispec.Descriptor{
+					{
+						Digest:    keptDigest,
+						MediaType: ispec.MediaTypeImageManifest,
+					},
+				},
+			}
+
+			err := gc.removeStaleManifestEntries(repoName, index)
+			So(err, ShouldBeNil)
+			So(removed, ShouldBeFalse)
+			So(len(index.Manifests), ShouldEqual, 1)
+			So(index.Manifests[0].Digest, ShouldEqual, keptDigest)
+		})
+
+		Convey("removeStaleManifestEntries aborts on StatBlob Transient without pruning", func() {
+			keptDigest := godigest.FromString("stat-blip")
+			transient := errclass.MarkTransient(errors.New("stat blip")) //nolint:err113 // test
+
+			imgStore := mocks.MockedImageStore{
+				GetAllBlobsFn: func(repo string) ([]godigest.Digest, error) {
+					return nil, nil
+				},
+				StatBlobFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+					return false, -1, time.Time{}, transient
+				},
+			}
+
+			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
+
+			index := &ispec.Index{
+				Manifests: []ispec.Descriptor{
+					{
+						Digest:    keptDigest,
+						MediaType: ispec.MediaTypeImageManifest,
+					},
+				},
+			}
+
+			err := gc.removeStaleManifestEntries(repoName, index)
+			So(errors.Is(err, zerr.ErrStorageTransient), ShouldBeTrue)
+			So(len(index.Manifests), ShouldEqual, 1)
+			So(index.Manifests[0].Digest, ShouldEqual, keptDigest)
+		})
+
+		Convey("removeStaleManifestEntries keeps index when nested inventory miss is contradicted by Stat", func() {
+			indexDigest := godigest.FromString("image-index-blob")
+			nestedDigest := godigest.FromString("nested-still-there")
+
+			indexBlob, err := json.Marshal(ispec.Index{
+				MediaType: ispec.MediaTypeImageIndex,
+				Manifests: []ispec.Descriptor{
+					{Digest: nestedDigest, MediaType: ispec.MediaTypeImageManifest},
+				},
+			})
+			So(err, ShouldBeNil)
+
+			imgStore := mocks.MockedImageStore{
+				GetAllBlobsFn: func(repo string) ([]godigest.Digest, error) {
+					// Nested digest absent from inventory (eventual consistency).
+					return []godigest.Digest{indexDigest}, nil
+				},
+				GetBlobContentFn: func(repo string, digest godigest.Digest) ([]byte, error) {
+					if digest == indexDigest {
+						return indexBlob, nil
+					}
+
+					return nil, zerr.ErrBlobNotFound
+				},
+				StatBlobFn: statBlobMissingUnlessPresent(indexDigest, nestedDigest),
+			}
+
+			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
+
+			index := &ispec.Index{
+				Manifests: []ispec.Descriptor{
+					{
+						Digest:    indexDigest,
+						MediaType: ispec.MediaTypeImageIndex,
+						Size:      int64(len(indexBlob)),
+					},
+				},
+			}
+
+			err = gc.removeStaleManifestEntries(repoName, index)
+			So(err, ShouldBeNil)
+			So(len(index.Manifests), ShouldEqual, 1)
+			So(index.Manifests[0].Digest, ShouldEqual, indexDigest)
+		})
+
+		Convey("removeStaleManifestEntries aborts when nested StatBlob is Transient", func() {
+			indexDigest := godigest.FromString("image-index-stat-blip")
+			nestedDigest := godigest.FromString("nested-stat-blip")
+			transient := errclass.MarkTransient(errors.New("nested stat blip")) //nolint:err113 // test
+
+			indexBlob, err := json.Marshal(ispec.Index{
+				MediaType: ispec.MediaTypeImageIndex,
+				Manifests: []ispec.Descriptor{
+					{Digest: nestedDigest, MediaType: ispec.MediaTypeImageManifest},
+				},
+			})
+			So(err, ShouldBeNil)
+
+			imgStore := mocks.MockedImageStore{
+				GetAllBlobsFn: func(repo string) ([]godigest.Digest, error) {
+					return []godigest.Digest{indexDigest}, nil
+				},
+				GetBlobContentFn: func(repo string, digest godigest.Digest) ([]byte, error) {
+					if digest == indexDigest {
+						return indexBlob, nil
+					}
+
+					return nil, zerr.ErrBlobNotFound
+				},
+				StatBlobFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+					if digest == nestedDigest {
+						return false, -1, time.Time{}, transient
+					}
+
+					return true, 0, time.Time{}, nil
+				},
+			}
+
+			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
+
+			index := &ispec.Index{
+				Manifests: []ispec.Descriptor{
+					{
+						Digest:    indexDigest,
+						MediaType: ispec.MediaTypeImageIndex,
+						Size:      int64(len(indexBlob)),
+					},
+				},
+			}
+
+			err = gc.removeStaleManifestEntries(repoName, index)
+			So(errors.Is(err, zerr.ErrStorageTransient), ShouldBeTrue)
+			So(len(index.Manifests), ShouldEqual, 1)
+			So(index.Manifests[0].Digest, ShouldEqual, indexDigest)
+		})
 	})
 }
 
@@ -1615,8 +3193,7 @@ func TestCleanRepoWithStaleManifestEntries(t *testing.T) {
 	Convey("cleanRepo end-to-end prunes stale manifest entries", t, func() {
 		log := zlog.NewTestLogger()
 		audit := zlog.NewAuditLogger("debug", "")
-		metrics := monitoring.NewMetricsServer(false, log)
-		defer metrics.Stop()
+		metrics := monitoring.NewNopMetricServer()
 
 		existingDigest := godigest.FromString("existing-blob")
 		missingDigest := godigest.FromString("missing-blob")
@@ -1651,13 +3228,14 @@ func TestCleanRepoWithStaleManifestEntries(t *testing.T) {
 
 				return nil
 			},
-			CleanupRepoFn: func(repo string, blobs []godigest.Digest, removeRepo bool) (int, error) {
+			CleanupRepoFn: func(repo string, blobs []godigest.Digest) (int, error) {
 				return 0, nil
 			},
 			GetBlobContentFn: func(repo string, digest godigest.Digest) ([]byte, error) {
 				if digest == existingDigest {
-					m := ispec.Manifest{}
-					m.SchemaVersion = 2
+					m := ispec.Manifest{
+						SchemaVersion: 2,
+					}
 					b, _ := json.Marshal(m)
 
 					return b, nil
@@ -1698,6 +3276,83 @@ func TestCleanRepoWithStaleManifestEntries(t *testing.T) {
 		So(len(savedIndex.Manifests), ShouldEqual, 1)
 		So(savedIndex.Manifests[0].Digest, ShouldEqual, existingDigest)
 	})
+
+	Convey("cleanRepo aborts on GetAllBlobs Transient before PutIndexContent", t, func() {
+		log := zlog.NewTestLogger()
+		audit := zlog.NewAuditLogger("debug", "")
+		metrics := monitoring.NewNopMetricServer()
+
+		existingDigest := godigest.FromString("existing-blob")
+
+		returnedIndex := ispec.Index{
+			Manifests: []ispec.Descriptor{
+				{
+					Digest:    existingDigest,
+					MediaType: ispec.MediaTypeImageManifest,
+				},
+			},
+		}
+
+		returnedIndexBuf, err := json.Marshal(returnedIndex)
+		So(err, ShouldBeNil)
+
+		putIndexCalled := false
+		cleanupCalled := false
+		transient := errclass.MarkTransient(errors.New("list blip")) //nolint:err113 // test
+
+		imgStore := mocks.MockedImageStore{
+			GetIndexContentFn: func(repo string) ([]byte, error) {
+				return returnedIndexBuf, nil
+			},
+			GetAllBlobsFn: func(repo string) ([]godigest.Digest, error) {
+				return nil, transient
+			},
+			PutIndexContentFn: func(repo string, index ispec.Index) error {
+				putIndexCalled = true
+
+				return nil
+			},
+			CleanupRepoFn: func(repo string, blobs []godigest.Digest) (int, error) {
+				cleanupCalled = true
+
+				return 0, nil
+			},
+			GetBlobContentFn: func(repo string, digest godigest.Digest) ([]byte, error) {
+				m := ispec.Manifest{SchemaVersion: 2}
+				b, _ := json.Marshal(m)
+
+				return b, nil
+			},
+			StatBlobFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+				return true, 100, time.Now().Add(-time.Hour), nil
+			},
+			ListBlobUploadsFn: func(repo string) ([]string, error) {
+				return nil, nil
+			},
+		}
+
+		falseVal := false
+		gcOptions := Options{
+			Delay: storageConstants.DefaultGCDelay,
+			ImageRetention: config.ImageRetention{
+				Delay: storageConstants.DefaultGCDelay,
+				Policies: []config.RetentionPolicy{
+					{
+						Repositories:   []string{"**"},
+						DeleteUntagged: &falseVal,
+					},
+				},
+			},
+		}
+
+		gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
+
+		err = gc.cleanRepo(ctx, repoName)
+		So(err, ShouldNotBeNil)
+		So(errors.Is(err, zerr.ErrStorageTransient), ShouldBeTrue)
+		So(putIndexCalled, ShouldBeFalse)
+		So(cleanupCalled, ShouldBeFalse)
+	})
 }
 
 func TestGetSubjectFromCosignTag(t *testing.T) {
@@ -1737,8 +3392,7 @@ func TestCleanupRepoMissingBlob(t *testing.T) {
 
 		log := zlog.NewTestLogger()
 
-		metrics := monitoring.NewMetricsServer(false, log)
-		defer metrics.Stop()
+		metrics := monitoring.NewNopMetricServer()
 
 		cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
 			RootDir:     dir,
@@ -1757,7 +3411,7 @@ func TestCleanupRepoMissingBlob(t *testing.T) {
 		err = os.Remove(blobPath)
 		So(err, ShouldBeNil)
 
-		count, err := imgStore.CleanupRepo(repoName, []godigest.Digest{digest}, false)
+		count, err := imgStore.CleanupRepo(repoName, []godigest.Digest{digest})
 		So(err, ShouldBeNil)
 		So(count, ShouldEqual, 1)
 	})
@@ -1862,4 +3516,885 @@ func TestGCTaskGeneratorTimeWindow(t *testing.T) {
 			So(gen.loggedWindowDefer, ShouldBeFalse)
 		})
 	})
+}
+
+func TestRemoveTagsPerRetentionPolicyMissingRepoMeta(t *testing.T) {
+	Convey("tag retention keeps every tag when the repo record is missing", t, func() {
+		oldDigest := godigest.FromString("old-matching-tag")
+		newDigest := godigest.FromString("new-matching-tag")
+		otherDigest := godigest.FromString("unmatched-tag")
+
+		pushedWithin := 24 * time.Hour
+		gcOptions := Options{
+			Delay: time.Hour,
+			ImageRetention: config.ImageRetention{
+				Delay: time.Hour,
+				Policies: []config.RetentionPolicy{
+					{
+						Repositories: []string{"**"},
+						KeepTags: []config.KeepTagsPolicy{
+							{
+								Patterns:                []string{"^v[0-9]+$"},
+								MostRecentlyPushedCount: 1,
+								PushedWithin:            &pushedWithin,
+							},
+						},
+					},
+				},
+			},
+		}
+
+		now := time.Now()
+		repoMeta := types.RepoMeta{
+			Name: repoName,
+			Tags: map[types.Tag]types.Descriptor{
+				"v1":    {Digest: oldDigest.String(), MediaType: ispec.MediaTypeImageManifest},
+				"v2":    {Digest: newDigest.String(), MediaType: ispec.MediaTypeImageManifest},
+				"other": {Digest: otherDigest.String(), MediaType: ispec.MediaTypeImageManifest},
+			},
+			Statistics: map[types.ImageDigest]types.DescriptorStatistics{
+				oldDigest.String(): {
+					PushTimestamp:     now.Add(-48 * time.Hour),
+					LastPullTimestamp: now.Add(-48 * time.Hour),
+				},
+				newDigest.String(): {
+					PushTimestamp:     now,
+					LastPullTimestamp: now,
+				},
+				otherDigest.String(): {
+					PushTimestamp:     now,
+					LastPullTimestamp: now,
+				},
+			},
+		}
+
+		// Count and pushedWithin both drop v1 when statistics exist. A nil metaDB keeps every
+		// tag matching the name pattern, including v1, and drops "other". A missing repo
+		// record keeps every tag because count and time rules cannot be evaluated.
+		testCases := []struct {
+			name     string
+			nilMeta  bool
+			getErr   error
+			wantErr  bool
+			wantTags []string
+		}{
+			{name: "successful metadata trims by count and time", wantTags: []string{"v2"}},
+			{name: "nil metadata keeps pattern matches", nilMeta: true, wantTags: []string{"v1", "v2"}},
+			{
+				name:     "direct ErrRepoMetaNotFound keeps every tag",
+				getErr:   zerr.ErrRepoMetaNotFound,
+				wantTags: []string{"other", "v1", "v2"},
+			},
+			{
+				name:     "wrapped ErrRepoMetaNotFound keeps every tag",
+				getErr:   fmt.Errorf("lookup repo: %w", zerr.ErrRepoMetaNotFound),
+				wantTags: []string{"other", "v1", "v2"},
+			},
+			{
+				name:     "unrelated metadata error is returned",
+				getErr:   errGC,
+				wantErr:  true,
+				wantTags: []string{"other", "v1", "v2"},
+			},
+		}
+
+		for _, testCase := range testCases {
+			Convey(testCase.name, func() {
+				index := tagRetentionIndex(oldDigest, newDigest, otherDigest)
+
+				var metaDB types.MetaDB
+				if !testCase.nilMeta {
+					metaDB = mocks.MetaDBMock{
+						GetRepoMetaFn: func(ctx context.Context, repo string) (types.RepoMeta, error) {
+							if testCase.getErr != nil {
+								return types.RepoMeta{}, testCase.getErr
+							}
+
+							return repoMeta, nil
+						},
+					}
+				}
+
+				gc := NewGarbageCollect(mocks.MockedImageStore{}, metaDB, gcOptions,
+					zlog.NewAuditLogger("debug", ""), zlog.NewTestLogger(), monitoring.NewNopMetricServer())
+
+				err := gc.removeTagsPerRetentionPolicy(context.Background(), repoName, &index)
+				if testCase.wantErr {
+					So(err, ShouldNotBeNil)
+					So(errors.Is(err, errGC), ShouldBeTrue)
+				} else {
+					So(err, ShouldBeNil)
+				}
+
+				So(descriptorTags(index), ShouldResemble, testCase.wantTags)
+			})
+		}
+	})
+}
+
+func TestRemoveUntaggedManifestsMissingRepoMeta(t *testing.T) {
+	Convey("untagged retention keeps every manifest when the repo record is missing", t, func() {
+		oldDrop := godigest.FromString("untagged-old-drop")
+		oldKeep := godigest.FromString("untagged-old-keep")
+		young := godigest.FromString("untagged-young")
+		child := godigest.FromString("multiarch-child")
+
+		manifestBlob, err := json.Marshal(ispec.Manifest{
+			Versioned: specs.Versioned{SchemaVersion: 2},
+			MediaType: ispec.MediaTypeImageManifest,
+			Config: ispec.Descriptor{
+				MediaType: ispec.MediaTypeImageConfig,
+				Digest:    godigest.FromString("config"),
+				Size:      2,
+			},
+			Layers: []ispec.Descriptor{},
+		})
+		So(err, ShouldBeNil)
+
+		indexBlob, err := json.Marshal(ispec.Index{
+			Versioned: specs.Versioned{SchemaVersion: 2},
+			MediaType: ispec.MediaTypeImageIndex,
+			Manifests: []ispec.Descriptor{
+				{MediaType: ispec.MediaTypeImageManifest, Digest: child, Size: 1},
+			},
+		})
+		So(err, ShouldBeNil)
+
+		indexDigest := godigest.FromBytes(indexBlob)
+		retainedByPolicy := []string{indexDigest.String(), child.String(), oldKeep.String(), young.String()}
+		retainedByDelay := []string{indexDigest.String(), child.String(), young.String()}
+		allDigests := []string{
+			indexDigest.String(), child.String(), oldDrop.String(), oldKeep.String(), young.String(),
+		}
+
+		slices.Sort(retainedByPolicy)
+		slices.Sort(retainedByDelay)
+		slices.Sort(allDigests)
+
+		now := time.Now()
+		repoMeta := types.RepoMeta{
+			Name: repoName,
+			Statistics: map[types.ImageDigest]types.DescriptorStatistics{
+				oldDrop.String(): {PushTimestamp: now.Add(-48 * time.Hour), LastPullTimestamp: now.Add(-48 * time.Hour)},
+				oldKeep.String(): {PushTimestamp: now.Add(-2 * time.Hour), LastPullTimestamp: now.Add(-2 * time.Hour)},
+				young.String():   {PushTimestamp: now, LastPullTimestamp: now},
+				child.String():   {PushTimestamp: now.Add(-48 * time.Hour), LastPullTimestamp: now.Add(-48 * time.Hour)},
+			},
+		}
+
+		deleteUntagged := true
+		gcOptions := Options{
+			Delay: time.Hour,
+			ImageRetention: config.ImageRetention{
+				Delay: time.Hour,
+				Policies: []config.RetentionPolicy{
+					{
+						Repositories:   []string{"**"},
+						DeleteUntagged: &deleteUntagged,
+						KeepUntagged: &config.KeepUntaggedPolicy{
+							MostRecentlyPushedCount: 2,
+						},
+					},
+				},
+			},
+		}
+
+		imgStore := mocks.MockedImageStore{
+			GetBlobContentFn: func(repo string, digest godigest.Digest) ([]byte, error) {
+				if digest == indexDigest {
+					return indexBlob, nil
+				}
+
+				return manifestBlob, nil
+			},
+			StatBlobFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+				if digest == young {
+					return true, 1, time.Now(), nil
+				}
+
+				return true, 1, now.Add(-2 * time.Hour), nil
+			},
+		}
+
+		testCases := []struct {
+			name        string
+			nilMeta     bool
+			getErr      error
+			wantErr     bool
+			wantDigests []string
+		}{
+			{name: "metadata applies keepUntagged", wantDigests: retainedByPolicy},
+			{name: "nil metadata uses retention delay", nilMeta: true, wantDigests: retainedByDelay},
+			{
+				name:        "direct ErrRepoMetaNotFound retains untagged",
+				getErr:      zerr.ErrRepoMetaNotFound,
+				wantDigests: allDigests,
+			},
+			{
+				name:        "wrapped ErrRepoMetaNotFound retains untagged",
+				getErr:      fmt.Errorf("lookup repo: %w", zerr.ErrRepoMetaNotFound),
+				wantDigests: allDigests,
+			},
+			{name: "unrelated metadata error aborts", getErr: errGC, wantErr: true, wantDigests: allDigests},
+		}
+
+		for _, testCase := range testCases {
+			Convey(testCase.name, func() {
+				index := untaggedRetentionIndex(oldDrop, oldKeep, young, child, indexDigest)
+
+				var metaDB types.MetaDB
+				if !testCase.nilMeta {
+					metaDB = mocks.MetaDBMock{
+						GetRepoMetaFn: func(ctx context.Context, repo string) (types.RepoMeta, error) {
+							if testCase.getErr != nil {
+								return types.RepoMeta{}, testCase.getErr
+							}
+
+							return repoMeta, nil
+						},
+					}
+				}
+
+				gc := NewGarbageCollect(imgStore, metaDB, gcOptions,
+					zlog.NewAuditLogger("debug", ""), zlog.NewTestLogger(), monitoring.NewNopMetricServer())
+
+				err := gc.removeManifestsPerRepoPolicy(context.Background(), repoName, &index)
+				if testCase.wantErr {
+					So(err, ShouldNotBeNil)
+					So(errors.Is(err, errGC), ShouldBeTrue)
+				} else {
+					So(err, ShouldBeNil)
+				}
+
+				So(sortedDigestStrings(index), ShouldResemble, testCase.wantDigests)
+			})
+		}
+	})
+}
+
+func TestRemoveManifestDeleteSignatureMetadataErrors(t *testing.T) {
+	Convey("removeManifest treats missing signature metadata as already cleaned", t, func() {
+		testCases := []struct {
+			name      string
+			withMeta  bool
+			deleteErr error
+			wantErr   bool
+		}{
+			{name: "nil metadb permits removal"},
+			{name: "nil delete error permits removal", withMeta: true},
+			{name: "ErrImageMetaNotFound permits removal", withMeta: true, deleteErr: zerr.ErrImageMetaNotFound},
+			{name: "ErrRepoMetaNotFound permits removal", withMeta: true, deleteErr: zerr.ErrRepoMetaNotFound},
+			{
+				name:      "wrapped ErrImageMetaNotFound permits removal",
+				withMeta:  true,
+				deleteErr: fmt.Errorf("delete signature: %w", zerr.ErrImageMetaNotFound),
+			},
+			{
+				name:      "wrapped ErrRepoMetaNotFound permits removal",
+				withMeta:  true,
+				deleteErr: fmt.Errorf("delete signature: %w", zerr.ErrRepoMetaNotFound),
+			},
+			{name: "unrelated database error is returned", withMeta: true, deleteErr: errGC, wantErr: true},
+		}
+
+		for _, testCase := range testCases {
+			Convey(testCase.name, func() {
+				desc := ispec.Descriptor{
+					MediaType: ispec.MediaTypeImageManifest,
+					Digest:    godigest.FromString("signature-manifest"),
+				}
+				index := &ispec.Index{Manifests: []ispec.Descriptor{desc}}
+
+				var metaDB types.MetaDB
+				if testCase.withMeta {
+					metaDB = mocks.MetaDBMock{
+						DeleteSignatureFn: func(repo string, signedManifestDigest godigest.Digest,
+							sm types.SignatureMetadata,
+						) error {
+							return testCase.deleteErr
+						},
+					}
+				}
+
+				gc := NewGarbageCollect(mocks.MockedImageStore{}, metaDB, Options{},
+					zlog.NewAuditLogger("debug", ""), zlog.NewTestLogger(), monitoring.NewNopMetricServer())
+
+				gced, err := gc.removeManifest(repoName, index, desc, desc.Digest.String(), storage.CosignType,
+					godigest.FromString("signed-subject"))
+				if testCase.wantErr {
+					So(err, ShouldNotBeNil)
+					So(errors.Is(err, errGC), ShouldBeTrue)
+					So(gced, ShouldBeFalse)
+
+					return
+				}
+
+				So(err, ShouldBeNil)
+				So(gced, ShouldBeTrue)
+				So(index.Manifests, ShouldBeEmpty)
+			})
+		}
+	})
+}
+
+func TestRemoveUntaggedManifestsProgress(t *testing.T) {
+	delay := time.Hour
+
+	newGC := func(oldDigest godigest.Digest) (GarbageCollect, *bytes.Buffer, *bytes.Buffer) {
+		var logBuf, auditBuf bytes.Buffer
+
+		log := zlog.NewLoggerWithWriter("debug", &logBuf)
+		audit := zlog.NewLoggerWithWriter("debug", &auditBuf)
+
+		gc := GarbageCollect{
+			imgStore: mocks.MockedImageStore{
+				StatBlobFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+					if digest == oldDigest {
+						return true, 1, time.Now().Add(-2 * delay), nil
+					}
+
+					return true, 1, time.Now(), nil
+				},
+			},
+			opts:      Options{ImageRetention: config.ImageRetention{Delay: delay}},
+			policyMgr: retentionPolicyMock{},
+			log:       log,
+			auditLog:  &audit,
+		}
+
+		return gc, &logBuf, &auditBuf
+	}
+
+	Convey("an eligible untagged manifest before a younger one still reports progress", t, func() {
+		eligible := godigest.FromString("eligible-untagged")
+		young := godigest.FromString("younger-untagged")
+		index := &ispec.Index{
+			Manifests: []ispec.Descriptor{
+				{Digest: eligible, MediaType: ispec.MediaTypeImageManifest},
+				{Digest: young, MediaType: ispec.MediaTypeImageManifest},
+			},
+		}
+
+		gc, logBuf, auditBuf := newGC(eligible)
+		gced, err := gc.removeUntaggedManifests(context.Background(), repoName, index, map[godigest.Digest]bool{})
+
+		So(err, ShouldBeNil)
+		So(gced, ShouldBeTrue)
+		So(index.Manifests, ShouldHaveLength, 1)
+		So(index.Manifests[0].Digest, ShouldEqual, young)
+		So(untaggedDeletionLogs(logBuf.String(), eligible.String()), ShouldEqual, 1)
+		So(untaggedDeletionLogs(logBuf.String(), young.String()), ShouldEqual, 0)
+		So(untaggedDeletionLogs(auditBuf.String(), eligible.String()), ShouldEqual, 1)
+		So(untaggedDeletionLogs(auditBuf.String(), young.String()), ShouldEqual, 0)
+	})
+
+	Convey("an untagged pass that removes nothing reports no progress", t, func() {
+		first := godigest.FromString("young-first")
+		second := godigest.FromString("young-second")
+		index := &ispec.Index{
+			Manifests: []ispec.Descriptor{
+				{Digest: first, MediaType: ispec.MediaTypeImageManifest},
+				{Digest: second, MediaType: ispec.MediaTypeImageManifest},
+			},
+		}
+
+		// Neither descriptor is the old digest, so the age check keeps both.
+		gc, logBuf, auditBuf := newGC(godigest.FromString("neither"))
+		gced, err := gc.removeUntaggedManifests(context.Background(), repoName, index, map[godigest.Digest]bool{})
+
+		So(err, ShouldBeNil)
+		So(gced, ShouldBeFalse)
+		So(index.Manifests, ShouldHaveLength, 2)
+		So(logBuf.String(), ShouldNotContainSubstring, "removed untagged manifest")
+		So(auditBuf.String(), ShouldNotContainSubstring, "removed untagged manifest")
+	})
+}
+
+func TestCleanRepoCompletesWhenSignatureMetadataIsMissing(t *testing.T) {
+	ctx := context.Background()
+	repo := "gc-missing-meta"
+	gcDelay := time.Hour
+
+	Convey("cleanRepo finishes referrer and untagged GC when signature metadata is already gone", t, func() {
+		harness := newMissingMetaCleanRepo(t, repo, gcDelay, zerr.ErrRepoMetaNotFound, false)
+
+		err := harness.gc.cleanRepo(ctx, repo)
+		So(err, ShouldBeNil)
+		So(harness.calls.deleteCalls, ShouldEqual, 1)
+		So(harness.calls.subject, ShouldEqual, harness.subject.manifest)
+		So(harness.calls.meta.SignatureDigest, ShouldEqual, harness.signature.manifest.String())
+		So(harness.calls.meta.SignatureType, ShouldEqual, storage.CosignType)
+		So(slices.Contains(harness.calls.removed, harness.subject.manifest), ShouldBeTrue)
+		So(slices.Contains(harness.calls.removed, harness.signature.manifest), ShouldBeTrue)
+
+		indexBytes, err := harness.imgStore.GetIndexContent(repo)
+		So(err, ShouldBeNil)
+
+		var saved ispec.Index
+		err = json.Unmarshal(indexBytes, &saved)
+		So(err, ShouldBeNil)
+		So(saved.Manifests, ShouldHaveLength, 1)
+		So(saved.Manifests[0].Digest, ShouldEqual, harness.young.manifest)
+		_, tagged := saved.Manifests[0].Annotations[ispec.AnnotationRefName]
+		So(tagged, ShouldBeFalse)
+
+		assertGCBlobs(harness.rootDir, repo, harness.subject, false)
+		assertGCBlobs(harness.rootDir, repo, harness.signature, false)
+		assertGCBlobs(harness.rootDir, repo, harness.young, true)
+
+		remaining, err := harness.imgStore.GetAllBlobs(repo)
+		So(err, ShouldBeNil)
+		So(sortedDigests(remaining), ShouldResemble, sortedDigests([]godigest.Digest{
+			harness.young.manifest, harness.young.config, harness.young.layer,
+		}))
+	})
+
+	Convey("a genuine signature metadata failure does not persist the index or delete blobs", t, func() {
+		harness := newMissingMetaCleanRepo(t, repo, gcDelay, errGC, false)
+
+		err := harness.gc.cleanRepo(ctx, repo)
+		So(err, ShouldNotBeNil)
+		So(errors.Is(err, errGC), ShouldBeTrue)
+		So(harness.calls.deleteCalls, ShouldEqual, 1)
+
+		indexBytes, err := harness.imgStore.GetIndexContent(repo)
+		So(err, ShouldBeNil)
+		So(indexBytes, ShouldResemble, harness.indexBefore)
+
+		assertGCBlobs(harness.rootDir, repo, harness.subject, true)
+		assertGCBlobs(harness.rootDir, repo, harness.signature, true)
+		assertGCBlobs(harness.rootDir, repo, harness.young, true)
+	})
+
+	Convey("dry-run leaves persisted storage and metadata untouched", t, func() {
+		harness := newMissingMetaCleanRepo(t, repo, gcDelay, zerr.ErrRepoMetaNotFound, true)
+
+		err := harness.gc.cleanRepo(ctx, repo)
+		So(err, ShouldBeNil)
+		So(harness.calls.deleteCalls, ShouldEqual, 0)
+		So(harness.calls.removed, ShouldBeEmpty)
+
+		indexBytes, err := harness.imgStore.GetIndexContent(repo)
+		So(err, ShouldBeNil)
+		So(indexBytes, ShouldResemble, harness.indexBefore)
+
+		assertGCBlobs(harness.rootDir, repo, harness.subject, true)
+		assertGCBlobs(harness.rootDir, repo, harness.signature, true)
+		assertGCBlobs(harness.rootDir, repo, harness.young, true)
+	})
+}
+
+type gcBlobSet struct {
+	manifest     godigest.Digest
+	config       godigest.Digest
+	layer        godigest.Digest
+	manifestSize int64
+}
+
+type signatureMetaCalls struct {
+	deleteCalls int
+	subject     godigest.Digest
+	meta        types.SignatureMetadata
+	removed     []godigest.Digest
+}
+
+type missingMetaCleanRepo struct {
+	rootDir     string
+	imgStore    storageTypes.ImageStore
+	gc          GarbageCollect
+	subject     gcBlobSet
+	signature   gcBlobSet
+	young       gcBlobSet
+	indexBefore []byte
+	calls       *signatureMetaCalls
+}
+
+func newMissingMetaCleanRepo(t *testing.T, repo string, gcDelay time.Duration, deleteErr error, dryRun bool,
+) missingMetaCleanRepo {
+	t.Helper()
+
+	rootDir := t.TempDir()
+	log := zlog.NewTestLogger()
+	metrics := monitoring.NewNopMetricServer()
+	imgStore := local.NewImageStore(rootDir, false, false, log, metrics, nil, nil, nil, nil)
+
+	ctx := context.Background()
+	subject := uploadGCManifest(ctx, imgStore, repo, "subject", []byte("subject-layer"))
+	signature := uploadGCManifest(ctx, imgStore, repo, "signature", []byte("signature-layer"))
+	young := uploadGCManifest(ctx, imgStore, repo, "young", []byte("young-layer"))
+
+	// Eligible subject, then its legacy cosign tag, then a younger untagged manifest.
+	// The young descriptor follows the subject so a sweep that forgets earlier progress
+	// would stop before the orphaned signature can be removed.
+	index := ispec.Index{
+		Versioned: specs.Versioned{SchemaVersion: 2},
+		MediaType: ispec.MediaTypeImageIndex,
+		Manifests: []ispec.Descriptor{
+			{
+				MediaType: ispec.MediaTypeImageManifest,
+				Digest:    subject.manifest,
+				Size:      subject.manifestSize,
+			},
+			{
+				MediaType: ispec.MediaTypeImageManifest,
+				Digest:    signature.manifest,
+				Size:      signature.manifestSize,
+				Annotations: map[string]string{
+					ispec.AnnotationRefName: "sha256-" + subject.manifest.Encoded() + ".sig",
+				},
+			},
+			{
+				MediaType: ispec.MediaTypeImageManifest,
+				Digest:    young.manifest,
+				Size:      young.manifestSize,
+			},
+		},
+	}
+
+	err := imgStore.PutIndexContent(repo, index)
+	So(err, ShouldBeNil)
+
+	indexBefore, err := imgStore.GetIndexContent(repo)
+	So(err, ShouldBeNil)
+
+	err = backdateGCBlobs(rootDir, repo, subject, 2*gcDelay)
+	So(err, ShouldBeNil)
+	err = backdateGCBlobs(rootDir, repo, signature, 2*gcDelay)
+	So(err, ShouldBeNil)
+
+	calls := &signatureMetaCalls{}
+	deleteUntagged := true
+	gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{
+		DeleteSignatureFn: func(repo string, signedManifestDigest godigest.Digest, sm types.SignatureMetadata) error {
+			calls.deleteCalls++
+			calls.subject = signedManifestDigest
+			calls.meta = sm
+
+			return deleteErr
+		},
+		RemoveRepoReferenceFn: func(repo, reference string, manifestDigest godigest.Digest) error {
+			calls.removed = append(calls.removed, manifestDigest)
+
+			return nil
+		},
+	}, Options{
+		Delay: gcDelay,
+		ImageRetention: config.ImageRetention{
+			Delay:  gcDelay,
+			DryRun: dryRun,
+			Policies: []config.RetentionPolicy{
+				{
+					Repositories:    []string{"**"},
+					DeleteReferrers: true,
+					DeleteUntagged:  &deleteUntagged,
+				},
+			},
+		},
+	}, zlog.NewAuditLogger("debug", ""), log, metrics)
+
+	return missingMetaCleanRepo{
+		rootDir:     rootDir,
+		imgStore:    imgStore,
+		gc:          gc,
+		subject:     subject,
+		signature:   signature,
+		young:       young,
+		indexBefore: indexBefore,
+		calls:       calls,
+	}
+}
+
+func uploadGCManifest(ctx context.Context, imgStore storageTypes.ImageStore, repo, author string, layer []byte,
+) gcBlobSet {
+	configBlob, err := json.Marshal(ispec.Image{
+		Author: author,
+		Platform: ispec.Platform{
+			Architecture: "amd64",
+			OS:           "linux",
+		},
+		RootFS: ispec.RootFS{
+			Type:    "layers",
+			DiffIDs: []godigest.Digest{godigest.FromBytes(layer)},
+		},
+	})
+	So(err, ShouldBeNil)
+
+	configDigest := godigest.FromBytes(configBlob)
+	_, _, err = imgStore.FullBlobUpload(ctx, repo, bytes.NewReader(configBlob), configDigest)
+	So(err, ShouldBeNil)
+
+	layerDigest := godigest.FromBytes(layer)
+	_, _, err = imgStore.FullBlobUpload(ctx, repo, bytes.NewReader(layer), layerDigest)
+	So(err, ShouldBeNil)
+
+	manifest := ispec.Manifest{
+		Versioned: specs.Versioned{SchemaVersion: 2},
+		MediaType: ispec.MediaTypeImageManifest,
+		Config: ispec.Descriptor{
+			MediaType: ispec.MediaTypeImageConfig,
+			Digest:    configDigest,
+			Size:      int64(len(configBlob)),
+		},
+		Layers: []ispec.Descriptor{
+			{
+				MediaType: ispec.MediaTypeImageLayerGzip,
+				Digest:    layerDigest,
+				Size:      int64(len(layer)),
+			},
+		},
+	}
+
+	manifestBlob, err := json.Marshal(manifest)
+	So(err, ShouldBeNil)
+
+	manifestDigest := godigest.FromBytes(manifestBlob)
+	_, _, err = imgStore.FullBlobUpload(ctx, repo, bytes.NewReader(manifestBlob), manifestDigest)
+	So(err, ShouldBeNil)
+
+	return gcBlobSet{
+		manifest:     manifestDigest,
+		config:       configDigest,
+		layer:        layerDigest,
+		manifestSize: int64(len(manifestBlob)),
+	}
+}
+
+func backdateGCBlobs(rootDir, repo string, blobs gcBlobSet, age time.Duration) error {
+	old := time.Now().Add(-age)
+
+	for _, digest := range []godigest.Digest{blobs.manifest, blobs.config, blobs.layer} {
+		blobPath := path.Join(rootDir, repo, "blobs", digest.Algorithm().String(), digest.Encoded())
+		if err := os.Chtimes(blobPath, old, old); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func assertGCBlobs(rootDir, repo string, blobs gcBlobSet, present bool) {
+	for _, digest := range []godigest.Digest{blobs.manifest, blobs.config, blobs.layer} {
+		_, err := os.Stat(path.Join(rootDir, repo, "blobs", digest.Algorithm().String(), digest.Encoded()))
+		So(err == nil, ShouldEqual, present)
+	}
+}
+
+func tagRetentionIndex(oldDigest, newDigest, otherDigest godigest.Digest) ispec.Index {
+	return ispec.Index{
+		Versioned: specs.Versioned{SchemaVersion: 2},
+		MediaType: ispec.MediaTypeImageIndex,
+		Manifests: []ispec.Descriptor{
+			taggedManifestDesc(oldDigest, "v1"),
+			taggedManifestDesc(newDigest, "v2"),
+			taggedManifestDesc(otherDigest, "other"),
+		},
+	}
+}
+
+func taggedManifestDesc(digest godigest.Digest, tag string) ispec.Descriptor {
+	return ispec.Descriptor{
+		MediaType: ispec.MediaTypeImageManifest,
+		Digest:    digest,
+		Size:      1,
+		Annotations: map[string]string{
+			ispec.AnnotationRefName: tag,
+		},
+	}
+}
+
+func untaggedRetentionIndex(oldDrop, oldKeep, young, child, indexDigest godigest.Digest) ispec.Index {
+	return ispec.Index{
+		Versioned: specs.Versioned{SchemaVersion: 2},
+		MediaType: ispec.MediaTypeImageIndex,
+		Manifests: []ispec.Descriptor{
+			{MediaType: ispec.MediaTypeImageManifest, Digest: oldDrop, Size: 1},
+			{MediaType: ispec.MediaTypeImageManifest, Digest: oldKeep, Size: 1},
+			{MediaType: ispec.MediaTypeImageManifest, Digest: young, Size: 1},
+			{MediaType: ispec.MediaTypeImageManifest, Digest: child, Size: 1},
+			{
+				MediaType: ispec.MediaTypeImageIndex,
+				Digest:    indexDigest,
+				Size:      1,
+				Annotations: map[string]string{
+					ispec.AnnotationRefName: "multi",
+				},
+			},
+		},
+	}
+}
+
+func descriptorTags(index ispec.Index) []string {
+	tags := make([]string, 0)
+
+	for _, desc := range index.Manifests {
+		tag, ok := getDescriptorTag(desc)
+		if ok {
+			tags = append(tags, tag)
+		}
+	}
+
+	slices.Sort(tags)
+
+	return tags
+}
+
+func sortedDigestStrings(index ispec.Index) []string {
+	digests := make([]string, 0, len(index.Manifests))
+
+	for _, desc := range index.Manifests {
+		digests = append(digests, desc.Digest.String())
+	}
+
+	slices.Sort(digests)
+
+	return digests
+}
+
+func sortedDigests(digests []godigest.Digest) []string {
+	sorted := make([]string, 0, len(digests))
+
+	for _, digest := range digests {
+		sorted = append(sorted, digest.String())
+	}
+
+	slices.Sort(sorted)
+
+	return sorted
+}
+
+func untaggedDeletionLogs(logs, digest string) int {
+	count := 0
+
+	for _, line := range strings.Split(logs, "\n") {
+		if strings.Contains(line, "removed untagged manifest") && strings.Contains(line, digest) {
+			count++
+		}
+	}
+
+	return count
+}
+
+// runGCGenerator drives the generator the way the scheduler does: Next until it
+// returns no task, running each task. visited counts CleanRepo runs per repo.
+func runGCGenerator(ctx context.Context, gen *GCTaskGenerator, visited map[string]int) error {
+	for range 10 {
+		task, err := gen.Next()
+		if err != nil {
+			return err
+		}
+
+		if task == nil {
+			return nil
+		}
+
+		gcTask, ok := task.(*gcTask)
+		So(ok, ShouldBeTrue)
+
+		if err := gcTask.DoWork(ctx); err != nil {
+			return err
+		}
+
+		visited[gcTask.repo]++
+	}
+
+	return nil
+}
+
+func TestGCTaskGeneratorStorageErrClasses(t *testing.T) {
+	repos := []string{"a/repo", "b", "c/repo"}
+	classes := []struct {
+		name  string
+		class error
+		mark  func(error) error
+	}{
+		{"Transient", zerr.ErrStorageTransient, errclass.MarkTransient},
+		{"Permanent", zerr.ErrStoragePermanent, errclass.MarkPermanent},
+	}
+
+	for _, backend := range storageerrclass.Backends() {
+		t.Run(backend.Name, func(t *testing.T) {
+			newGenerator := func() (*GCTaskGenerator, *storageerrclass.HookDriver, storageTypes.ImageStore) {
+				imgStore, hooks := storageerrclass.NewStore(t, backend)
+				storeController := storage.StoreController{DefaultStore: imgStore}
+
+				for _, repo := range repos {
+					So(WriteImageToFileSystem(CreateRandomImage(), repo, "v1", storeController), ShouldBeNil)
+				}
+
+				gcInstance := NewGarbageCollect(imgStore, nil, Options{
+					Delay:          time.Hour,
+					ImageRetention: config.ImageRetention{Delay: time.Hour},
+				}, zlog.NewAuditLogger("debug", "/dev/null"), zlog.NewTestLogger(), monitoring.NewNopMetricServer())
+
+				gen := &GCTaskGenerator{
+					imgStore:       imgStore,
+					gc:             gcInstance,
+					processedRepos: map[string]struct{}{},
+					maxDelay:       time.Millisecond,
+				}
+
+				return gen, hooks, imgStore
+			}
+
+			for _, tc := range classes {
+				Convey("A "+tc.name+" failure validating one repository stops the GC sweep", t, func() {
+					gen, hooks, imgStore := newGenerator()
+					ctx := context.Background()
+
+					hooks.AddFault(storageerrclass.Fault{
+						Op: storageerrclass.OpList, Path: path.Join(imgStore.RootDir(), "b"), Err: tc.mark(errGC),
+					})
+
+					visited := map[string]int{}
+					err := runGCGenerator(ctx, gen, visited)
+					So(errors.Is(err, tc.class), ShouldBeTrue)
+					So(gen.IsDone(), ShouldBeFalse)
+					So(visited, ShouldNotContainKey, "b")
+
+					Convey("and the next sweep, once storage recovers, visits every repo once", func() {
+						hooks.ClearFaults()
+						gen.Reset()
+
+						visited := map[string]int{}
+						So(runGCGenerator(ctx, gen, visited), ShouldBeNil)
+						So(gen.IsDone(), ShouldBeTrue)
+
+						for _, repo := range repos {
+							So(visited[repo], ShouldEqual, 1)
+						}
+					})
+				})
+			}
+
+			Convey("A repository deleted while the GC sweep walks the store", t, func() {
+				gen, hooks, imgStore := newGenerator()
+				ctx := context.Background()
+
+				hooks.DeleteOnVisit = path.Join(imgStore.RootDir(), "b")
+
+				visited := map[string]int{}
+				err := runGCGenerator(ctx, gen, visited)
+
+				if backend.WalkAbortsOnNestedMissing {
+					So(errors.Is(err, zerr.ErrStorageTransient), ShouldBeTrue)
+					So(errors.Is(err, zerr.ErrStorageMissing), ShouldBeFalse)
+					So(gen.IsDone(), ShouldBeFalse)
+					So(visited, ShouldNotContainKey, "c/repo")
+				} else {
+					So(err, ShouldBeNil)
+					So(gen.IsDone(), ShouldBeTrue)
+					So(visited, ShouldContainKey, "c/repo")
+				}
+
+				gen.Reset()
+
+				visited = map[string]int{}
+				So(runGCGenerator(ctx, gen, visited), ShouldBeNil)
+				So(gen.IsDone(), ShouldBeTrue)
+				So(visited, ShouldNotContainKey, "b")
+				So(visited["a/repo"], ShouldEqual, 1)
+				So(visited["c/repo"], ShouldEqual, 1)
+			})
+		})
+	}
 }

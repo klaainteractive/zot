@@ -453,7 +453,7 @@ func TestVerifyMandatoryAnnotationsFunction(t *testing.T) {
 		enable := false
 
 		lintConfig := &extconf.LintConfig{
-			BaseConfig:           extconf.BaseConfig{Enable: &enable},
+			Enable:               &enable,
 			MandatoryAnnotations: []string{},
 		}
 
@@ -467,7 +467,7 @@ func TestVerifyMandatoryAnnotationsFunction(t *testing.T) {
 
 		linter := lint.NewLinter(lintConfig, log.NewTestLogger())
 		imgStore := local.NewImageStore(dir, false, false,
-			log.NewTestLogger(), monitoring.NewMetricsServer(false, log.NewTestLogger()), linter, nil, nil, nil)
+			log.NewTestLogger(), monitoring.NewNopMetricServer(), linter, nil, nil, nil)
 
 		indexContent, err := imgStore.GetIndexContent("zot-test")
 		So(err, ShouldBeNil)
@@ -485,7 +485,7 @@ func TestVerifyMandatoryAnnotationsFunction(t *testing.T) {
 		enable := true
 
 		lintConfig := &extconf.LintConfig{
-			BaseConfig:           extconf.BaseConfig{Enable: &enable},
+			Enable:               &enable,
 			MandatoryAnnotations: []string{},
 		}
 
@@ -499,7 +499,7 @@ func TestVerifyMandatoryAnnotationsFunction(t *testing.T) {
 
 		linter := lint.NewLinter(lintConfig, log.NewTestLogger())
 		imgStore := local.NewImageStore(dir, false, false,
-			log.NewTestLogger(), monitoring.NewMetricsServer(false, log.NewTestLogger()), linter, nil, nil, nil)
+			log.NewTestLogger(), monitoring.NewNopMetricServer(), linter, nil, nil, nil)
 
 		indexContent, err := imgStore.GetIndexContent("zot-test")
 		So(err, ShouldBeNil)
@@ -517,7 +517,7 @@ func TestVerifyMandatoryAnnotationsFunction(t *testing.T) {
 		enable := true
 
 		lintConfig := &extconf.LintConfig{
-			BaseConfig:           extconf.BaseConfig{Enable: &enable},
+			Enable:               &enable,
 			MandatoryAnnotations: []string{"annotation1", "annotation2", "annotation3"},
 		}
 
@@ -569,7 +569,7 @@ func TestVerifyMandatoryAnnotationsFunction(t *testing.T) {
 
 		linter := lint.NewLinter(lintConfig, log.NewTestLogger())
 		imgStore := local.NewImageStore(dir, false, false,
-			log.NewTestLogger(), monitoring.NewMetricsServer(false, log.NewTestLogger()), linter, nil, nil, nil)
+			log.NewTestLogger(), monitoring.NewNopMetricServer(), linter, nil, nil, nil)
 
 		pass, err := linter.CheckMandatoryAnnotations("zot-test", digest, imgStore)
 		So(err, ShouldBeNil)
@@ -580,7 +580,7 @@ func TestVerifyMandatoryAnnotationsFunction(t *testing.T) {
 		enable := true
 
 		lintConfig := &extconf.LintConfig{
-			BaseConfig:           extconf.BaseConfig{Enable: &enable},
+			Enable:               &enable,
 			MandatoryAnnotations: []string{"annotation1", "annotation2", "annotation3"},
 		}
 
@@ -631,7 +631,7 @@ func TestVerifyMandatoryAnnotationsFunction(t *testing.T) {
 
 		linter := lint.NewLinter(lintConfig, log.NewTestLogger())
 		imgStore := local.NewImageStore(dir, false, false,
-			log.NewTestLogger(), monitoring.NewMetricsServer(false, log.NewTestLogger()), linter, nil, nil, nil)
+			log.NewTestLogger(), monitoring.NewNopMetricServer(), linter, nil, nil, nil)
 
 		pass, err := linter.CheckMandatoryAnnotations("zot-test", digest, imgStore)
 		So(err, ShouldNotBeNil)
@@ -642,7 +642,7 @@ func TestVerifyMandatoryAnnotationsFunction(t *testing.T) {
 		enable := true
 
 		lintConfig := &extconf.LintConfig{
-			BaseConfig:           extconf.BaseConfig{Enable: &enable},
+			Enable:               &enable,
 			MandatoryAnnotations: []string{"annotation1", "annotation2", "annotation3"},
 		}
 
@@ -695,7 +695,7 @@ func TestVerifyMandatoryAnnotationsFunction(t *testing.T) {
 
 		linter := lint.NewLinter(lintConfig, log.NewTestLogger())
 		imgStore := local.NewImageStore(dir, false, false,
-			log.NewTestLogger(), monitoring.NewMetricsServer(false, log.NewTestLogger()), linter, nil, nil, nil)
+			log.NewTestLogger(), monitoring.NewNopMetricServer(), linter, nil, nil, nil)
 
 		pass, err := linter.CheckMandatoryAnnotations("zot-test", digest, imgStore)
 		So(err, ShouldBeNil)
@@ -706,7 +706,7 @@ func TestVerifyMandatoryAnnotationsFunction(t *testing.T) {
 		enable := true
 
 		lintConfig := &extconf.LintConfig{
-			BaseConfig:           extconf.BaseConfig{Enable: &enable},
+			Enable:               &enable,
 			MandatoryAnnotations: []string{"annotation1", "annotation2", "annotation3"},
 		}
 
@@ -758,7 +758,7 @@ func TestVerifyMandatoryAnnotationsFunction(t *testing.T) {
 
 		linter := lint.NewLinter(lintConfig, log.NewTestLogger())
 		imgStore := local.NewImageStore(dir, false, false,
-			log.NewTestLogger(), monitoring.NewMetricsServer(false, log.NewTestLogger()), linter, nil, nil, nil)
+			log.NewTestLogger(), monitoring.NewNopMetricServer(), linter, nil, nil, nil)
 
 		err = os.Chmod(path.Join(dir, "zot-test", "blobs"), 0o000)
 		if err != nil {
@@ -779,7 +779,7 @@ func TestVerifyMandatoryAnnotationsFunction(t *testing.T) {
 		enable := true
 
 		lintConfig := &extconf.LintConfig{
-			BaseConfig:           extconf.BaseConfig{Enable: &enable},
+			Enable:               &enable,
 			MandatoryAnnotations: []string{"annotation1", "annotation2", "annotation3"},
 		}
 
@@ -856,7 +856,7 @@ func TestVerifyMandatoryAnnotationsFunction(t *testing.T) {
 
 		linter := lint.NewLinter(lintConfig, log.NewTestLogger())
 		imgStore := local.NewImageStore(dir, false, false,
-			log.NewTestLogger(), monitoring.NewMetricsServer(false, log.NewTestLogger()), linter, nil, nil, nil)
+			log.NewTestLogger(), monitoring.NewNopMetricServer(), linter, nil, nil, nil)
 
 		err = os.Chmod(path.Join(dir, "zot-test", "blobs", "sha256", manifest.Config.Digest.Encoded()), 0o000)
 		if err != nil {

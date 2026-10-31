@@ -3,12 +3,14 @@ package config_test
 import (
 	"errors"
 	"testing"
+	"time"
 
 	. "github.com/smartystreets/goconvey/convey"
 
 	"zotregistry.dev/zot/v2/pkg/extensions/config"
 	"zotregistry.dev/zot/v2/pkg/extensions/config/events"
 	"zotregistry.dev/zot/v2/pkg/extensions/config/sync"
+	syncConstants "zotregistry.dev/zot/v2/pkg/extensions/sync/constants"
 )
 
 var (
@@ -22,9 +24,7 @@ var (
 func buildSearchConfig(enabled bool) *config.ExtensionConfig {
 	ext := &config.ExtensionConfig{}
 	ext.Search = &config.SearchConfig{
-		BaseConfig: config.BaseConfig{
-			Enable: &enabled,
-		},
+		Enable: &enabled,
 	}
 
 	return ext
@@ -33,9 +33,7 @@ func buildSearchConfig(enabled bool) *config.ExtensionConfig {
 func buildSearchConfigWithCVE(enabled bool) *config.ExtensionConfig {
 	ext := &config.ExtensionConfig{}
 	ext.Search = &config.SearchConfig{
-		BaseConfig: config.BaseConfig{
-			Enable: &enabled,
-		},
+		Enable: &enabled,
 		CVE: &config.CVEConfig{
 			Trivy: &config.TrivyConfig{},
 		},
@@ -70,9 +68,7 @@ func buildSyncConfig(enabled bool) *config.ExtensionConfig {
 func buildScrubConfig(enabled bool) *config.ExtensionConfig {
 	ext := &config.ExtensionConfig{}
 	ext.Scrub = &config.ScrubConfig{
-		BaseConfig: config.BaseConfig{
-			Enable: &enabled,
-		},
+		Enable: &enabled,
 	}
 
 	return ext
@@ -81,9 +77,7 @@ func buildScrubConfig(enabled bool) *config.ExtensionConfig {
 func buildMetricsConfig(enabled bool) *config.ExtensionConfig {
 	ext := &config.ExtensionConfig{}
 	ext.Metrics = &config.MetricsConfig{
-		BaseConfig: config.BaseConfig{
-			Enable: &enabled,
-		},
+		Enable: &enabled,
 		Prometheus: &config.PrometheusConfig{
 			Path: "/metrics",
 		},
@@ -95,9 +89,7 @@ func buildMetricsConfig(enabled bool) *config.ExtensionConfig {
 func buildTrustConfig(enabled bool) *config.ExtensionConfig {
 	ext := &config.ExtensionConfig{}
 	ext.Trust = &config.ImageTrustConfig{
-		BaseConfig: config.BaseConfig{
-			Enable: &enabled,
-		},
+		Enable: &enabled,
 	}
 
 	return ext
@@ -106,9 +98,7 @@ func buildTrustConfig(enabled bool) *config.ExtensionConfig {
 func buildUIConfig(enabled bool) *config.ExtensionConfig {
 	ext := &config.ExtensionConfig{}
 	ext.UI = &config.UIConfig{
-		BaseConfig: config.BaseConfig{
-			Enable: &enabled,
-		},
+		Enable: &enabled,
 	}
 
 	return ext
@@ -117,14 +107,10 @@ func buildUIConfig(enabled bool) *config.ExtensionConfig {
 func buildSearchAndUIConfig(enabled bool) *config.ExtensionConfig {
 	ext := &config.ExtensionConfig{}
 	ext.Search = &config.SearchConfig{
-		BaseConfig: config.BaseConfig{
-			Enable: &enabled,
-		},
+		Enable: &enabled,
 	}
 	ext.UI = &config.UIConfig{
-		BaseConfig: config.BaseConfig{
-			Enable: &enabled,
-		},
+		Enable: &enabled,
 	}
 
 	return ext
@@ -133,9 +119,7 @@ func buildSearchAndUIConfig(enabled bool) *config.ExtensionConfig {
 func buildTrustConfigWithCosign(enabled bool) *config.ExtensionConfig {
 	ext := &config.ExtensionConfig{}
 	ext.Trust = &config.ImageTrustConfig{
-		BaseConfig: config.BaseConfig{
-			Enable: &enabled,
-		},
+		Enable: &enabled,
 		Cosign: true,
 	}
 
@@ -145,9 +129,7 @@ func buildTrustConfigWithCosign(enabled bool) *config.ExtensionConfig {
 func buildTrustConfigWithNotation(enabled bool) *config.ExtensionConfig {
 	ext := &config.ExtensionConfig{}
 	ext.Trust = &config.ImageTrustConfig{
-		BaseConfig: config.BaseConfig{
-			Enable: &enabled,
-		},
+		Enable:   &enabled,
 		Notation: true,
 	}
 
@@ -392,26 +374,18 @@ func TestExtensionConfig(t *testing.T) {
 		uiEnabled := true
 		searchConfig := &config.ExtensionConfig{}
 		searchConfig.Search = &config.SearchConfig{
-			BaseConfig: config.BaseConfig{
-				Enable: &searchEnabled,
-			},
+			Enable: &searchEnabled,
 		}
 		uiConfig := &config.ExtensionConfig{}
 		uiConfig.UI = &config.UIConfig{
-			BaseConfig: config.BaseConfig{
-				Enable: &uiEnabled,
-			},
+			Enable: &uiEnabled,
 		}
 		searchAndUIConfig := &config.ExtensionConfig{}
 		searchAndUIConfig.Search = &config.SearchConfig{
-			BaseConfig: config.BaseConfig{
-				Enable: &searchEnabled,
-			},
+			Enable: &searchEnabled,
 		}
 		searchAndUIConfig.UI = &config.UIConfig{
-			BaseConfig: config.BaseConfig{
-				Enable: &uiEnabled,
-			},
+			Enable: &uiEnabled,
 		}
 
 		testConcurrentAccessWithConfig(
@@ -438,14 +412,10 @@ func TestExtensionConfig(t *testing.T) {
 			uiEnabled := true
 			extensionConfig := &config.ExtensionConfig{}
 			extensionConfig.Search = &config.SearchConfig{
-				BaseConfig: config.BaseConfig{
-					Enable: &searchEnabled,
-				},
+				Enable: &searchEnabled,
 			}
 			extensionConfig.UI = &config.UIConfig{
-				BaseConfig: config.BaseConfig{
-					Enable: &uiEnabled,
-				},
+				Enable: &uiEnabled,
 			}
 
 			// Test mixed concurrent access to verify thread-safety across all methods
@@ -553,6 +523,35 @@ func TestExtensionConfig(t *testing.T) {
 		Convey("Test GetSyncConfig()", func() {
 			testGetterWithNilConfig((*config.ExtensionConfig).GetSyncConfig, nil)
 			testGetterWithValidConfig("Sync", (*config.ExtensionConfig).GetSyncConfig, buildSyncConfig)
+		})
+
+		Convey("Test SyncStagingDownloadDir()", func() {
+			testGetterWithNilConfig((*config.ExtensionConfig).SyncStagingDownloadDir, "")
+			testGetterWithNilSubConfig("Sync", (*config.ExtensionConfig).SyncStagingDownloadDir, "")
+
+			Convey("Test with sync downloadDir configured", func() {
+				enabled := true
+				extensionConfig := buildSyncConfig(enabled)
+				extensionConfig.Sync.DownloadDir = "/tmp/sync-staging"
+
+				So(extensionConfig.SyncStagingDownloadDir(), ShouldEqual, "/tmp/sync-staging")
+			})
+		})
+
+		Convey("Test LargestSyncTimeout()", func() {
+			testGetterWithNilConfig((*config.ExtensionConfig).LargestSyncTimeout, syncConstants.DefaultSyncTimeout)
+			testGetterWithNilSubConfig("Sync", (*config.ExtensionConfig).LargestSyncTimeout, syncConstants.DefaultSyncTimeout)
+
+			Convey("returns largest configured registry timeout", func() {
+				enabled := true
+				extensionConfig := buildSyncConfig(enabled)
+				extensionConfig.Sync.Registries = []sync.RegistryConfig{
+					{SyncTimeout: 2 * time.Hour},
+					{SyncTimeout: 5 * time.Hour},
+				}
+
+				So(extensionConfig.LargestSyncTimeout(), ShouldEqual, 5*time.Hour)
+			})
 		})
 
 		Convey("Test GetMetricsPrometheusConfig()", func() {

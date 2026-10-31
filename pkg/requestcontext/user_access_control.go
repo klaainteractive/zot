@@ -32,7 +32,21 @@ type UserAccessControl struct {
 	claims           map[string]any
 	methodActions    []string
 	behaviourActions []string
+	// permissionEvaluator performs repo-level authz when glob patterns alone are
+	// insufficient (config-based authz with CEL). Nil → CanOnResource falls back to Can().
+	permissionEvaluator PermissionEvaluator
+	// adminPolicyEvaluator checks accessControl.adminPolicy (membership and CEL conditions) for
+	// this request. Set by config authz; nil means no admin-policy decision was made.
+	adminPolicyEvaluator AdminPolicyEvaluator
 }
+
+// PermissionEvaluator performs per-resource authorization when concrete repository
+// and reference are known (e.g. config authz with CEL conditions).
+type PermissionEvaluator func(action, repository, reference string) bool
+
+// AdminPolicyEvaluator reports whether the request satisfies accessControl.adminPolicy, including
+// its conditions. When a condition denies, the second return value is that condition's Message.
+type AdminPolicyEvaluator func() (bool, string)
 
 type UserAuthzInfo struct {
 	// {action: {repo: bool}}
@@ -129,6 +143,23 @@ func (uac *UserAccessControl) IsAdmin() bool {
 	return uac.authzInfo.isAdmin
 }
 
+// IsAdminByPolicy reports whether this request satisfies accessControl.adminPolicy: the user matched
+// its users/groups and every adminPolicy condition holds for the request. Unlike IsAdmin, a missing
+// authz decision (no accessControl configured, so BaseAuthzHandler never ran) is not treated as admin.
+// Use it to gate admin-only routes. When a condition denies, the second return value is its Message.
+func (uac *UserAccessControl) IsAdminByPolicy() (bool, string) {
+	if uac.authzInfo == nil || !uac.authzInfo.isAdmin || uac.adminPolicyEvaluator == nil {
+		return false, ""
+	}
+
+	return uac.adminPolicyEvaluator()
+}
+
+// SetAdminPolicyEvaluator attaches the request-scoped adminPolicy check used by IsAdminByPolicy.
+func (uac *UserAccessControl) SetAdminPolicyEvaluator(fn AdminPolicyEvaluator) {
+	uac.adminPolicyEvaluator = fn
+}
+
 func (uac *UserAccessControl) SetIsAdmin(isAdmin bool) {
 	if uac.authzInfo == nil {
 		uac.authzInfo = &UserAuthzInfo{}
@@ -189,6 +220,23 @@ func (uac *UserAccessControl) Can(action, repository string) bool {
 	return uac.matchesRepo(uac.authzInfo.globPatterns[action], repository)
 }
 
+// SetPermissionEvaluator attaches request-scoped policy evaluation for config-based
+// authz. Traditional bearer auth leaves this nil and relies on glob patterns only.
+func (uac *UserAccessControl) SetPermissionEvaluator(fn PermissionEvaluator) {
+	uac.permissionEvaluator = fn
+}
+
+// CanOnResource reports whether the caller may perform action on repository/reference.
+// When a permission evaluator is set (config authz), it takes precedence over glob
+// patterns so CEL conditions are evaluated against the concrete resource.
+func (uac *UserAccessControl) CanOnResource(action, repository, reference string) bool {
+	if uac.permissionEvaluator != nil {
+		return uac.permissionEvaluator(action, repository, reference)
+	}
+
+	return uac.Can(action, repository)
+}
+
 func (uac *UserAccessControl) isBehaviourAction(action string) bool {
 	return slices.Contains(uac.behaviourActions, action)
 }
@@ -202,6 +250,22 @@ func (uac *UserAccessControl) areGlobPatternsSet() bool {
 	notSet := uac.authzInfo == nil || uac.authzInfo.globPatterns == nil
 
 	return !notSet
+}
+
+// HasScopedPermissions reports whether explicit repository permissions were
+// populated (config-based authz or bearer token access claims).
+func (uac *UserAccessControl) HasScopedPermissions() bool {
+	if !uac.areGlobPatternsSet() {
+		return false
+	}
+
+	for _, patterns := range uac.authzInfo.globPatterns {
+		if len(patterns) > 0 {
+			return true
+		}
+	}
+
+	return false
 }
 
 // matchesRepo returns whether repository matches the provided action's glob patterns

@@ -2,14 +2,18 @@ package common_test
 
 import (
 	"errors"
+	"math"
 	"testing"
 	"time"
 
+	dockerList "github.com/distribution/distribution/v3/manifest/manifestlist"
+	docker "github.com/distribution/distribution/v3/manifest/schema2"
 	godigest "github.com/opencontainers/go-digest"
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
 	. "github.com/smartystreets/goconvey/convey"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	zerr "zotregistry.dev/zot/v2/errors"
 	"zotregistry.dev/zot/v2/pkg/meta/common"
 	proto_go "zotregistry.dev/zot/v2/pkg/meta/proto/gen"
 	mTypes "zotregistry.dev/zot/v2/pkg/meta/types"
@@ -612,5 +616,225 @@ func TestUtils(t *testing.T) {
 			So(resultBlobs.Blobs[configDigest.String()], ShouldNotBeNil)
 			So(resultBlobs.Blobs[layerDigest.String()], ShouldNotBeNil)
 		})
+
+		Convey("should handle Docker schema2 ImageManifest media type", func() {
+			repoMeta := &proto_go.RepoMeta{
+				Name: "test-repo",
+				Tags: map[string]*proto_go.TagDescriptor{},
+			}
+
+			repoBlobs := &proto_go.RepoBlobs{
+				Blobs: map[string]*proto_go.BlobInfo{},
+			}
+
+			testDigest := godigest.FromString("sha256:dockertestdigest")
+			configDigest := godigest.FromString("sha256:dockerconfigdigest")
+			layerDigest := godigest.FromString("sha256:dockerlayerdigest")
+
+			imageMeta := mTypes.ImageMeta{
+				MediaType: docker.MediaTypeManifest,
+				Digest:    testDigest,
+				Size:      1000,
+				Manifests: []mTypes.ManifestMeta{
+					{
+						Digest: testDigest,
+						Size:   1000,
+						Manifest: ispec.Manifest{
+							Config: ispec.Descriptor{
+								Digest: configDigest,
+								Size:   500,
+							},
+							Layers: []ispec.Descriptor{
+								{
+									Digest: layerDigest,
+									Size:   300,
+								},
+							},
+						},
+						Config: ispec.Image{},
+					},
+				},
+			}
+
+			resultMeta, resultBlobs := common.AddImageMetaToRepoMeta(repoMeta, repoBlobs, "tag1", imageMeta)
+			So(resultMeta, ShouldNotBeNil)
+			So(resultBlobs, ShouldNotBeNil)
+
+			digestStr := testDigest.String()
+			So(resultBlobs.Blobs[digestStr], ShouldNotBeNil)
+			So(resultBlobs.Blobs[digestStr].Size, ShouldEqual, 1000)
+			So(len(resultBlobs.Blobs[digestStr].SubBlobs), ShouldEqual, 2)
+			So(resultBlobs.Blobs[configDigest.String()], ShouldNotBeNil)
+			So(resultBlobs.Blobs[layerDigest.String()], ShouldNotBeNil)
+		})
+
+		Convey("should handle Docker schema2 manifest list media type", func() {
+			repoMeta := &proto_go.RepoMeta{
+				Name: "test-repo",
+				Tags: map[string]*proto_go.TagDescriptor{},
+			}
+
+			repoBlobs := &proto_go.RepoBlobs{
+				Blobs: map[string]*proto_go.BlobInfo{},
+			}
+
+			indexDigest := godigest.FromString("sha256:dockerindexdigest")
+			childDigest := godigest.FromString("sha256:dockerchilddigest")
+
+			imageMeta := mTypes.ImageMeta{
+				MediaType: dockerList.MediaTypeManifestList,
+				Digest:    indexDigest,
+				Size:      2000,
+				Index: &ispec.Index{
+					MediaType: dockerList.MediaTypeManifestList,
+					Manifests: []ispec.Descriptor{
+						{
+							MediaType: docker.MediaTypeManifest,
+							Digest:    childDigest,
+							Size:      1000,
+						},
+					},
+				},
+			}
+
+			resultMeta, resultBlobs := common.AddImageMetaToRepoMeta(repoMeta, repoBlobs, "tag1", imageMeta)
+			So(resultMeta, ShouldNotBeNil)
+			So(resultBlobs, ShouldNotBeNil)
+
+			digestStr := indexDigest.String()
+			So(resultBlobs.Blobs[digestStr], ShouldNotBeNil)
+			So(resultBlobs.Blobs[digestStr].Size, ShouldEqual, 2000)
+			So(resultBlobs.Blobs[digestStr].SubBlobs, ShouldContain, childDigest.String())
+		})
+	})
+}
+
+func TestProjectRepoSize(t *testing.T) {
+	Convey("ProjectRepoSize", t, func() {
+		oldDigest := godigest.FromString("old-manifest")
+		configDigest := godigest.FromString("shared-config")
+		layerDigest := godigest.FromString("shared-layer")
+		newDigest := godigest.FromString("new-manifest")
+		newLayerDigest := godigest.FromString("new-layer")
+
+		repoMeta := &proto_go.RepoMeta{
+			Name: "repo",
+			Tags: map[string]*proto_go.TagDescriptor{
+				"latest": {Digest: oldDigest.String(), MediaType: ispec.MediaTypeImageManifest},
+			},
+			Size: 60,
+		}
+		repoBlobs := &proto_go.RepoBlobs{
+			Name: "repo",
+			Blobs: map[string]*proto_go.BlobInfo{
+				oldDigest.String():    {Size: 10, SubBlobs: []string{configDigest.String(), layerDigest.String()}},
+				configDigest.String(): {Size: 20},
+				layerDigest.String():  {Size: 30},
+			},
+		}
+		candidate := mTypes.ImageMeta{
+			MediaType: ispec.MediaTypeImageManifest,
+			Digest:    newDigest,
+			Size:      15,
+			Manifests: []mTypes.ManifestMeta{{
+				Digest: newDigest,
+				Size:   15,
+				Manifest: ispec.Manifest{
+					Config: ispec.Descriptor{Digest: configDigest, Size: 20},
+					Layers: []ispec.Descriptor{
+						{Digest: layerDigest, Size: 30},
+						{Digest: newLayerDigest, Size: 40},
+					},
+				},
+			}},
+		}
+
+		current, projected, err := common.ProjectRepoSize(repoMeta, repoBlobs, []string{"latest"}, candidate)
+		So(err, ShouldBeNil)
+		So(current, ShouldEqual, 60)
+		So(projected, ShouldEqual, 105)
+		So(repoMeta.Tags["latest"].Digest, ShouldEqual, newDigest.String())
+
+		Convey("rejects negative and changed blob sizes", func() {
+			invalid := candidate
+			invalid.Size = -1
+
+			_, _, err := common.ProjectRepoSize(repoMeta, repoBlobs, []string{"latest"}, invalid)
+			So(errors.Is(err, zerr.ErrInvalidRepoSizeCandidate), ShouldBeTrue)
+		})
+
+		Convey("rejects conflicting sizes for a digest within a candidate", func() {
+			invalid := candidate
+			invalid.Manifests[0].Manifest.Layers = []ispec.Descriptor{
+				{Digest: newLayerDigest, Size: 40},
+				{Digest: newLayerDigest, Size: 1},
+			}
+
+			_, _, err := common.ProjectRepoSize(repoMeta, repoBlobs, []string{"latest"}, invalid)
+			So(errors.Is(err, zerr.ErrInvalidRepoSizeCandidate), ShouldBeTrue)
+		})
+
+		Convey("rejects aggregate size overflow", func() {
+			overflowRepoMeta := &proto_go.RepoMeta{
+				Tags: map[string]*proto_go.TagDescriptor{
+					"old": {Digest: oldDigest.String()},
+				},
+				Size: math.MaxInt64,
+			}
+			overflowRepoBlobs := &proto_go.RepoBlobs{
+				Blobs: map[string]*proto_go.BlobInfo{
+					oldDigest.String(): {Size: math.MaxInt64},
+				},
+			}
+
+			_, _, err := common.ProjectRepoSize(overflowRepoMeta, overflowRepoBlobs,
+				[]string{"new"}, candidate)
+			So(errors.Is(err, zerr.ErrInvalidRepoSize), ShouldBeTrue)
+		})
+	})
+}
+
+func TestProjectRepoSizeReconcilesExistingBlobSizes(t *testing.T) {
+	Convey("ProjectRepoSize uses trusted candidate sizes for existing image blobs", t, func() {
+		oldDigest := godigest.FromString("old-manifest")
+		configDigest := godigest.FromString("shared-config")
+		layerDigest := godigest.FromString("shared-layer")
+		newDigest := godigest.FromString("new-manifest")
+
+		repoMeta := &proto_go.RepoMeta{
+			Name: "repo",
+			Tags: map[string]*proto_go.TagDescriptor{
+				"latest": {Digest: oldDigest.String(), MediaType: ispec.MediaTypeImageManifest},
+			},
+			Size: 12,
+		}
+		repoBlobs := &proto_go.RepoBlobs{
+			Name: "repo",
+			Blobs: map[string]*proto_go.BlobInfo{
+				oldDigest.String():    {Size: 10, SubBlobs: []string{configDigest.String(), layerDigest.String()}},
+				configDigest.String(): {Size: 1},
+				layerDigest.String():  {Size: 1},
+			},
+		}
+		candidate := mTypes.ImageMeta{
+			MediaType: ispec.MediaTypeImageManifest,
+			Digest:    newDigest,
+			Size:      15,
+			Manifests: []mTypes.ManifestMeta{{
+				Digest: newDigest,
+				Size:   15,
+				Manifest: ispec.Manifest{
+					Config: ispec.Descriptor{Digest: configDigest, Size: 20},
+					Layers: []ispec.Descriptor{{Digest: layerDigest, Size: 30}},
+				},
+			}},
+		}
+
+		current, projected, err := common.ProjectRepoSize(repoMeta, repoBlobs, []string{"next"}, candidate)
+		So(err, ShouldBeNil)
+		So(current, ShouldEqual, 60)
+		So(projected, ShouldEqual, 75)
+		So(repoBlobs.Blobs[configDigest.String()].Size, ShouldEqual, 20)
+		So(repoBlobs.Blobs[layerDigest.String()].Size, ShouldEqual, 30)
 	})
 }

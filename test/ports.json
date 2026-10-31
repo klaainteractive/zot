@@ -239,6 +239,28 @@
     "zot3": {
       "begin": 3060,
       "end": 3069
+    },
+    "zot4": {
+      "begin": 3080,
+      "end": 3089
+    },
+    "zot5": {
+      "begin": 3100,
+      "end": 3109
+    },
+    "zot6": {
+      "begin": 3160,
+      "end": 3169
+    }
+  },
+  "blackbox/sync_ondemand_seed.bats": {
+    "upstream": {
+      "begin": 3120,
+      "end": 3129
+    },
+    "downstream": {
+      "begin": 3140,
+      "end": 3149
     }
   },
   "scale-out/cloud_scale_out_basic_auth_tls_scale.bats": {
@@ -475,6 +497,60 @@
     "zot": {
       "begin": 11550,
       "end": 11559
+    }
+  },
+  "blackbox/systemd.bats": {
+    "systemd": {
+      "begin": 11560,
+      "end": 11569
+    }
+  },
+  "blackbox/pushpull_mount.bats": {
+    "zot": {
+      "begin": 11570,
+      "end": 11579
+    }
+  },
+  "blackbox/pushpull_mount_hydrate.bats": {
+    "zot": {
+      "begin": 11580,
+      "end": 11589
+    }
+  },
+  "blackbox/sync_streaming.bats": {
+    "zot_min": {
+      "begin": 11590,
+      "end": 11599
+    },
+    "zot_stream": {
+      "begin": 11600,
+      "end": 11609
+    },
+    "zot_stream_capped": {
+      "begin": 11610,
+      "end": 11619
+    }
+  },
+  "blackbox/sync_streaming_stress.bats": {
+    "zot_min": {
+      "begin": 11640,
+      "end": 11649
+    },
+    "zot_stream": {
+      "begin": 11650,
+      "end": 11659
+    }
+  },
+  "blackbox/healthcheck.bats": {
+    "zot": {
+      "begin": 11620,
+      "end": 11629
+    }
+  },
+  "blackbox/modelpack.bats": {
+    "zot": {
+      "begin": 11660,
+      "end": 11669
     }
   }
 }

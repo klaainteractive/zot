@@ -39,12 +39,14 @@ type MockedImageStore struct {
 	FinishBlobUploadFn func(repo string, uuid string, body io.Reader, digest godigest.Digest) error
 	FullBlobUploadFn   func(ctx context.Context, repo string, body io.Reader,
 		digest godigest.Digest) (string, int64, error)
-	DedupeBlobFn       func(src string, dstDigest godigest.Digest, dstRepo, dst string) error
-	DeleteBlobUploadFn func(repo string, uuid string) error
-	BlobPathFn         func(repo string, digest godigest.Digest) string
-	CheckBlobFn        func(ctx context.Context, repo string, digest godigest.Digest) (bool, int64, error)
-	StatBlobFn         func(repo string, digest godigest.Digest) (bool, int64, time.Time, error)
-	GetBlobPartialFn   func(repo string, digest godigest.Digest, mediaType string, from, to int64,
+	DedupeBlobFn             func(src string, dstDigest godigest.Digest, dstRepo, dst string) error
+	DeleteBlobUploadFn       func(repo string, uuid string) error
+	DeleteBlobUploadIfIdleFn func(repo string, uuid string) (bool, error)
+	BlobPathFn               func(repo string, digest godigest.Digest) string
+	CheckBlobFn              func(ctx context.Context, repo string, digest godigest.Digest) (bool, int64, error)
+	StatBlobFn               func(repo string, digest godigest.Digest) (bool, int64, time.Time, error)
+	StatBlobEntryFn          func(repo string, digest godigest.Digest) (bool, int64, time.Time, error)
+	GetBlobPartialFn         func(repo string, digest godigest.Digest, mediaType string, from, to int64,
 	) (io.ReadCloser, int64, int64, error)
 	GetBlobFn            func(repo string, digest godigest.Digest, mediaType string) (io.ReadCloser, int64, error)
 	DeleteBlobFn         func(repo string, digest godigest.Digest) error
@@ -59,7 +61,8 @@ type MockedImageStore struct {
 		duplicateBlobs []string) error
 	GetNextDigestWithBlobPathsFn  func(repos []string, lastDigests []godigest.Digest) (godigest.Digest, []string, error)
 	GetAllBlobsFn                 func(repo string) ([]godigest.Digest, error)
-	CleanupRepoFn                 func(repo string, blobs []godigest.Digest, removeRepo bool) (int, error)
+	CleanupRepoFn                 func(repo string, blobs []godigest.Digest) (int, error)
+	RemoveIdleRepositoryFn        func(repo string, maxBlobAge time.Duration) (bool, error)
 	PutIndexContentFn             func(repo string, index ispec.Index) error
 	PopulateStorageMetricsFn      func(interval time.Duration, sch *scheduler.Scheduler)
 	StatIndexFn                   func(repo string) (bool, int64, time.Time, error)
@@ -76,16 +79,32 @@ func (is MockedImageStore) StatIndex(repo string) (bool, int64, time.Time, error
 	return true, 0, time.Time{}, nil
 }
 
-func (is MockedImageStore) Lock(t *time.Time) {
+func (is MockedImageStore) WithRepoLock(repo string, wrappedFunc func() error) error {
+	return wrappedFunc()
 }
 
-func (is MockedImageStore) Unlock(t *time.Time) {
+func (is MockedImageStore) WithRepoReadLock(repo string, wrappedFunc func() error) error {
+	return wrappedFunc()
 }
 
-func (is MockedImageStore) RUnlock(t *time.Time) {
+func (is MockedImageStore) WithBlobstoreLock(wrappedFunc func() error) error {
+	return wrappedFunc()
 }
 
-func (is MockedImageStore) RLock(t *time.Time) {
+func (is MockedImageStore) WithBlobstoreReadLock(wrappedFunc func() error) error {
+	return wrappedFunc()
+}
+
+func (is MockedImageStore) WithBlobstoreAndRepoLock(repo string, wrappedFunc func() error) error {
+	return wrappedFunc()
+}
+
+func (is MockedImageStore) WithBlobstoreReadAndRepoLock(repo string, wrappedFunc func() error) error {
+	return wrappedFunc()
+}
+
+func (is MockedImageStore) WithRepoCleanupLock(repo string, wrappedFunc func() error) error {
+	return wrappedFunc()
 }
 
 func (is MockedImageStore) Name() string {
@@ -334,6 +353,20 @@ func (is MockedImageStore) StatBlob(repo string, digest godigest.Digest) (bool, 
 	return true, 0, time.Time{}, nil
 }
 
+func (is MockedImageStore) StatBlobEntry(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+	if is.StatBlobEntryFn != nil {
+		return is.StatBlobEntryFn(repo, digest)
+	}
+
+	// Age-check tests historically mocked StatBlob; fall back so they keep working
+	// until callers assert entry-local timing separately.
+	if is.StatBlobFn != nil {
+		return is.StatBlobFn(repo, digest)
+	}
+
+	return true, 0, time.Time{}, nil
+}
+
 func (is MockedImageStore) GetBlobPartial(repo string, digest godigest.Digest, mediaType string, from, to int64,
 ) (io.ReadCloser, int64, int64, error) {
 	if is.GetBlobPartialFn != nil {
@@ -368,6 +401,14 @@ func (is MockedImageStore) DeleteBlobUpload(repo string, uuid string) error {
 	}
 
 	return nil
+}
+
+func (is MockedImageStore) DeleteBlobUploadIfIdle(repo string, uuid string) (bool, error) {
+	if is.DeleteBlobUploadIfIdleFn != nil {
+		return is.DeleteBlobUploadIfIdleFn(repo, uuid)
+	}
+
+	return true, nil
 }
 
 func (is MockedImageStore) GetIndexContent(repo string) ([]byte, error) {
@@ -444,12 +485,20 @@ func (is MockedImageStore) GetNextDigestWithBlobPaths(repos []string, lastDigest
 	return "", []string{}, nil
 }
 
-func (is MockedImageStore) CleanupRepo(repo string, blobs []godigest.Digest, removeRepo bool) (int, error) {
+func (is MockedImageStore) CleanupRepo(repo string, blobs []godigest.Digest) (int, error) {
 	if is.CleanupRepoFn != nil {
-		return is.CleanupRepoFn(repo, blobs, removeRepo)
+		return is.CleanupRepoFn(repo, blobs)
 	}
 
 	return 0, nil
+}
+
+func (is MockedImageStore) RemoveIdleRepository(repo string, maxBlobAge time.Duration) (bool, error) {
+	if is.RemoveIdleRepositoryFn != nil {
+		return is.RemoveIdleRepositoryFn(repo, maxBlobAge)
+	}
+
+	return false, nil
 }
 
 func (is MockedImageStore) PutIndexContent(repo string, index ispec.Index) error {
@@ -475,7 +524,7 @@ func (is MockedImageStore) VerifyBlobDigestValue(repo string, digest godigest.Di
 }
 
 func (is MockedImageStore) GetAllDedupeReposCandidates(digest godigest.Digest) ([]string, error) {
-	if is.GetAllBlobsFn != nil {
+	if is.GetAllDedupeReposCandidatesFn != nil {
 		return is.GetAllDedupeReposCandidatesFn(digest)
 	}
 

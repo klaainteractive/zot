@@ -21,7 +21,6 @@ import (
 
 	storagedriver "github.com/distribution/distribution/v3/registry/storage/driver"
 	godigest "github.com/opencontainers/go-digest"
-	imeta "github.com/opencontainers/image-spec/specs-go"
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
 	. "github.com/smartystreets/goconvey/convey"
 
@@ -33,6 +32,7 @@ import (
 	"zotregistry.dev/zot/v2/pkg/scheduler"
 	"zotregistry.dev/zot/v2/pkg/storage"
 	"zotregistry.dev/zot/v2/pkg/storage/cache"
+	storageCommon "zotregistry.dev/zot/v2/pkg/storage/common"
 	storageConstants "zotregistry.dev/zot/v2/pkg/storage/constants"
 	"zotregistry.dev/zot/v2/pkg/storage/gc"
 	"zotregistry.dev/zot/v2/pkg/storage/imagestore"
@@ -71,7 +71,7 @@ var (
 
 func runAndGetScheduler() *scheduler.Scheduler {
 	log := zlog.NewTestLogger()
-	metrics := monitoring.NewMetricsServer(true, log)
+	metrics := monitoring.NewNopMetricServer()
 	taskScheduler := scheduler.NewScheduler(config.New(), metrics, log)
 	taskScheduler.RateLimit = 50 * time.Millisecond
 
@@ -84,7 +84,7 @@ func TestStorageFSAPIs(t *testing.T) {
 	dir := t.TempDir()
 
 	log := zlog.NewTestLogger()
-	metrics := monitoring.NewMetricsServer(false, log)
+	metrics := monitoring.NewNopMetricServer()
 	cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
 		RootDir:     dir,
 		Name:        "cache",
@@ -137,9 +137,9 @@ func TestStorageFSAPIs(t *testing.T) {
 					},
 				},
 				Annotations: annotationsMap,
-			}
 
-			manifest.SchemaVersion = 2
+				SchemaVersion: 2,
+			}
 			manifestBuf, err := json.Marshal(manifest)
 			So(err, ShouldBeNil)
 
@@ -221,7 +221,7 @@ func FuzzNewBlobUpload(f *testing.F) {
 		t.Logf("Input argument is %s", data)
 
 		log := zlog.NewTestLogger()
-		metrics := monitoring.NewMetricsServer(false, log)
+		metrics := monitoring.NewNopMetricServer()
 		cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
 			RootDir:     dir,
 			Name:        "cache",
@@ -249,7 +249,7 @@ func FuzzPutBlobChunk(f *testing.F) {
 
 		log := zlog.NewTestLogger()
 
-		metrics := monitoring.NewMetricsServer(false, log)
+		metrics := monitoring.NewNopMetricServer()
 		cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
 			RootDir:     dir,
 			Name:        "cache",
@@ -285,7 +285,7 @@ func FuzzPutBlobChunkStreamed(f *testing.F) {
 		t.Logf("Input argument is %s", data)
 
 		log := zlog.NewTestLogger()
-		metrics := monitoring.NewMetricsServer(false, log)
+		metrics := monitoring.NewNopMetricServer()
 		cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
 			RootDir:     dir,
 			Name:        "cache",
@@ -318,7 +318,7 @@ func FuzzGetBlobUpload(f *testing.F) {
 		dir := t.TempDir()
 		defer os.RemoveAll(dir)
 		log := zlog.NewTestLogger()
-		metrics := monitoring.NewMetricsServer(false, log)
+		metrics := monitoring.NewNopMetricServer()
 		cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
 			RootDir:     dir,
 			Name:        "cache",
@@ -341,7 +341,7 @@ func FuzzGetBlobUpload(f *testing.F) {
 func FuzzTestPutGetImageManifest(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
 		log := zlog.NewTestLoggerPtr()
-		metrics := monitoring.NewMetricsServer(false, *log)
+		metrics := monitoring.NewNopMetricServer()
 
 		dir := t.TempDir()
 		defer os.RemoveAll(dir)
@@ -398,7 +398,7 @@ func FuzzTestPutGetImageManifest(f *testing.F) {
 func FuzzTestPutDeleteImageManifest(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
 		log := zlog.NewTestLoggerPtr()
-		metrics := monitoring.NewMetricsServer(false, *log)
+		metrics := monitoring.NewNopMetricServer()
 
 		dir := t.TempDir()
 		defer os.RemoveAll(dir)
@@ -460,7 +460,7 @@ func FuzzTestPutDeleteImageManifest(f *testing.F) {
 func FuzzTestDeleteImageManifest(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
 		log := zlog.NewTestLoggerPtr()
-		metrics := monitoring.NewMetricsServer(false, *log)
+		metrics := monitoring.NewNopMetricServer()
 
 		dir := t.TempDir()
 		defer os.RemoveAll(dir)
@@ -497,7 +497,7 @@ func FuzzDirExists(f *testing.F) {
 func FuzzInitRepo(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data string) {
 		log := zlog.NewTestLoggerPtr()
-		metrics := monitoring.NewMetricsServer(false, *log)
+		metrics := monitoring.NewNopMetricServer()
 
 		dir := t.TempDir()
 		defer os.RemoveAll(dir)
@@ -523,7 +523,7 @@ func FuzzInitRepo(f *testing.F) {
 func FuzzInitValidateRepo(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data string) {
 		log := zlog.NewTestLoggerPtr()
-		metrics := monitoring.NewMetricsServer(false, *log)
+		metrics := monitoring.NewNopMetricServer()
 
 		dir := t.TempDir()
 		defer os.RemoveAll(dir)
@@ -558,7 +558,7 @@ func FuzzInitValidateRepo(f *testing.F) {
 func FuzzGetImageTags(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data string) {
 		log := zlog.NewTestLoggerPtr()
-		metrics := monitoring.NewMetricsServer(false, *log)
+		metrics := monitoring.NewNopMetricServer()
 
 		dir := t.TempDir()
 		defer os.RemoveAll(dir)
@@ -584,7 +584,7 @@ func FuzzGetImageTags(f *testing.F) {
 func FuzzBlobUploadPath(f *testing.F) {
 	f.Fuzz(func(t *testing.T, repo, uuid string) {
 		log := zlog.NewTestLoggerPtr()
-		metrics := monitoring.NewMetricsServer(false, *log)
+		metrics := monitoring.NewNopMetricServer()
 
 		dir := t.TempDir()
 		defer os.RemoveAll(dir)
@@ -603,7 +603,7 @@ func FuzzBlobUploadPath(f *testing.F) {
 func FuzzBlobUploadInfo(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data string, uuid string) {
 		log := zlog.NewTestLoggerPtr()
-		metrics := monitoring.NewMetricsServer(false, *log)
+		metrics := monitoring.NewNopMetricServer()
 
 		dir := t.TempDir()
 		defer os.RemoveAll(dir)
@@ -633,7 +633,7 @@ func FuzzTestGetImageManifest(f *testing.F) {
 		defer os.RemoveAll(dir)
 
 		log := zlog.NewTestLogger()
-		metrics := monitoring.NewMetricsServer(false, log)
+		metrics := monitoring.NewNopMetricServer()
 		cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
 			RootDir:     dir,
 			Name:        "cache",
@@ -662,7 +662,7 @@ func FuzzFinishBlobUpload(f *testing.F) {
 		defer os.RemoveAll(dir)
 
 		log := zlog.NewTestLogger()
-		metrics := monitoring.NewMetricsServer(false, log)
+		metrics := monitoring.NewNopMetricServer()
 		cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
 			RootDir:     dir,
 			Name:        "cache",
@@ -709,7 +709,7 @@ func FuzzFinishBlobUpload(f *testing.F) {
 func FuzzFullBlobUpload(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
 		log := zlog.NewTestLoggerPtr()
-		metrics := monitoring.NewMetricsServer(false, *log)
+		metrics := monitoring.NewNopMetricServer()
 		repoName := "test"
 
 		dir := t.TempDir()
@@ -741,7 +741,7 @@ func FuzzFullBlobUpload(f *testing.F) {
 func TestStorageCacheErrors(t *testing.T) {
 	Convey("get error in DedupeBlob() when cache.Put() deduped blob", t, func() {
 		log := zlog.NewTestLogger()
-		metrics := monitoring.NewMetricsServer(false, log)
+		metrics := monitoring.NewNopMetricServer()
 
 		dir := t.TempDir()
 
@@ -781,9 +781,12 @@ func TestStorageCacheErrors(t *testing.T) {
 }
 
 func FuzzDedupeBlob(f *testing.F) {
+	// a seed, so that a plain go test runs the target too
+	f.Add("blob-content")
+
 	f.Fuzz(func(t *testing.T, data string) {
 		log := zlog.NewTestLoggerPtr()
-		metrics := monitoring.NewMetricsServer(false, *log)
+		metrics := monitoring.NewNopMetricServer()
 
 		dir := t.TempDir()
 		defer os.RemoveAll(dir)
@@ -801,19 +804,20 @@ func FuzzDedupeBlob(f *testing.F) {
 		src := path.Join(imgStore.RootDir(), "src")
 		blob := bytes.NewReader([]byte(data))
 
-		_, _, err := imgStore.FullBlobUpload(context.Background(), "repoName", blob, blobDigest)
+		_, _, err := imgStore.FullBlobUpload(context.Background(), "repo", blob, blobDigest)
 		if err != nil {
 			t.Error(err)
 		}
 
-		dst := imgStore.BlobPath("repoName", blobDigest)
+		dst := imgStore.BlobPath("repo", blobDigest)
 
-		err = os.MkdirAll(src, 0o755)
+		// the staged upload holds the verified blob, as BlobUploadPath would
+		err = os.WriteFile(src, []byte(data), 0o600)
 		if err != nil {
 			t.Error(err)
 		}
 
-		err = imgStore.DedupeBlob(src, blobDigest, "repoName", dst)
+		err = imgStore.DedupeBlob(src, blobDigest, "repo", dst)
 		if err != nil {
 			t.Error(err)
 		}
@@ -823,7 +827,7 @@ func FuzzDedupeBlob(f *testing.F) {
 func FuzzDeleteBlobUpload(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data string) {
 		log := zlog.NewTestLoggerPtr()
-		metrics := monitoring.NewMetricsServer(false, *log)
+		metrics := monitoring.NewNopMetricServer()
 		repoName := data
 
 		dir := t.TempDir()
@@ -855,7 +859,7 @@ func FuzzDeleteBlobUpload(f *testing.F) {
 func FuzzBlobPath(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data string) {
 		log := zlog.NewTestLoggerPtr()
-		metrics := monitoring.NewMetricsServer(false, *log)
+		metrics := monitoring.NewNopMetricServer()
 		repoName := data
 
 		dir := t.TempDir()
@@ -876,7 +880,7 @@ func FuzzBlobPath(f *testing.F) {
 func FuzzCheckBlob(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data string) {
 		log := zlog.NewTestLoggerPtr()
-		metrics := monitoring.NewMetricsServer(false, *log)
+		metrics := monitoring.NewNopMetricServer()
 		repoName := data
 
 		dir := t.TempDir()
@@ -915,7 +919,7 @@ func TestMissingBlobChecksDoNotLogErrors(t *testing.T) {
 		var buf bytes.Buffer
 
 		logger := zlog.NewLoggerWithWriter("debug", &buf)
-		metrics := monitoring.NewMetricsServer(false, logger)
+		metrics := monitoring.NewNopMetricServer()
 		t.Cleanup(metrics.Stop)
 
 		dir := t.TempDir()
@@ -995,7 +999,7 @@ func TestMissingBlobChecksDoNotLogErrors(t *testing.T) {
 func FuzzGetBlob(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data string) {
 		log := zlog.NewTestLoggerPtr()
-		metrics := monitoring.NewMetricsServer(false, *log)
+		metrics := monitoring.NewNopMetricServer()
 		repoName := data
 
 		dir := t.TempDir()
@@ -1036,7 +1040,7 @@ func FuzzGetBlob(f *testing.F) {
 func FuzzDeleteBlob(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data string) {
 		log := zlog.NewTestLoggerPtr()
-		metrics := monitoring.NewMetricsServer(false, *log)
+		metrics := monitoring.NewNopMetricServer()
 		repoName := data
 
 		dir := t.TempDir()
@@ -1073,7 +1077,7 @@ func FuzzDeleteBlob(f *testing.F) {
 func FuzzGetIndexContent(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data string) {
 		log := zlog.NewTestLoggerPtr()
-		metrics := monitoring.NewMetricsServer(false, *log)
+		metrics := monitoring.NewNopMetricServer()
 		repoName := data
 
 		dir := t.TempDir()
@@ -1110,7 +1114,7 @@ func FuzzGetIndexContent(f *testing.F) {
 func FuzzGetBlobContent(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data string) {
 		log := zlog.NewTestLoggerPtr()
-		metrics := monitoring.NewMetricsServer(false, *log)
+		metrics := monitoring.NewNopMetricServer()
 		repoName := data
 
 		dir := t.TempDir()
@@ -1149,7 +1153,7 @@ func FuzzRunGCRepo(f *testing.F) {
 		log := zlog.NewTestLogger()
 		audit := zlog.NewAuditLogger("debug", "")
 
-		metrics := monitoring.NewMetricsServer(false, log)
+		metrics := monitoring.NewNopMetricServer()
 
 		dir := t.TempDir()
 		defer os.RemoveAll(dir)
@@ -1188,7 +1192,7 @@ func TestDedupeLinks(t *testing.T) {
 	}
 
 	log := zlog.NewTestLogger()
-	metrics := monitoring.NewMetricsServer(false, log)
+	metrics := monitoring.NewNopMetricServer()
 
 	for _, testCase := range testCases {
 		Convey(fmt.Sprintf("Dedupe %t", testCase.dedupe), t, func(c C) {
@@ -1270,8 +1274,9 @@ func TestDedupeLinks(t *testing.T) {
 						Size:      int64(buflen),
 					},
 				},
+
+				SchemaVersion: 2,
 			}
-			manifest.SchemaVersion = 2
 			manifestBuf, err := json.Marshal(manifest)
 			So(err, ShouldBeNil)
 
@@ -1334,8 +1339,9 @@ func TestDedupeLinks(t *testing.T) {
 						Size:      int64(buflen),
 					},
 				},
+
+				SchemaVersion: 2,
 			}
-			manifest.SchemaVersion = 2
 			manifestBuf, err = json.Marshal(manifest)
 			So(err, ShouldBeNil)
 
@@ -1382,7 +1388,7 @@ func TestDedupeLinks(t *testing.T) {
 					So(err, ShouldBeNil)
 				})
 
-				Convey("test RunDedupeForDigest directly, trigger stat error on original blob", func() {
+				Convey("test RunDedupeForDigest directly, blob deleted after listing", func() {
 					// rebuild with dedupe true
 					imgStore := local.NewImageStore(dir, true, true, log, metrics, nil, cacheDriver, nil, nil)
 
@@ -1395,8 +1401,39 @@ func TestDedupeLinks(t *testing.T) {
 					err := os.Remove(path.Join(dir, "dedupe1", "blobs", "sha256", blobDigest1))
 					So(err, ShouldBeNil)
 
+					/* The paths come from a listing taken at the start of the run, so a blob
+					may have been deleted since. That is skipped rather than failing the
+					digest: a failed task is never retried and its completion callback never
+					runs, which would leave OnRunComplete unfired (project-zot/zot#4349). */
 					err = imgStore.RunDedupeForDigest(context.TODO(), godigest.Digest(blobDigest1), true, duplicateBlobs)
-					So(err, ShouldNotBeNil)
+					So(err, ShouldBeNil)
+				})
+
+				Convey("test RunDedupeForDigest directly, unreadable blob still fails", func() {
+					// rebuild with dedupe true
+					imgStore := local.NewImageStore(dir, true, true, log, metrics, nil, cacheDriver, nil, nil)
+
+					duplicateBlobs := []string{
+						path.Join(dir, "dedupe1", "blobs", "sha256", blobDigest1),
+						path.Join(dir, "dedupe1", "blobs", "sha256", blobDigest2),
+					}
+
+					// only a missing blob is skipped; a real I/O error must still fail the
+					// digest, so that the run does not quietly write off unreadable content
+					if os.Geteuid() != 0 {
+						blobsDir := path.Join(dir, "dedupe1", "blobs", "sha256")
+
+						err := os.Chmod(blobsDir, 0o000)
+						So(err, ShouldBeNil)
+
+						defer func() {
+							_ = os.Chmod(blobsDir, 0o700)
+						}()
+
+						err = imgStore.RunDedupeForDigest(context.TODO(), godigest.Digest(blobDigest1),
+							true, duplicateBlobs)
+						So(err, ShouldNotBeNil)
+					}
 				})
 
 				Convey("Intrerrupt rebuilding and restart, checking idempotency", func() {
@@ -1577,6 +1614,11 @@ func TestDedupeLinks(t *testing.T) {
 }
 
 func TestDedupeRestoreCompleteMarker(t *testing.T) {
+	// OnRunComplete runs in a goroutine (slow remote marker PUTs must not block
+	// the scheduler worker). Wait for the post-write log line, not only the file:
+	// WriteFile can finish before the following Info is visible in the buffer.
+	const logWait = 5 * time.Second
+
 	waitForMarker := func(t *testing.T, markerPath, expected string) {
 		t.Helper()
 
@@ -1594,15 +1636,12 @@ func TestDedupeRestoreCompleteMarker(t *testing.T) {
 
 	Convey("Restore-complete marker lifecycle", t, func(c C) {
 		dir := t.TempDir()
-
-		logBuf := test.NewThreadSafeLogBuffer()
-
-		log := zlog.NewLoggerWithWriter("debug", logBuf)
-		metrics := monitoring.NewMetricsServer(false, log)
-
+		metrics := monitoring.NewNopMetricServer()
 		markerPath := path.Join(dir, storageConstants.DedupeRestoreCompleteMarker)
 
 		Convey("dedupe=false on an empty store writes the restore-complete marker", func() {
+			logBuf := test.NewThreadSafeLogBuffer()
+			log := zlog.NewLoggerWithWriter("debug", logBuf)
 			imgStore := local.NewImageStore(dir, false, true, log, metrics, nil, nil, nil, nil)
 
 			taskScheduler := runAndGetScheduler()
@@ -1610,11 +1649,11 @@ func TestDedupeRestoreCompleteMarker(t *testing.T) {
 
 			imgStore.RunDedupeBlobs(time.Duration(0), taskScheduler)
 
-			waitForMarker(t, markerPath, storageConstants.DedupeRestoreMarkerComplete)
+			So(test.WaitForLogMessages(logBuf, "restore-complete marker written", 1, logWait), ShouldBeTrue)
 
-			taskScheduler.Shutdown()
-
-			So(logBuf.String(), ShouldContainSubstring, "restore-complete marker written")
+			data, err := os.ReadFile(markerPath)
+			So(err, ShouldBeNil)
+			So(strings.TrimSpace(string(data)), ShouldEqual, storageConstants.DedupeRestoreMarkerComplete)
 		})
 
 		Convey("dedupe=false with a complete marker skips the restore scan", func() {
@@ -1622,6 +1661,8 @@ func TestDedupeRestoreCompleteMarker(t *testing.T) {
 				storageConstants.DefaultFilePerms)
 			So(err, ShouldBeNil)
 
+			logBuf := test.NewThreadSafeLogBuffer()
+			log := zlog.NewLoggerWithWriter("debug", logBuf)
 			imgStore := local.NewImageStore(dir, false, true, log, metrics, nil, nil, nil, nil)
 
 			taskScheduler := runAndGetScheduler()
@@ -1629,9 +1670,7 @@ func TestDedupeRestoreCompleteMarker(t *testing.T) {
 
 			imgStore.RunDedupeBlobs(time.Duration(0), taskScheduler)
 
-			taskScheduler.Shutdown()
-
-			So(logBuf.String(), ShouldContainSubstring, "skipping dedupe restore scan")
+			So(test.WaitForLogMessages(logBuf, "skipping dedupe restore scan", 1, logWait), ShouldBeTrue)
 
 			data, err := os.ReadFile(markerPath)
 			So(err, ShouldBeNil)
@@ -1643,6 +1682,8 @@ func TestDedupeRestoreCompleteMarker(t *testing.T) {
 				storageConstants.DefaultFilePerms)
 			So(err, ShouldBeNil)
 
+			logBuf := test.NewThreadSafeLogBuffer()
+			log := zlog.NewLoggerWithWriter("debug", logBuf)
 			imgStore := local.NewImageStore(dir, false, true, log, metrics, nil, nil, nil, nil)
 
 			taskScheduler := runAndGetScheduler()
@@ -1650,11 +1691,11 @@ func TestDedupeRestoreCompleteMarker(t *testing.T) {
 
 			imgStore.RunDedupeBlobs(time.Duration(0), taskScheduler)
 
+			So(test.WaitForLogMessages(logBuf, "restore-complete marker present but not complete", 1, logWait),
+				ShouldBeTrue)
+			// Completion rewrite is async; wait for the post-write log, then confirm content.
+			So(test.WaitForLogMessages(logBuf, "restore-complete marker written", 1, logWait), ShouldBeTrue)
 			waitForMarker(t, markerPath, storageConstants.DedupeRestoreMarkerComplete)
-
-			taskScheduler.Shutdown()
-
-			So(logBuf.String(), ShouldContainSubstring, "restore-complete marker present but not complete")
 		})
 
 		Convey("dedupe=true removes an existing restore-complete marker", func() {
@@ -1662,15 +1703,14 @@ func TestDedupeRestoreCompleteMarker(t *testing.T) {
 				storageConstants.DefaultFilePerms)
 			So(err, ShouldBeNil)
 
-			imgStore := local.NewImageStore(dir, true, true, log, metrics, nil, nil, nil, nil)
+			imgStore := local.NewImageStore(dir, true, true, zlog.NewTestLogger(), metrics, nil, nil, nil, nil)
 
 			taskScheduler := runAndGetScheduler()
 			defer taskScheduler.Shutdown()
 
 			imgStore.RunDedupeBlobs(time.Duration(0), taskScheduler)
 
-			taskScheduler.Shutdown()
-
+			// Delete of the marker is synchronous in RunDedupeBlobs before the generator runs.
 			_, err = os.Stat(markerPath)
 			So(errors.Is(err, fs.ErrNotExist), ShouldBeTrue)
 		})
@@ -1682,7 +1722,7 @@ func TestCheckBlobTreatsRealEmptyBlobAsPresent(t *testing.T) {
 		dir := t.TempDir()
 
 		logger := zlog.NewTestLogger()
-		metrics := monitoring.NewMetricsServer(false, logger)
+		metrics := monitoring.NewNopMetricServer()
 
 		imgStore := local.NewImageStore(dir, false, true, logger, metrics, nil, nil, nil, nil)
 
@@ -1701,7 +1741,9 @@ func TestCheckBlobTreatsRealEmptyBlobAsPresent(t *testing.T) {
 
 // recheckDriver wraps local.Driver and, for a single target path, returns a
 // custom result on the second Stat call to simulate the state observed by
-// restoreDedupedBlobs' re-check under the write lock.
+// restoreDedupedBlobs' re-check under the write lock. It reports a name that is
+// not the local one, so the store uses the remote lifecycle, where zero-size
+// copies are placeholders the restore walk refills.
 type recheckDriver struct {
 	*local.Driver
 
@@ -1713,6 +1755,8 @@ type recheckDriver struct {
 	recheckSize int64
 	recheckErr  error
 }
+
+func (d *recheckDriver) Name() string { return "remote-test" }
 
 func (d *recheckDriver) Stat(path string) (storagedriver.FileInfo, error) {
 	if path == d.targetPath {
@@ -1738,7 +1782,7 @@ func (d *recheckDriver) Stat(path string) (storagedriver.FileInfo, error) {
 func TestRestoreDedupedBlobsRecheck(t *testing.T) {
 	Convey("restoreDedupedBlobs re-checks blob size under the write lock", t, func() {
 		log := zlog.NewTestLogger()
-		metrics := monitoring.NewMetricsServer(false, log)
+		metrics := monitoring.NewNopMetricServer()
 
 		Convey("a blob restored by a concurrent task is left untouched", func() {
 			dir := t.TempDir()
@@ -1845,7 +1889,7 @@ func TestRunDedupeBlobsMarkerDeleteError(t *testing.T) {
 			logBuf := test.NewThreadSafeLogBuffer()
 
 			log := zlog.NewLoggerWithWriter("debug", logBuf)
-			metrics := monitoring.NewMetricsServer(false, log)
+			metrics := monitoring.NewNopMetricServer()
 
 			testDriver := &errMarkerDriver{
 				Driver:    local.New(true),
@@ -1870,7 +1914,7 @@ func TestRunDedupeBlobsMarkerDeleteError(t *testing.T) {
 			logBuf := test.NewThreadSafeLogBuffer()
 
 			log := zlog.NewLoggerWithWriter("debug", logBuf)
-			metrics := monitoring.NewMetricsServer(false, log)
+			metrics := monitoring.NewNopMetricServer()
 
 			testDriver := &errMarkerDriver{
 				Driver:    local.New(true),
@@ -1903,7 +1947,7 @@ func TestDedupe(t *testing.T) {
 			dir := t.TempDir()
 
 			log := zlog.NewTestLogger()
-			metrics := monitoring.NewMetricsServer(false, log)
+			metrics := monitoring.NewNopMetricServer()
 			cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
 				RootDir:     dir,
 				Name:        "cache",
@@ -1923,7 +1967,7 @@ func TestNegativeCases(t *testing.T) {
 		dir := t.TempDir()
 
 		log := zlog.NewTestLogger()
-		metrics := monitoring.NewMetricsServer(false, log)
+		metrics := monitoring.NewNopMetricServer()
 		cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
 			RootDir:     dir,
 			Name:        "cache",
@@ -1947,7 +1991,7 @@ func TestNegativeCases(t *testing.T) {
 		dir := t.TempDir()
 
 		log := zlog.NewTestLogger()
-		metrics := monitoring.NewMetricsServer(false, log)
+		metrics := monitoring.NewNopMetricServer()
 		cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
 			RootDir:     dir,
 			Name:        "cache",
@@ -1997,7 +2041,7 @@ func TestNegativeCases(t *testing.T) {
 		dir := t.TempDir()
 
 		log := zlog.NewTestLogger()
-		metrics := monitoring.NewMetricsServer(false, log)
+		metrics := monitoring.NewNopMetricServer()
 		cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
 			RootDir:     dir,
 			Name:        "cache",
@@ -2019,7 +2063,7 @@ func TestNegativeCases(t *testing.T) {
 
 		_, err = imgStore.ValidateRepo("invalid-test")
 		So(err, ShouldNotBeNil)
-		So(err, ShouldEqual, zerr.ErrRepoNotFound)
+		So(errors.Is(err, zerr.ErrStoragePermanent), ShouldBeTrue)
 
 		err = os.Chmod(path.Join(dir, "invalid-test"), 0o755) // remove all perms
 		if err != nil {
@@ -2111,7 +2155,7 @@ func TestNegativeCases(t *testing.T) {
 		dir := t.TempDir()
 
 		log := zlog.NewTestLogger()
-		metrics := monitoring.NewMetricsServer(false, log)
+		metrics := monitoring.NewNopMetricServer()
 		cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
 			RootDir:     dir,
 			Name:        "cache",
@@ -2138,7 +2182,7 @@ func TestNegativeCases(t *testing.T) {
 		dir := t.TempDir()
 
 		log := zlog.NewTestLogger()
-		metrics := monitoring.NewMetricsServer(false, log)
+		metrics := monitoring.NewNopMetricServer()
 		cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
 			RootDir:     dir,
 			Name:        "cache",
@@ -2186,7 +2230,7 @@ func TestNegativeCases(t *testing.T) {
 		dir := t.TempDir()
 
 		log := zlog.NewTestLogger()
-		metrics := monitoring.NewMetricsServer(false, log)
+		metrics := monitoring.NewNopMetricServer()
 		cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
 			RootDir:     dir,
 			Name:        "cache",
@@ -2364,7 +2408,7 @@ func TestInjectWriteFile(t *testing.T) {
 		dir := t.TempDir()
 
 		log := zlog.NewTestLogger()
-		metrics := monitoring.NewMetricsServer(false, log)
+		metrics := monitoring.NewNopMetricServer()
 		cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
 			RootDir:     dir,
 			Name:        "cache",
@@ -2393,7 +2437,7 @@ func TestGarbageCollectForImageStore(t *testing.T) {
 			log := zlog.NewLogger("debug", logPath)
 			audit := zlog.NewAuditLogger("debug", "")
 
-			metrics := monitoring.NewMetricsServer(false, log)
+			metrics := monitoring.NewNopMetricServer()
 			cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
 				RootDir:     dir,
 				Name:        "cache",
@@ -2442,7 +2486,7 @@ func TestGarbageCollectForImageStore(t *testing.T) {
 			log := zlog.NewLogger("debug", logPath)
 			audit := zlog.NewAuditLogger("debug", "")
 
-			metrics := monitoring.NewMetricsServer(false, log)
+			metrics := monitoring.NewNopMetricServer()
 			cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
 				RootDir:     dir,
 				Name:        "cache",
@@ -2481,7 +2525,7 @@ func TestGarbageCollectForImageStore(t *testing.T) {
 			log := zlog.NewTestLogger()
 			audit := zlog.NewAuditLogger("debug", "")
 
-			metrics := monitoring.NewMetricsServer(false, log)
+			metrics := monitoring.NewNopMetricServer()
 			cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
 				RootDir:     dir,
 				Name:        "cache",
@@ -2556,7 +2600,7 @@ func TestGarbageCollectForImageStore(t *testing.T) {
 			log := zlog.NewLogger("debug", logPath)
 			audit := zlog.NewAuditLogger("debug", "")
 
-			metrics := monitoring.NewMetricsServer(false, log)
+			metrics := monitoring.NewNopMetricServer()
 			cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
 				RootDir:     dir,
 				Name:        "cache",
@@ -2631,7 +2675,7 @@ func TestGarbageCollectImageUnknownManifest(t *testing.T) {
 		log := zlog.NewTestLogger()
 		audit := zlog.NewAuditLogger("debug", "")
 
-		metrics := monitoring.NewMetricsServer(false, log)
+		metrics := monitoring.NewNopMetricServer()
 		cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
 			RootDir:     dir,
 			Name:        "cache",
@@ -2814,7 +2858,7 @@ func TestGarbageCollectErrors(t *testing.T) {
 		log := zlog.NewTestLogger()
 		audit := zlog.NewAuditLogger("debug", "")
 
-		metrics := monitoring.NewMetricsServer(false, log)
+		metrics := monitoring.NewNopMetricServer()
 		cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
 			RootDir:     dir,
 			Name:        "cache",
@@ -2887,8 +2931,9 @@ func TestGarbageCollectErrors(t *testing.T) {
 							Size:      int64(bsize1),
 						},
 					},
+
+					SchemaVersion: 2,
 				}
-				manifest.SchemaVersion = 2
 				content, err = json.Marshal(manifest)
 				So(err, ShouldBeNil)
 
@@ -2926,61 +2971,29 @@ func TestGarbageCollectErrors(t *testing.T) {
 			So(err, ShouldNotBeNil)
 		})
 
-		Convey("Trigger error on GetBlobContent and Unmarshal for untagged manifest", func() {
-			// upload image config blob
-			upload, err = imgStore.NewBlobUpload(context.Background(), repoName)
-			So(err, ShouldBeNil)
-			So(upload, ShouldNotBeEmpty)
+		Convey("Missing untagged manifest blob does not abort GC", func() {
+			digest = putUntaggedManifestForGCErrors(imgStore, repoName, bdgst1, bsize1)
 
-			cblob, cdigest := GetRandomImageConfig()
-			buf = bytes.NewBuffer(cblob)
-			buflen = buf.Len()
-			blob, err = imgStore.PutBlobChunkStreamed(context.Background(), repoName, upload, buf)
-			So(err, ShouldBeNil)
-			So(blob, ShouldEqual, buflen)
-
-			err = imgStore.FinishBlobUpload(repoName, upload, buf, cdigest)
-			So(err, ShouldBeNil)
-			So(blob, ShouldEqual, buflen)
-
-			// create a manifest
-			manifest := ispec.Manifest{
-				Config: ispec.Descriptor{
-					MediaType: ispec.MediaTypeImageConfig,
-					Digest:    cdigest,
-					Size:      int64(len(cblob)),
-				},
-				Layers: []ispec.Descriptor{
-					{
-						MediaType: ispec.MediaTypeImageLayer,
-						Digest:    bdgst1,
-						Size:      int64(bsize1),
-					},
-				},
-			}
-			manifest.SchemaVersion = 2
-			content, err = json.Marshal(manifest)
-			So(err, ShouldBeNil)
-
-			digest = godigest.FromBytes(content)
-			So(digest, ShouldNotBeNil)
-
-			_, _, err = imgStore.PutImageManifest(context.Background(),
-				repoName, digest.String(), ispec.MediaTypeImageManifest, content, nil)
-			So(err, ShouldBeNil)
-
-			// trigger GetBlobContent error
+			// Identify soft-continues on Get miss; age check also skips on StatBlob miss so
+			// CleanRepo reaches removeStaleManifestEntries and drops the absent index row.
 			err = os.Remove(imgStore.BlobPath(repoName, digest))
 			So(err, ShouldBeNil)
 
 			time.Sleep(500 * time.Millisecond)
 
 			err = gc.CleanRepo(ctx, repoName)
-			So(err, ShouldNotBeNil)
-
-			// trigger Unmarshal error
-			_, err = os.Create(imgStore.BlobPath(repoName, digest))
 			So(err, ShouldBeNil)
+		})
+
+		Convey("Corrupt untagged manifest blob aborts GC", func() {
+			digest = putUntaggedManifestForGCErrors(imgStore, repoName, bdgst1, bsize1)
+
+			// Non-empty corrupt content: a zero-size copy fails closed as blob not found and
+			// soft-continues; invalid JSON must fail closed in identify.
+			err = os.WriteFile(imgStore.BlobPath(repoName, digest), []byte("not-a-manifest"), 0o600)
+			So(err, ShouldBeNil)
+
+			time.Sleep(500 * time.Millisecond)
 
 			err = gc.CleanRepo(ctx, repoName)
 			So(err, ShouldNotBeNil)
@@ -3017,8 +3030,9 @@ func TestGarbageCollectErrors(t *testing.T) {
 						Size:      int64(bsize1),
 					},
 				},
+
+				SchemaVersion: 2,
 			}
-			manifest.SchemaVersion = 2
 			content, err = json.Marshal(manifest)
 			So(err, ShouldBeNil)
 
@@ -3046,6 +3060,53 @@ func TestGarbageCollectErrors(t *testing.T) {
 	})
 }
 
+func putUntaggedManifestForGCErrors(imgStore storageTypes.ImageStore, repoName string,
+	layerDigest godigest.Digest, layerSize int,
+) godigest.Digest {
+	upload, err := imgStore.NewBlobUpload(context.Background(), repoName)
+	So(err, ShouldBeNil)
+	So(upload, ShouldNotBeEmpty)
+
+	cblob, cdigest := GetRandomImageConfig()
+	buf := bytes.NewBuffer(cblob)
+	buflen := buf.Len()
+	blob, err := imgStore.PutBlobChunkStreamed(context.Background(), repoName, upload, buf)
+	So(err, ShouldBeNil)
+	So(blob, ShouldEqual, buflen)
+
+	err = imgStore.FinishBlobUpload(repoName, upload, buf, cdigest)
+	So(err, ShouldBeNil)
+	So(blob, ShouldEqual, buflen)
+
+	manifest := ispec.Manifest{
+		Config: ispec.Descriptor{
+			MediaType: ispec.MediaTypeImageConfig,
+			Digest:    cdigest,
+			Size:      int64(len(cblob)),
+		},
+		Layers: []ispec.Descriptor{
+			{
+				MediaType: ispec.MediaTypeImageLayer,
+				Digest:    layerDigest,
+				Size:      int64(layerSize),
+			},
+		},
+
+		SchemaVersion: 2,
+	}
+	content, err := json.Marshal(manifest)
+	So(err, ShouldBeNil)
+
+	digest := godigest.FromBytes(content)
+	So(digest, ShouldNotBeNil)
+
+	_, _, err = imgStore.PutImageManifest(context.Background(),
+		repoName, digest.String(), ispec.MediaTypeImageManifest, content, nil)
+	So(err, ShouldBeNil)
+
+	return digest
+}
+
 func randSeq(n int) string {
 	letters := []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
@@ -3067,7 +3128,7 @@ func TestInitRepo(t *testing.T) {
 		dir := t.TempDir()
 
 		log := zlog.NewTestLogger()
-		metrics := monitoring.NewMetricsServer(false, log)
+		metrics := monitoring.NewNopMetricServer()
 		cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
 			RootDir:     dir,
 			Name:        "cache",
@@ -3089,7 +3150,7 @@ func TestValidateRepo(t *testing.T) {
 		dir := t.TempDir()
 
 		log := zlog.NewTestLogger()
-		metrics := monitoring.NewMetricsServer(false, log)
+		metrics := monitoring.NewNopMetricServer()
 		cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
 			RootDir:     dir,
 			Name:        "cache",
@@ -3109,7 +3170,7 @@ func TestValidateRepo(t *testing.T) {
 		dir := t.TempDir()
 
 		log := zlog.NewTestLogger()
-		metrics := monitoring.NewMetricsServer(false, log)
+		metrics := monitoring.NewNopMetricServer()
 		cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
 			RootDir:     dir,
 			Name:        "cache",
@@ -3154,7 +3215,7 @@ func TestGetRepositories(t *testing.T) {
 		dir := t.TempDir()
 
 		log := zlog.NewTestLogger()
-		metrics := monitoring.NewMetricsServer(false, log)
+		metrics := monitoring.NewNopMetricServer()
 		cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
 			RootDir:     dir,
 			Name:        "cache",
@@ -3249,7 +3310,7 @@ func TestGetRepositories(t *testing.T) {
 		dir := t.TempDir()
 
 		log := zlog.NewTestLogger()
-		metrics := monitoring.NewMetricsServer(false, log)
+		metrics := monitoring.NewNopMetricServer()
 		cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
 			RootDir:     dir,
 			Name:        "cache",
@@ -3295,7 +3356,7 @@ func TestGetRepositories(t *testing.T) {
 		So(err, ShouldBeNil)
 
 		log := zlog.NewTestLogger()
-		metrics := monitoring.NewMetricsServer(false, log)
+		metrics := monitoring.NewNopMetricServer()
 		cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
 			RootDir:     rootDir,
 			Name:        "cache",
@@ -3334,12 +3395,145 @@ func TestGetRepositories(t *testing.T) {
 		t.Logf("repos %v", repos)
 		So(len(repos), ShouldEqual, 0)
 	})
+
+	Convey("GetRepositories ignores unreadable lost+found", t, func() {
+		// Regression for https://github.com/project-zot/zot/issues/4413:
+		// ext4 mount roots often contain a root-owned lost+found. Walking into it
+		// used to fail GetRepositories with permission denied.
+		dir := t.TempDir()
+
+		log := zlog.NewTestLogger()
+		metrics := monitoring.NewNopMetricServer()
+		cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
+			RootDir:     dir,
+			Name:        "cache",
+			UseRelPaths: true,
+		}, log)
+
+		imgStore := local.NewImageStore(dir, true, true, log, metrics, nil, cacheDriver, nil, nil)
+
+		repoDir := path.Join(dir, "myrepo")
+		So(os.MkdirAll(path.Join(repoDir, ispec.ImageBlobsDir), 0o755), ShouldBeNil)
+
+		il := ispec.ImageLayout{Version: ispec.ImageLayoutVersion}
+		layoutFileContent, err := json.Marshal(il)
+		So(err, ShouldBeNil)
+
+		err = os.WriteFile(path.Join(repoDir, ispec.ImageIndexFile), []byte("{}"),
+			storageConstants.DefaultFilePerms)
+		So(err, ShouldBeNil)
+		err = os.WriteFile(path.Join(repoDir, ispec.ImageLayoutFile), layoutFileContent,
+			storageConstants.DefaultFilePerms)
+		So(err, ShouldBeNil)
+
+		lostFound := path.Join(dir, "lost+found")
+		So(os.MkdirAll(path.Join(lostFound, "orphan"), 0o755), ShouldBeNil)
+		So(os.Chmod(lostFound, 0o000), ShouldBeNil)
+
+		defer func() {
+			_ = os.Chmod(lostFound, 0o755)
+		}()
+
+		repos, err := imgStore.GetRepositories()
+		So(err, ShouldBeNil)
+		So(repos, ShouldResemble, []string{"myrepo"})
+	})
+
+	Convey("Skip invalid repo names (lost+found) without failing; still find nested repos", t, func() {
+		dir := t.TempDir()
+
+		log := zlog.NewTestLogger()
+		metrics := monitoring.NewNopMetricServer()
+		cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
+			RootDir:     dir,
+			Name:        "cache",
+			UseRelPaths: true,
+		}, log)
+
+		imgStore := local.NewImageStore(dir, true, true, log, metrics, nil, cacheDriver, nil, nil)
+
+		writeMinimalOCILayout := func(repo string) {
+			repoDir := path.Join(dir, repo)
+			So(os.MkdirAll(path.Join(repoDir, ispec.ImageBlobsDir), 0o755), ShouldBeNil)
+
+			il := ispec.ImageLayout{Version: ispec.ImageLayoutVersion}
+			layoutFileContent, err := json.Marshal(il)
+			So(err, ShouldBeNil)
+
+			err = os.WriteFile(path.Join(repoDir, ispec.ImageIndexFile), []byte("{}"),
+				storageConstants.DefaultFilePerms)
+			So(err, ShouldBeNil)
+			err = os.WriteFile(path.Join(repoDir, ispec.ImageLayoutFile), layoutFileContent,
+				storageConstants.DefaultFilePerms)
+			So(err, ShouldBeNil)
+		}
+
+		// Nested valid repos under a namespace prefix that is not itself a layout.
+		writeMinimalOCILayout("org/team")
+		writeMinimalOCILayout("org/group/app")
+		writeMinimalOCILayout("toplevel")
+
+		// ext4-style junk: invalid distribution name with nested contents, unreadable
+		// like a root-owned lost+found. Without ErrSkipDir on invalid names, Walk
+		// would List this dir and fail the whole GetRepositories call.
+		lostFound := path.Join(dir, "lost+found")
+		So(os.MkdirAll(path.Join(lostFound, "orphan-inode"), 0o755), ShouldBeNil)
+		err := os.WriteFile(path.Join(lostFound, "orphan-inode", "data"), []byte("x"),
+			storageConstants.DefaultFilePerms)
+		So(err, ShouldBeNil)
+		So(os.Chmod(lostFound, 0o000), ShouldBeNil)
+
+		defer func() {
+			_ = os.Chmod(lostFound, 0o755)
+		}()
+
+		// Another invalid-name tree with nested folders (readable): must be skipped,
+		// not mistaken for repos and not break discovery of valid nested paths.
+		So(os.MkdirAll(path.Join(dir, "_invalid", "nested", "deep"), 0o755), ShouldBeNil)
+		err = os.WriteFile(path.Join(dir, "_invalid", "nested", "deep", "file"), []byte("x"),
+			storageConstants.DefaultFilePerms)
+		So(err, ShouldBeNil)
+
+		repos, err := imgStore.GetRepositories()
+		So(err, ShouldBeNil)
+		So(repos, ShouldContain, "org/team")
+		So(repos, ShouldContain, "org/group/app")
+		So(repos, ShouldContain, "toplevel")
+		So(len(repos), ShouldEqual, 3)
+		So(repos, ShouldNotContain, "lost+found")
+		So(repos, ShouldNotContain, "_invalid")
+		So(repos, ShouldNotContain, "org") // namespace prefix only, not a layout
+
+		nextRepos, more, err := imgStore.GetNextRepositories("", 10, func(repo string) (bool, error) {
+			return true, nil
+		})
+		So(err, ShouldBeNil)
+		So(more, ShouldBeFalse)
+		So(nextRepos, ShouldContain, "org/team")
+		So(nextRepos, ShouldContain, "org/group/app")
+		So(nextRepos, ShouldContain, "toplevel")
+		So(len(nextRepos), ShouldEqual, 3)
+
+		found := map[string]struct{}{}
+		for range 5 {
+			repo, err := imgStore.GetNextRepository(found)
+			So(err, ShouldBeNil)
+			if repo == "" {
+				break
+			}
+			found[repo] = struct{}{}
+		}
+		So(found, ShouldContainKey, "org/team")
+		So(found, ShouldContainKey, "org/group/app")
+		So(found, ShouldContainKey, "toplevel")
+		So(len(found), ShouldEqual, 3)
+	})
 }
 
 func TestGetNextRepository(t *testing.T) {
 	dir := t.TempDir()
 	log := zlog.NewTestLogger()
-	metrics := monitoring.NewMetricsServer(false, log)
+	metrics := monitoring.NewNopMetricServer()
 	cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
 		RootDir:     dir,
 		Name:        "cache",
@@ -3416,7 +3610,7 @@ func TestPutBlobChunkStreamed(t *testing.T) {
 		dir := t.TempDir()
 
 		log := zlog.NewTestLogger()
-		metrics := monitoring.NewMetricsServer(false, log)
+		metrics := monitoring.NewNopMetricServer()
 		cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
 			RootDir:     dir,
 			Name:        "cache",
@@ -3439,12 +3633,287 @@ func TestPutBlobChunkStreamed(t *testing.T) {
 	})
 }
 
+func TestBlobChunkUploadDoesNotBlockOnStoreLock(t *testing.T) {
+	Convey("chunk PUT/PATCH copy the body while the store write lock is held", t, func() {
+		dir := t.TempDir()
+		log := zlog.NewTestLogger()
+		metrics := monitoring.NewNopMetricServer()
+		imgStore := local.NewImageStore(dir, false, false, log, metrics, nil, nil, nil, nil)
+		ctx := context.Background()
+		repo := "chunk-under-lock"
+
+		assertCopyWhileLocked := func(put func() (int64, error)) {
+			blocked := true
+
+			var putErr error
+
+			_ = imgStore.WithRepoLock(repo, func() error {
+				done := make(chan error, 1)
+
+				go func() {
+					_, err := put()
+					done <- err
+				}()
+
+				select {
+				case putErr = <-done:
+					blocked = false
+				case <-time.After(5 * time.Second):
+				}
+
+				return nil
+			})
+
+			So(blocked, ShouldBeFalse)
+			So(putErr, ShouldBeNil)
+		}
+
+		Convey("PutBlobChunkStreamed", func() {
+			uuid, err := imgStore.NewBlobUpload(ctx, repo)
+			So(err, ShouldBeNil)
+
+			content := []byte("streamed-under-lock")
+			assertCopyWhileLocked(func() (int64, error) {
+				return imgStore.PutBlobChunkStreamed(ctx, repo, uuid, bytes.NewReader(content))
+			})
+		})
+
+		Convey("PutBlobChunk", func() {
+			uuid, err := imgStore.NewBlobUpload(ctx, repo)
+			So(err, ShouldBeNil)
+
+			content := []byte("chunk-under-lock")
+			assertCopyWhileLocked(func() (int64, error) {
+				return imgStore.PutBlobChunk(ctx, repo, uuid, 0, int64(len(content)), bytes.NewReader(content))
+			})
+		})
+	})
+}
+
+func TestFinishBlobUploadRecreatesRepoLayout(t *testing.T) {
+	Convey("FinishBlobUpload restores oci-layout and index.json if GC removed them", t, func() {
+		dir := t.TempDir()
+		log := zlog.NewTestLogger()
+		metrics := monitoring.NewNopMetricServer()
+		imgStore := local.NewImageStore(dir, false, false, log, metrics, nil, nil, nil, nil)
+		ctx := context.Background()
+		repo := "finish-after-gc"
+
+		uuid, err := imgStore.NewBlobUpload(ctx, repo)
+		So(err, ShouldBeNil)
+
+		content := []byte("blob-survives-gc-layout-delete")
+		digest := godigest.FromBytes(content)
+		n, err := imgStore.PutBlobChunk(ctx, repo, uuid, 0, int64(len(content)), bytes.NewReader(content))
+		So(err, ShouldBeNil)
+		So(n, ShouldEqual, len(content))
+
+		So(os.Remove(path.Join(dir, repo, ispec.ImageIndexFile)), ShouldBeNil)
+		So(os.Remove(path.Join(dir, repo, ispec.ImageLayoutFile)), ShouldBeNil)
+		So(os.RemoveAll(path.Join(dir, repo, ispec.ImageBlobsDir)), ShouldBeNil)
+
+		ok, _ := imgStore.ValidateRepo(repo)
+		So(ok, ShouldBeFalse)
+
+		err = imgStore.FinishBlobUpload(repo, uuid, bytes.NewReader(nil), digest)
+		So(err, ShouldBeNil)
+
+		ok, err = imgStore.ValidateRepo(repo)
+		So(err, ShouldBeNil)
+		So(ok, ShouldBeTrue)
+
+		hasBlob, size, err := imgStore.CheckBlob(ctx, repo, digest)
+		So(err, ShouldBeNil)
+		So(hasBlob, ShouldBeTrue)
+		So(size, ShouldEqual, int64(len(content)))
+	})
+}
+
+func TestFullBlobUploadDoesNotBlockOnStoreLock(t *testing.T) {
+	Convey("FullBlobUpload reads the body while the store write lock is held", t, func() {
+		dir := t.TempDir()
+		log := zlog.NewTestLogger()
+		metrics := monitoring.NewNopMetricServer()
+		imgStore := local.NewImageStore(dir, false, false, log, metrics, nil, nil, nil, nil)
+		ctx := context.Background()
+		repo := "full-under-lock"
+		content := []byte("full-blob-under-lock")
+		digest := godigest.FromBytes(content)
+
+		pipeReader, pipeWriter := io.Pipe()
+
+		errCh := make(chan error, 1)
+		blocked := true
+
+		var writeErr error
+
+		_ = imgStore.WithRepoLock(repo, func() error {
+			go func() {
+				_, _, err := imgStore.FullBlobUpload(ctx, repo, pipeReader, digest)
+				errCh <- err
+			}()
+
+			wrote := make(chan error, 1)
+
+			go func() {
+				_, err := pipeWriter.Write(content)
+				_ = pipeWriter.Close()
+				wrote <- err
+			}()
+
+			select {
+			case writeErr = <-wrote:
+				blocked = false
+			case <-time.After(5 * time.Second):
+				_ = pipeWriter.Close()
+			}
+
+			return nil
+		})
+
+		So(blocked, ShouldBeFalse)
+		So(writeErr, ShouldBeNil)
+		So(<-errCh, ShouldBeNil)
+	})
+}
+
+func TestFullBlobUploadCreatesRepoLayout(t *testing.T) {
+	Convey("FullBlobUpload creates the OCI layout after copying, including if GC removed it", t, func() {
+		dir := t.TempDir()
+		log := zlog.NewTestLogger()
+		metrics := monitoring.NewNopMetricServer()
+		imgStore := local.NewImageStore(dir, false, false, log, metrics, nil, nil, nil, nil)
+		ctx := context.Background()
+		repo := "full-creates-layout"
+
+		content := []byte("monolith-first-push")
+		digest := godigest.FromBytes(content)
+
+		_, nbytes, err := imgStore.FullBlobUpload(ctx, repo, bytes.NewReader(content), digest)
+		So(err, ShouldBeNil)
+		So(nbytes, ShouldEqual, int64(len(content)))
+
+		ok, err := imgStore.ValidateRepo(repo)
+		So(err, ShouldBeNil)
+		So(ok, ShouldBeTrue)
+
+		So(os.Remove(path.Join(dir, repo, ispec.ImageIndexFile)), ShouldBeNil)
+		So(os.Remove(path.Join(dir, repo, ispec.ImageLayoutFile)), ShouldBeNil)
+		So(os.RemoveAll(path.Join(dir, repo, ispec.ImageBlobsDir)), ShouldBeNil)
+
+		content2 := []byte("monolith-after-gc")
+		digest2 := godigest.FromBytes(content2)
+		_, nbytes, err = imgStore.FullBlobUpload(ctx, repo, bytes.NewReader(content2), digest2)
+		So(err, ShouldBeNil)
+		So(nbytes, ShouldEqual, int64(len(content2)))
+
+		ok, err = imgStore.ValidateRepo(repo)
+		So(err, ShouldBeNil)
+		So(ok, ShouldBeTrue)
+
+		hasBlob, size, err := imgStore.CheckBlob(ctx, repo, digest2)
+		So(err, ShouldBeNil)
+		So(hasBlob, ShouldBeTrue)
+		So(size, ShouldEqual, int64(len(content2)))
+	})
+}
+
+func TestBlobUploadPrepareAndInitRepoErrors(t *testing.T) {
+	Convey("prepareBlobUploadDir and post-copy initRepo error paths", t, func() {
+		dir := t.TempDir()
+		log := zlog.NewTestLogger()
+		metrics := monitoring.NewNopMetricServer()
+		imgStore := local.NewImageStore(dir, false, false, log, metrics, nil, nil, nil, nil)
+		content := []byte("upload-error-path")
+		digest := godigest.FromBytes(content)
+
+		Convey("canceled context fails before opening the upload writer", func() {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+
+			_, err := imgStore.PutBlobChunkStreamed(ctx, "canceled-chunk", "unused-uuid", bytes.NewReader(content))
+			So(err, ShouldNotBeNil)
+			So(errors.Is(err, context.Canceled), ShouldBeTrue)
+
+			_, _, err = imgStore.FullBlobUpload(ctx, "canceled-full", bytes.NewReader(content), digest)
+			So(err, ShouldNotBeNil)
+			So(errors.Is(err, context.Canceled), ShouldBeTrue)
+		})
+
+		Convey("invalid repository name fails prepareBlobUploadDir", func() {
+			ctx := context.Background()
+
+			_, err := imgStore.PutBlobChunk(ctx, "_badname", "unused-uuid", 0, int64(len(content)), bytes.NewReader(content))
+			So(err, ShouldNotBeNil)
+			So(errors.Is(err, zerr.ErrInvalidRepositoryName), ShouldBeTrue)
+
+			_, _, err = imgStore.FullBlobUpload(ctx, "_badname", bytes.NewReader(content), digest)
+			So(err, ShouldNotBeNil)
+			So(errors.Is(err, zerr.ErrInvalidRepositoryName), ShouldBeTrue)
+		})
+
+		Convey("EnsureDir for .uploads fails when .uploads is a file", func() {
+			ctx := context.Background()
+			repoChunk := "ensure-uploads-fail"
+			repoFull := "ensure-uploads-fail-full"
+
+			for _, repo := range []string{repoChunk, repoFull} {
+				So(os.MkdirAll(path.Join(dir, repo), 0o755), ShouldBeNil)
+				So(os.WriteFile(path.Join(dir, repo, storageConstants.BlobUploadDir), []byte("not-a-dir"), 0o600), ShouldBeNil)
+			}
+
+			_, err := imgStore.PutBlobChunkStreamed(ctx, repoChunk, "unused-uuid", bytes.NewReader(content))
+			So(err, ShouldNotBeNil)
+
+			_, _, err = imgStore.FullBlobUpload(ctx, repoFull, bytes.NewReader(content), digest)
+			So(err, ShouldNotBeNil)
+		})
+
+		Convey("FinishBlobUpload returns initRepo errors under the move lock", func() {
+			ctx := context.Background()
+			repo := "finish-init-fail"
+
+			uuid, err := imgStore.NewBlobUpload(ctx, repo)
+			So(err, ShouldBeNil)
+
+			n, err := imgStore.PutBlobChunk(ctx, repo, uuid, 0, int64(len(content)), bytes.NewReader(content))
+			So(err, ShouldBeNil)
+			So(n, ShouldEqual, len(content))
+
+			So(os.RemoveAll(path.Join(dir, repo, ispec.ImageBlobsDir)), ShouldBeNil)
+			So(os.WriteFile(path.Join(dir, repo, ispec.ImageBlobsDir), []byte("not-a-dir"), 0o600), ShouldBeNil)
+
+			err = imgStore.FinishBlobUpload(repo, uuid, bytes.NewReader(nil), digest)
+			So(err, ShouldNotBeNil)
+		})
+
+		Convey("FullBlobUpload returns initRepo errors after the body is copied", func() {
+			ctx := context.Background()
+			repo := "full-init-fail"
+
+			_, nbytes, err := imgStore.FullBlobUpload(ctx, repo, bytes.NewReader(content), digest)
+			So(err, ShouldBeNil)
+			So(nbytes, ShouldEqual, int64(len(content)))
+
+			So(os.Remove(path.Join(dir, repo, ispec.ImageIndexFile)), ShouldBeNil)
+			So(os.Remove(path.Join(dir, repo, ispec.ImageLayoutFile)), ShouldBeNil)
+			So(os.RemoveAll(path.Join(dir, repo, ispec.ImageBlobsDir)), ShouldBeNil)
+			So(os.WriteFile(path.Join(dir, repo, ispec.ImageBlobsDir), []byte("not-a-dir"), 0o600), ShouldBeNil)
+
+			content2 := []byte("full-init-fail-second")
+			digest2 := godigest.FromBytes(content2)
+			_, _, err = imgStore.FullBlobUpload(ctx, repo, bytes.NewReader(content2), digest2)
+			So(err, ShouldNotBeNil)
+		})
+	})
+}
+
 func TestPullRange(t *testing.T) {
 	Convey("Repo layout", t, func(c C) {
 		dir := t.TempDir()
 
 		log := zlog.NewTestLogger()
-		metrics := monitoring.NewMetricsServer(false, log)
+		metrics := monitoring.NewNopMetricServer()
 
 		Convey("Negative cases", func() {
 			cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
@@ -3494,7 +3963,7 @@ func TestStatIndex(t *testing.T) {
 	Convey("NewImageStore", t, func() {
 		dir := t.TempDir()
 		log := zlog.NewTestLogger()
-		metrics := monitoring.NewMetricsServer(false, log)
+		metrics := monitoring.NewNopMetricServer()
 		imgStore := local.NewImageStore(dir, true, true, log, metrics, nil, nil, nil, nil)
 
 		err := WriteImageToFileSystem(CreateRandomImage(), "repo", "tag",
@@ -3512,7 +3981,7 @@ func TestStorageDriverErr(t *testing.T) {
 	dir := t.TempDir()
 
 	log := zlog.NewTestLogger()
-	metrics := monitoring.NewMetricsServer(false, log)
+	metrics := monitoring.NewNopMetricServer()
 	cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
 		RootDir:     dir,
 		Name:        "cache",
@@ -3624,10 +4093,8 @@ func NewRandomImgManifest(data []byte, cdigest, ldigest godigest.Digest, cblob, 
 				Size:      int64(len(lblob)),
 			},
 		},
-		Annotations: annotationsMap,
-		Versioned: imeta.Versioned{
-			SchemaVersion: schemaVersion,
-		},
+		Annotations:   annotationsMap,
+		SchemaVersion: schemaVersion,
 	}
 
 	return &manifest, nil
@@ -3637,7 +4104,7 @@ func TestGetNextDigestWithBlobPathsPathNotFound(t *testing.T) {
 	Convey("GetNextDigestWithBlobPaths PathNotFoundError handling", t, func() {
 		dir := t.TempDir()
 		log := zlog.NewTestLogger()
-		metrics := monitoring.NewMetricsServer(false, log)
+		metrics := monitoring.NewNopMetricServer()
 		cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
 			RootDir:     dir,
 			Name:        "cache",
@@ -3664,7 +4131,7 @@ func TestGetNextDigestWithBlobPathsNestedRepo(t *testing.T) {
 	Convey("GetNextDigestWithBlobPaths must visit nested-namespace repositories", t, func() {
 		dir := t.TempDir()
 		log := zlog.NewTestLogger()
-		metrics := monitoring.NewMetricsServer(false, log)
+		metrics := monitoring.NewNopMetricServer()
 		cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
 			RootDir:     dir,
 			Name:        "cache",
@@ -3687,7 +4154,7 @@ func TestGetNextDigestWithBlobPathsNestedRepo(t *testing.T) {
 			So(err, ShouldBeNil)
 			So(os.WriteFile(path.Join(repoDir, ispec.ImageLayoutFile), ilBuf, storageConstants.DefaultFilePerms), ShouldBeNil)
 
-			idxBuf, err := json.Marshal(ispec.Index{Versioned: imeta.Versioned{SchemaVersion: 2}})
+			idxBuf, err := json.Marshal(ispec.Index{SchemaVersion: 2})
 			So(err, ShouldBeNil)
 			So(os.WriteFile(path.Join(repoDir, ispec.ImageIndexFile), idxBuf, storageConstants.DefaultFilePerms), ShouldBeNil)
 
@@ -3716,6 +4183,193 @@ func TestGetNextDigestWithBlobPathsNestedRepo(t *testing.T) {
 	})
 }
 
+func TestBlobPathsByDigest(t *testing.T) {
+	Convey("BlobPathsByDigest groups blob paths by digest, one listing per repo", t, func() {
+		dir := t.TempDir()
+		log := zlog.NewTestLogger()
+		metrics := monitoring.NewNopMetricServer()
+		cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
+			RootDir:     dir,
+			Name:        "cache",
+			UseRelPaths: true,
+		}, log)
+
+		imgStore := local.NewImageStore(dir, true, true, log, metrics, nil, cacheDriver, nil, nil)
+
+		shared := []byte("shared-blob-content")
+		pair := []byte("two-repo-blob-content")
+		onlyFirst := []byte("only-in-the-first-repo")
+		onlyLast := []byte("only-in-the-last-repo")
+
+		sharedDigest := godigest.FromBytes(shared)
+		pairDigest := godigest.FromBytes(pair)
+		onlyFirstDigest := godigest.FromBytes(onlyFirst)
+		onlyLastDigest := godigest.FromBytes(onlyLast)
+
+		// one repo is nested, to prove a namespace is handled like any other repo
+		layout := map[string][][]byte{
+			"aaa-repo": {shared, pair, onlyFirst},
+			"org/team": {shared},
+			"zzz-repo": {shared, pair, onlyLast},
+		}
+
+		for repo, blobs := range layout {
+			repoDir := path.Join(dir, repo)
+			So(os.MkdirAll(path.Join(repoDir, ispec.ImageBlobsDir), storageConstants.DefaultDirPerms), ShouldBeNil)
+
+			ilBuf, err := json.Marshal(ispec.ImageLayout{Version: ispec.ImageLayoutVersion})
+			So(err, ShouldBeNil)
+			So(os.WriteFile(path.Join(repoDir, ispec.ImageLayoutFile), ilBuf, storageConstants.DefaultFilePerms),
+				ShouldBeNil)
+
+			idxBuf, err := json.Marshal(ispec.Index{SchemaVersion: 2})
+			So(err, ShouldBeNil)
+			So(os.WriteFile(path.Join(repoDir, ispec.ImageIndexFile), idxBuf, storageConstants.DefaultFilePerms),
+				ShouldBeNil)
+
+			for _, blob := range blobs {
+				digest := godigest.FromBytes(blob)
+				blobPath := path.Join(repoDir, ispec.ImageBlobsDir, digest.Algorithm().String(), digest.Encoded())
+				So(os.MkdirAll(path.Dir(blobPath), storageConstants.DefaultDirPerms), ShouldBeNil)
+				So(os.WriteFile(blobPath, blob, storageConstants.DefaultFilePerms), ShouldBeNil)
+			}
+		}
+
+		repos, err := imgStore.GetRepositories()
+		So(err, ShouldBeNil)
+		So(len(repos), ShouldEqual, len(layout))
+
+		digests, blobPaths, err := storageCommon.BlobPathsByDigest(imgStore, repos, log)
+		So(err, ShouldBeNil)
+
+		// every digest collected exactly once, and the slice agrees with the map
+		So(len(digests), ShouldEqual, 4)
+		So(len(blobPaths), ShouldEqual, len(digests))
+
+		occurrences := map[godigest.Digest]int{}
+		for _, digest := range digests {
+			occurrences[digest]++
+			So(blobPaths, ShouldContainKey, digest)
+		}
+
+		for _, digest := range digests {
+			So(occurrences[digest], ShouldEqual, 1)
+		}
+
+		// path groups are complete, and single-copy blobs are included: the dedupe pass
+		// records a cache entry for those too, so dropping them would leave the cache short
+		So(len(blobPaths[sharedDigest]), ShouldEqual, 3)
+		So(len(blobPaths[pairDigest]), ShouldEqual, 2)
+		So(len(blobPaths[onlyFirstDigest]), ShouldEqual, 1)
+		So(len(blobPaths[onlyLastDigest]), ShouldEqual, 1)
+
+		// the paths are the real ones on disk
+		for _, blobPath := range blobPaths[sharedDigest] {
+			_, err := os.Stat(blobPath)
+			So(err, ShouldBeNil)
+		}
+
+		So(blobPaths[onlyFirstDigest][0], ShouldContainSubstring, "aaa-repo")
+		So(blobPaths[onlyLastDigest][0], ShouldContainSubstring, "zzz-repo")
+
+		// a file whose name is not a valid digest must be skipped rather than becoming a
+		// task that can never succeed
+		strayPath := path.Join(dir, "aaa-repo", ispec.ImageBlobsDir, "sha256", "not-a-valid-digest")
+		So(os.WriteFile(strayPath, []byte("junk"), storageConstants.DefaultFilePerms), ShouldBeNil)
+
+		withStray, strayPaths, err := storageCommon.BlobPathsByDigest(imgStore, repos, log)
+		So(err, ShouldBeNil)
+		So(len(withStray), ShouldEqual, 4)
+
+		for digest := range strayPaths {
+			So(digest.Validate(), ShouldBeNil)
+		}
+
+		So(os.Remove(strayPath), ShouldBeNil)
+
+		// a missing blobs directory must not curtail the rest of the listing
+		So(os.RemoveAll(path.Join(dir, "org/team", ispec.ImageBlobsDir)), ShouldBeNil)
+
+		afterRemoval, afterPaths, err := storageCommon.BlobPathsByDigest(imgStore, repos, log)
+		So(err, ShouldBeNil)
+		So(len(afterRemoval), ShouldEqual, 4)
+		So(len(afterPaths[sharedDigest]), ShouldEqual, 2)
+	})
+}
+
+func TestRunDedupeForDigestSkipsDeletedPaths(t *testing.T) {
+	Convey("A blob deleted after the listing must not fail the whole digest", t, func() {
+		newStore := func(dir string) storageTypes.ImageStore {
+			log := zlog.NewTestLogger()
+			metrics := monitoring.NewNopMetricServer()
+			cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
+				RootDir:     dir,
+				Name:        "cache",
+				UseRelPaths: true,
+			}, log)
+
+			return local.NewImageStore(dir, true, true, log, metrics, nil, cacheDriver, nil, nil)
+		}
+
+		content := []byte("blob-content-for-dedupe")
+		digest := godigest.FromBytes(content)
+
+		writeBlob := func(dir, repo string, body []byte) string {
+			blobPath := path.Join(dir, repo, ispec.ImageBlobsDir, digest.Algorithm().String(), digest.Encoded())
+			So(os.MkdirAll(path.Dir(blobPath), storageConstants.DefaultDirPerms), ShouldBeNil)
+			So(os.WriteFile(blobPath, body, storageConstants.DefaultFilePerms), ShouldBeNil)
+
+			return blobPath
+		}
+
+		Convey("dedupe direction", func() {
+			dir := t.TempDir()
+			imgStore := newStore(dir)
+
+			survivor := writeBlob(dir, "repo-keep", content)
+			deleted := writeBlob(dir, "repo-gone", content)
+			So(os.Remove(deleted), ShouldBeNil)
+
+			// the vanished path is listed first, which is what the old code choked on
+			err := imgStore.RunDedupeForDigest(context.Background(), digest, true, []string{deleted, survivor})
+			So(err, ShouldBeNil)
+		})
+
+		Convey("dedupe direction repairs a corrupt zero-size copy", func() {
+			dir := t.TempDir()
+			imgStore := newStore(dir)
+
+			corrupt := writeBlob(dir, "repo-corrupt", []byte{})
+			original := writeBlob(dir, "repo-original", content)
+
+			// a hardlink always holds the content, so a zero-size copy is not a placeholder:
+			// it is neither the origin nor skipped, and the origin gets linked over it
+			err := imgStore.RunDedupeForDigest(context.Background(), digest, true, []string{corrupt, original})
+			So(err, ShouldBeNil)
+
+			repaired, err := os.ReadFile(corrupt)
+			So(err, ShouldBeNil)
+			So(repaired, ShouldResemble, content)
+		})
+
+		Convey("restore direction, every path deleted", func() {
+			dir := t.TempDir()
+			imgStore := newStore(dir)
+
+			first := writeBlob(dir, "repo-one", content)
+			second := writeBlob(dir, "repo-two", []byte{})
+			So(os.Remove(first), ShouldBeNil)
+			So(os.Remove(second), ShouldBeNil)
+
+			// nothing survives, so there is nothing to restore. Failing here would stop the
+			// run reporting completion, which would wedge the restore marker.
+			err := imgStore.RunDedupeForDigest(context.Background(), digest, false,
+				[]string{first, second})
+			So(err, ShouldBeNil)
+		})
+	})
+}
+
 func newRandomBlobForFuzz(data []byte) (godigest.Digest, []byte, error) { //nolint:unparam
 	return godigest.FromBytes(data), data, nil
 }
@@ -3735,4 +4389,54 @@ func isKnownErr(err error) bool {
 	}
 
 	return false
+}
+
+func TestGetNextRepositoriesWithMissingLast(t *testing.T) {
+	dir := t.TempDir()
+	logBuf := &bytes.Buffer{}
+	log := zlog.NewLoggerWithWriter("debug", logBuf)
+	metrics := monitoring.NewNopMetricServer()
+	cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
+		RootDir:     dir,
+		Name:        "cache",
+		UseRelPaths: true,
+	}, log)
+
+	imgStore := local.NewImageStore(dir, true, true, log, metrics, nil, cacheDriver, nil, nil)
+	storeController := storage.StoreController{DefaultStore: imgStore}
+	image := CreateDefaultImage()
+
+	for _, repo := range []string{"a/z", "a-foo", "b"} {
+		if err := WriteImageToFileSystem(image, repo, "0.0.1", storeController); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	Convey("A last that is not a repo only returns repos that sort after it", t, func() {
+		repos, more, err := imgStore.GetNextRepositories("a.", 10, func(repo string) (bool, error) {
+			return true, nil
+		})
+		So(err, ShouldBeNil)
+		So(more, ShouldBeFalse)
+		So(repos, ShouldResemble, []string{"a/z", "b"})
+	})
+
+	Convey("A deleted last does not log a storage error", t, func() {
+		logBuf.Reset()
+		repos, more, err := imgStore.GetNextRepositories("a-bar", 10, func(repo string) (bool, error) {
+			return true, nil
+		})
+		So(err, ShouldBeNil)
+		So(more, ShouldBeFalse)
+		So(repos, ShouldResemble, []string{"a/z", "a-foo", "b"})
+		So(logBuf.String(), ShouldNotContainSubstring, "failed to read directory")
+	})
+
+	Convey("A last that is a repo keeps walk order after it", t, func() {
+		repos, _, err := imgStore.GetNextRepositories("a/z", 10, func(repo string) (bool, error) {
+			return true, nil
+		})
+		So(err, ShouldBeNil)
+		So(repos, ShouldResemble, []string{"a-foo", "b"})
+	})
 }

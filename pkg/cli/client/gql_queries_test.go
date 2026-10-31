@@ -16,23 +16,21 @@ import (
 )
 
 func TestGQLQueries(t *testing.T) {
-	port := test.GetFreePort()
-	baseURL := test.GetBaseURL(port)
 	conf := config.New()
-	conf.HTTP.Port = port
+	conf.HTTP.Port = "0"
 	dir := t.TempDir()
 	conf.Storage.RootDirectory = dir
 	defaultVal := true
 	conf.Extensions = &extconf.ExtensionConfig{
 		Search: &extconf.SearchConfig{
-			BaseConfig: extconf.BaseConfig{Enable: &defaultVal},
+			Enable: &defaultVal,
 		},
 	}
 
 	ctlr := api.NewController(conf)
 
 	cm := test.NewControllerManager(ctlr)
-	cm.StartAndWait(conf.HTTP.Port)
+	baseURL := cm.StartAndWait()
 
 	defer cm.StopServer()
 

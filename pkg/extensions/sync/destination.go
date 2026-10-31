@@ -138,6 +138,12 @@ func (registry *DestinationRegistry) CommitAll(repo string, imageReference ref.R
 			Err(err).Str("dir", repoDir).Str("repo", repo).
 			Msg("failed to get repo index from temp sync dir")
 
+		// Staging was non-empty but has no usable index — local layout failure.
+		// Do not return bare ErrRepoNotFound: on-demand treats that as a soft miss.
+		if errors.Is(err, zerr.ErrRepoNotFound) {
+			return fmt.Errorf("%w: %w", zerr.ErrRepoBadLayout, err)
+		}
+
 		return err
 	}
 
@@ -275,20 +281,14 @@ func (registry *DestinationRegistry) copyManifest(repo string, desc ispec.Descri
 			return err
 		}
 
-		var firstMissingErr error
-
 		for _, manifest := range indexManifest.Manifests {
 			reference := GetDescriptorReference(manifest)
 
 			manifestBuf, err := tempImageStore.GetBlobContent(repo, manifest.Digest)
 			if err != nil {
-				// Handle missing manifest blobs gracefully - log warning and continue with other manifests
+				// Sparse indexes: skip missing arch/attestation children and still commit the index.
 				var pathNotFoundErr driver.PathNotFoundError
 				if errors.Is(err, zerr.ErrBlobNotFound) || errors.As(err, &pathNotFoundErr) {
-					if firstMissingErr == nil {
-						firstMissingErr = err
-					}
-
 					registry.log.Warn().Err(err).Str("dir", path.Join(tempImageStore.RootDir(), repo)).
 						Str("digest", manifest.Digest.String()).
 						Msg("skipping missing manifest blob in image index, continuing sync with other manifests")
@@ -316,11 +316,6 @@ func (registry *DestinationRegistry) copyManifest(repo string, desc ispec.Descri
 
 				return err
 			}
-		}
-
-		// Return error if we encountered any missing manifests
-		if firstMissingErr != nil {
-			return firstMissingErr
 		}
 
 		// Referrers indexes are a transport convention in the temp ocidir layout; persist child
@@ -385,7 +380,7 @@ func (registry *DestinationRegistry) copyBlob(repo string, blobDigest godigest.D
 }
 
 // ocidirLayoutPath returns the on-disk OCI layout directory for a temp sync ref.
-// regclient may clear Path after mod.Apply while Reference still holds the ocidir URL.
+// regclient may clear Path while Reference still holds the ocidir URL.
 func ocidirLayoutPath(imageReference ref.Ref) (string, error) {
 	if imageReference.Path != "" {
 		return imageReference.Path, nil
@@ -439,7 +434,6 @@ func getImageStoreFromImageReference(repo string, imageReference ref.Ref, log lo
 }
 
 func getImageStore(rootDir string, log log.Logger) storageTypes.ImageStore {
-	metrics := monitoring.NewMetricsServer(false, log)
-
-	return local.NewImageStore(rootDir, false, false, log, metrics, nil, nil, nil, nil)
+	// Temp sync layouts are short-lived and don't need an active metrics server.
+	return local.NewImageStore(rootDir, false, false, log, monitoring.NewNopMetricServer(), nil, nil, nil, nil)
 }

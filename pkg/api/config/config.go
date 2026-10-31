@@ -18,6 +18,7 @@ import (
 	"zotregistry.dev/zot/v2/pkg/buildinfo"
 	"zotregistry.dev/zot/v2/pkg/compat"
 	extconf "zotregistry.dev/zot/v2/pkg/extensions/config"
+	eventsconf "zotregistry.dev/zot/v2/pkg/extensions/config/events"
 	storageConstants "zotregistry.dev/zot/v2/pkg/storage/constants"
 )
 
@@ -29,13 +30,21 @@ var (
 type StorageConfig struct {
 	RootDirectory   string
 	MaxRepos        int
+	MaxRepoBytes    int64
 	Dedupe          bool
 	RemoteCache     bool
 	RedirectBlobURL bool
-	GC              bool
-	Commit          bool
-	GCDelay         time.Duration // applied for blobs
-	GCInterval      time.Duration
+	// HydrateBlobOnRead restores the pre-conformance behavior where HEAD and ranged
+	// GET may call CheckBlob and hard-link a digest from this store's dedupe cache
+	// into the destination repository. The zero value (false) keeps blob reads
+	// repo-local via StatBlob (OCI AtomicDelete / distribution-spec). Explicit
+	// mounts via POST .../blobs/uploads/?mount= are unaffected. Only applies within
+	// a single store/substore (not across SubPaths).
+	HydrateBlobOnRead bool
+	GC                bool
+	Commit            bool
+	GCDelay           time.Duration // applied for blobs
+	GCInterval        time.Duration
 	// GCTimeWindow restricts periodic garbage-collection runs to a daily time-of-day
 	// window, e.g. "01:00-08:00". The zero value means GC can run at any time.
 	GCTimeWindow  GCTimeWindow
@@ -148,6 +157,25 @@ func (a *AuthConfig) IsBearerAuthEnabled() bool {
 // HasBearerConfig checks if Bearer authentication config is present.
 func (a *AuthConfig) HasBearerConfig() bool {
 	return a != nil && a.Bearer != nil
+}
+
+// HasBearerChallengeConfig checks if this auth config can build a complete
+// WWW-Authenticate Bearer challenge.
+func (a *AuthConfig) HasBearerChallengeConfig() bool {
+	return a != nil && a.Bearer != nil && a.Bearer.Realm != "" && a.Bearer.Service != ""
+}
+
+// ShouldAdvertiseBearerChallenge checks if clients should receive Bearer
+// challenges for one of the enabled token-consuming auth paths.
+func (a *AuthConfig) ShouldAdvertiseBearerChallenge() bool {
+	return a.HasBearerChallengeConfig() && (a.IsBearerAuthEnabled() || a.IsAPIKeyEnabled())
+}
+
+// ShouldInitializeBearerAuth checks if the API layer needs BearerAuth.
+// API-key-only deployments use BearerAuth for wrapped credentials and token
+// exchange, but only when a complete Bearer challenge can be advertised.
+func (a *AuthConfig) ShouldInitializeBearerAuth() bool {
+	return a.IsBearerAuthEnabled() || (a.IsAPIKeyEnabled() && a.ShouldAdvertiseBearerChallenge())
 }
 
 // IsTraditionalBearerAuthEnabled checks if traditional Bearer authentication is enabled in this auth config.
@@ -343,6 +371,7 @@ type OpenIDProviderConfig struct {
 	ClientSecret    string
 	KeyPath         string
 	Issuer          string
+	DiscoveryURL    string
 	AuthURL         string
 	TokenURL        string
 	Scopes          []string
@@ -545,11 +574,33 @@ type GlobalStorageConfig struct {
 	FastRestart *bool `mapstructure:",omitempty"`
 }
 
+// LargestGCDelay returns the largest GCDelay across the default store and substores,
+// falling back to DefaultGCDelay when none is configured.
+func (g GlobalStorageConfig) LargestGCDelay() time.Duration {
+	maxDelay := g.GCDelay
+
+	for _, sub := range g.SubPaths {
+		if sub.GCDelay > maxDelay {
+			maxDelay = sub.GCDelay
+		}
+	}
+
+	if maxDelay <= 0 {
+		return storageConstants.DefaultGCDelay
+	}
+
+	return maxDelay
+}
+
 type AccessControlConfig struct {
 	Repositories Repositories `json:"repositories" mapstructure:"repositories"`
 	AdminPolicy  Policy
 	Groups       Groups
 	Metrics      Metrics
+
+	// DisableAnonymousCatalog rejects unauthenticated requests to /v2/_catalog
+	// with 401, even if an anonymousPolicy would otherwise allow listing.
+	DisableAnonymousCatalog bool `json:"disableAnonymousCatalog" mapstructure:"disableAnonymousCatalog"`
 
 	// compiledConditions caches CEL programs for all policy condition
 	// expressions present in this access-control config, keyed by expression
@@ -674,6 +725,11 @@ func (config *AccessControlConfig) GetAdminPolicy() Policy {
 	}
 
 	return config.AdminPolicy
+}
+
+// IsAnonymousCatalogDisabled reports whether anonymous access to the catalog API is disabled.
+func (config *AccessControlConfig) IsAnonymousCatalogDisabled() bool {
+	return config != nil && config.DisableAnonymousCatalog
 }
 
 // GetMetrics safely gets a copy of the metrics configuration.
@@ -838,7 +894,9 @@ func New() *Config {
 
 func (expConfig StorageConfig) ParamsEqual(actConfig StorageConfig) bool {
 	return expConfig.GC == actConfig.GC && expConfig.Dedupe == actConfig.Dedupe &&
-		expConfig.RedirectBlobURL == actConfig.RedirectBlobURL && expConfig.GCDelay == actConfig.GCDelay &&
+		expConfig.RedirectBlobURL == actConfig.RedirectBlobURL &&
+		expConfig.HydrateBlobOnRead == actConfig.HydrateBlobOnRead &&
+		expConfig.GCDelay == actConfig.GCDelay &&
 		expConfig.GCInterval == actConfig.GCInterval && expConfig.GCTimeWindow == actConfig.GCTimeWindow
 }
 
@@ -1027,6 +1085,7 @@ func (c *Config) Sanitize() *Config {
 					ClientSecret: "******",
 					KeyPath:      config.KeyPath,
 					Issuer:       config.Issuer,
+					DiscoveryURL: config.DiscoveryURL,
 					AuthURL:      config.AuthURL,
 					TokenURL:     config.TokenURL,
 					Scopes:       config.Scopes,
@@ -1073,6 +1132,7 @@ func (c *Config) UpdateReloadableConfig(newConfig *Config) {
 	c.Storage.GC = newConfig.Storage.GC
 	c.Storage.Dedupe = newConfig.Storage.Dedupe
 	c.Storage.RedirectBlobURL = newConfig.Storage.RedirectBlobURL
+	c.Storage.HydrateBlobOnRead = newConfig.Storage.HydrateBlobOnRead
 	c.Storage.GCDelay = newConfig.Storage.GCDelay
 	c.Storage.GCInterval = newConfig.Storage.GCInterval
 	c.Storage.GCTimeWindow = newConfig.Storage.GCTimeWindow
@@ -1092,6 +1152,7 @@ func (c *Config) UpdateReloadableConfig(newConfig *Config) {
 		subPathConfig.GC = storageConfig.GC
 		subPathConfig.Dedupe = storageConfig.Dedupe
 		subPathConfig.RedirectBlobURL = storageConfig.RedirectBlobURL
+		subPathConfig.HydrateBlobOnRead = storageConfig.HydrateBlobOnRead
 		subPathConfig.GCDelay = storageConfig.GCDelay
 		subPathConfig.GCInterval = storageConfig.GCInterval
 		subPathConfig.GCTimeWindow = storageConfig.GCTimeWindow
@@ -1127,6 +1188,7 @@ func (c *Config) UpdateReloadableConfig(newConfig *Config) {
 		c.HTTP.AccessControl.AdminPolicy = newConfig.HTTP.AccessControl.AdminPolicy
 		c.HTTP.AccessControl.Metrics = newConfig.HTTP.AccessControl.Metrics
 		c.HTTP.AccessControl.Groups = newConfig.HTTP.AccessControl.Groups
+		c.HTTP.AccessControl.DisableAnonymousCatalog = newConfig.HTTP.AccessControl.DisableAnonymousCatalog
 	}
 
 	// Initialize and update ExtensionConfig
@@ -1157,7 +1219,26 @@ func (c *Config) UpdateReloadableConfig(newConfig *Config) {
 
 		// Update scrub extension
 		c.Extensions.Scrub = newConfig.Extensions.Scrub
+
+		// Update events extension
+		c.Extensions.Events = newConfig.Extensions.Events
 	}
+}
+
+// SnapshotJSON returns the config serialized under the read lock with secrets
+// left unmasked, for callers that compare two configs and report only which
+// fields differ. It is a view, not a clone: whatever JSON does not carry is
+// absent, session keys and ldap bind credentials among it. Use Sanitize for
+// anything shown to a user, and the Copy* accessors for real values.
+func (c *Config) SnapshotJSON() ([]byte, error) {
+	if c == nil {
+		return nil, nil
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return json.Marshal(c)
 }
 
 // CopyAuthConfig returns a copy of the auth config if it exists.
@@ -1242,6 +1323,26 @@ func (c *Config) IsBlobRedirectEnabled(storePath string) bool {
 	return c.Storage.RedirectBlobURL
 }
 
+// IsHydrateBlobOnReadEnabled returns whether HEAD / ranged GET may hydrate blobs
+// from this store's dedupe cache into the destination repository. If a matching
+// subpath exists, its setting takes precedence over the global one.
+func (c *Config) IsHydrateBlobOnReadEnabled(storePath string) bool {
+	if c == nil {
+		return false
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if storePath != "/" {
+		if subPathConfig, ok := c.Storage.SubPaths[storePath]; ok {
+			return subPathConfig.HydrateBlobOnRead
+		}
+	}
+
+	return c.Storage.HydrateBlobOnRead
+}
+
 // CopyExtensionsConfig returns a copy of the extensions config if it exists.
 func (c *Config) CopyExtensionsConfig() *extconf.ExtensionConfig {
 	if c == nil {
@@ -1260,6 +1361,30 @@ func (c *Config) CopyExtensionsConfig() *extconf.ExtensionConfig {
 	_ = deepcopy.Copy(extensionsCopy, c.Extensions)
 
 	return extensionsCopy
+}
+
+// SyncStagingDownloadDir returns extensions.sync.downloadDir when configured.
+func (c *Config) SyncStagingDownloadDir() string {
+	if c == nil {
+		return ""
+	}
+
+	extensionsConfig := c.CopyExtensionsConfig()
+	if extensionsConfig == nil {
+		return ""
+	}
+
+	return extensionsConfig.SyncStagingDownloadDir()
+}
+
+// LargestSyncTimeout returns the largest configured sync registry timeout.
+func (c *Config) LargestSyncTimeout() time.Duration {
+	var extensionsConfig *extconf.ExtensionConfig
+	if c != nil {
+		extensionsConfig = c.CopyExtensionsConfig()
+	}
+
+	return extensionsConfig.LargestSyncTimeout()
 }
 
 // CopyLogConfig returns a copy of the log config if it exists.
@@ -1438,6 +1563,35 @@ func (c *Config) StorageFingerprint() string {
 	return hex.EncodeToString(sum[:])
 }
 
+// EventsFingerprint returns a stable SHA-256 of the events extension config.
+func (c *Config) EventsFingerprint() string {
+	if c == nil {
+		return ""
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.Extensions == nil || c.Extensions.Events == nil {
+		return ""
+	}
+
+	var norm eventsconf.Config
+	if err := DeepCopy(c.Extensions.Events, &norm); err != nil {
+		return ""
+	}
+
+	// encoding/json sorts map keys, so the serialization is deterministic across restarts.
+	blob, err := json.Marshal(norm)
+	if err != nil {
+		return ""
+	}
+
+	sum := sha256.Sum256(blob)
+
+	return hex.EncodeToString(sum[:])
+}
+
 // GetCompat returns a copy of the compatibility config.
 func (c *Config) GetCompat() []compat.MediaCompatibility {
 	if c == nil {
@@ -1546,6 +1700,19 @@ func (c *Config) IsMTLSAuthEnabled() bool {
 	return false
 }
 
+// IsAuthnEnabled checks if any authentication method is enabled. mTLS is detected the same way the
+// authn middleware detects it (TLS with a client CA), not by the presence of an http.auth.mtls block,
+// so guards keyed on this cannot fail open for mTLS-only deployments that omit that block.
+func (c *Config) IsAuthnEnabled() bool {
+	if c == nil {
+		return false
+	}
+
+	authConfig := c.CopyAuthConfig()
+
+	return authConfig.IsBasicAuthnEnabled() || authConfig.IsBearerAuthEnabled() || c.IsMTLSAuthEnabled()
+}
+
 // IsRetentionEnabled checks if tags retention is enabled.
 func (c *Config) IsRetentionEnabled() bool {
 	if c == nil {
@@ -1566,7 +1733,37 @@ func (c *Config) IsQuotaEnabled() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	return c.Storage.MaxRepos > 0
+	if c.Storage.MaxRepos > 0 || c.Storage.MaxRepoBytes > 0 {
+		return true
+	}
+
+	for _, subStorageConfig := range c.Storage.SubPaths {
+		if subStorageConfig.MaxRepoBytes > 0 {
+			return true
+		}
+	}
+
+	return false
+}
+
+// MaxRepoBytesForStore returns the logical byte quota for a store path.
+// A matching subPath overrides the top-level value, including with zero.
+// Changes to this setting are startup-only, like maxRepos.
+func (c *Config) MaxRepoBytesForStore(storePath string) int64 {
+	if c == nil {
+		return 0
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if storePath != "/" {
+		if subStorageConfig, ok := c.Storage.SubPaths[storePath]; ok {
+			return subStorageConfig.MaxRepoBytes
+		}
+	}
+
+	return c.Storage.MaxRepoBytes
 }
 
 // IsCompatEnabled checks if compatibility mode is enabled.
@@ -1579,6 +1776,15 @@ func (c *Config) IsCompatEnabled() bool {
 	defer c.mu.RUnlock()
 
 	return len(c.HTTP.Compat) > 0
+}
+
+// IsDockerCompatEnabled reports whether http.compat includes docker2s2.
+func (c *Config) IsDockerCompatEnabled() bool {
+	if c == nil {
+		return false
+	}
+
+	return slices.Contains(c.GetCompat(), compat.DockerManifestV2SchemaV2)
 }
 
 // UseSecureSession returns whether cookies should have the Secure flag set.

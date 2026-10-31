@@ -6,11 +6,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/url"
+	"strings"
 
 	godigest "github.com/opencontainers/go-digest"
 	"github.com/regclient/regclient"
 	"github.com/regclient/regclient/config"
 	"github.com/regclient/regclient/scheme"
+	"github.com/regclient/regclient/types/descriptor"
 	"github.com/regclient/regclient/types/errs"
 	"github.com/regclient/regclient/types/manifest"
 	"github.com/regclient/regclient/types/ref"
@@ -78,6 +82,8 @@ func (registry *RemoteRegistry) getRepoList(ctx context.Context, hostname string
 	}
 
 	last := ""
+	seen := map[string]struct{}{}
+	linkPagination := false
 
 	for {
 		repoOpts := []scheme.RepoOpts{}
@@ -96,16 +102,111 @@ func (registry *RemoteRegistry) getRepoList(ctx context.Context, hostname string
 			return repositories, err
 		}
 
-		if len(repoList) == 0 || last == repoList[len(repoList)-1] {
-			break
+		headers, _ := clientRepoList.RawHeaders() // never returns an error
+
+		// Follow the Link header cursor: registries such as AWS ECR use an opaque
+		// token there and reject a repository name as `last`.
+		next, hasLink := nextCatalogLast(headers)
+
+		switch {
+		case hasLink:
+			linkPagination = true
+		case linkPagination: // no rel="next": last page
+			return append(repositories, repoList...), nil
+		case len(repoList) == 0, last == repoList[len(repoList)-1]:
+			return repositories, nil
+		default: // no rel="next" link seen: use the last repository name as the cursor
+			next = repoList[len(repoList)-1]
 		}
 
 		repositories = append(repositories, repoList...)
 
-		last = repoList[len(repoList)-1]
+		if next == "" {
+			registry.log.Warn().Str("remote", hostname).
+				Msg("catalog next link has no last parameter, repository list may be incomplete")
+
+			return repositories, nil
+		}
+
+		if _, ok := seen[next]; ok {
+			return repositories, nil
+		}
+
+		seen[next] = struct{}{}
+		last = next
+	}
+}
+
+// nextCatalogLast returns the `last` query parameter of the rel="next" Link, if any.
+func nextCatalogLast(headers http.Header) (string, bool) {
+	for _, value := range headers.Values("Link") {
+		for _, link := range splitLinkHeader(value, ',') {
+			params := splitLinkHeader(link, ';')
+			target := strings.TrimSpace(params[0])
+
+			if len(target) < 2 || target[0] != '<' || target[len(target)-1] != '>' || !hasNextRel(params[1:]) {
+				continue
+			}
+
+			// An unusable query yields "", which the caller reports as a missing cursor.
+			_, rawQuery, _ := strings.Cut(target[1:len(target)-1], "?")
+			query, _ := url.ParseQuery(rawQuery)
+
+			return query.Get("last"), true
+		}
 	}
 
-	return repositories, nil
+	return "", false
+}
+
+// hasNextRel reports whether the first rel link-param (RFC 8288 section 3.3) includes "next".
+func hasNextRel(params []string) bool {
+	for _, param := range params {
+		name, value, _ := strings.Cut(param, "=")
+		if !strings.EqualFold(strings.TrimSpace(name), "rel") {
+			continue
+		}
+
+		for rel := range strings.FieldsSeq(strings.Trim(strings.TrimSpace(value), `"`)) {
+			if strings.EqualFold(rel, "next") {
+				return true
+			}
+		}
+
+		return false
+	}
+
+	return false
+}
+
+// splitLinkHeader splits a Link header on sep, ignoring separators inside <URI> and quoted strings.
+func splitLinkHeader(value string, sep byte) []string {
+	var (
+		parts                  []string
+		start                  int
+		inURI, quoted, escaped bool
+	)
+
+	for i := range len(value) {
+		switch char := value[i]; {
+		case escaped:
+			escaped = false
+		case quoted:
+			escaped = char == '\\'
+			quoted = char != '"'
+		case inURI:
+			inURI = char != '>'
+		case char == '"':
+			quoted = true
+		case char == '<':
+			inURI = true
+		case char == sep:
+			parts = append(parts, value[start:i])
+			start = i + 1
+		}
+	}
+
+	return append(parts, value[start:])
 }
 
 func (registry *RemoteRegistry) GetImageReference(repo, reference string) (ref.Ref, error) {
@@ -121,6 +222,13 @@ func (registry *RemoteRegistry) GetImageReference(repo, reference string) (ref.R
 
 	imageRef, err := ref.New(imageRefPath)
 	if err != nil {
+		// Unusable configured host (empty, absolute path, …) is a registry config
+		// failure → ErrSyncParseRemoteRepo (weak). Client/reference parse failures
+		// stay as ErrInvalidReference (soft on-demand miss → 404, not opaque 503).
+		if isInvalidRemoteHost(registry.primaryHost) {
+			return ref.Ref{}, fmt.Errorf("%w: %w", zerr.ErrSyncParseRemoteRepo, err)
+		}
+
 		return ref.Ref{}, err
 	}
 
@@ -133,75 +241,123 @@ func (registry *RemoteRegistry) GetImageReference(repo, reference string) (ref.R
 	return imageRef, nil
 }
 
-// translateManifestErr maps regclient manifest fetch errors to zot errors for sync/on-demand callers.
-func (registry *RemoteRegistry) translateManifestErr(imageReference ref.Ref, err error) error {
+// isInvalidRemoteHost reports whether host cannot form any valid registry image
+// reference, independent of the client repo/tag.
+func isInvalidRemoteHost(host string) bool {
+	// ref.New returns the same ErrInvalidReference for a bad host and a bad
+	// client repo/tag, so probe with a fixed valid path: if this fails, the
+	// host itself is unusable; if it succeeds, a later failure is the client ref.
+	_, err := ref.New(host + "/library/probe:latest")
+
+	return err != nil
+}
+
+// mapRegclientManifestErr maps regclient manifest fetch failures to zot errors so
+// sync skippable/unresolved allowlists stay zot-only. All Remote manifest helpers
+// (HeadManifest, HeadManifestRef, GetManifestList) must return errors through this
+// path via translateManifestErr.
+func mapRegclientManifestErr(err error) error {
 	if err == nil {
 		return nil
 	}
 
-	/* public registries may return 401 for image not found
-	they will try to check private registries as a fallback => 401 */
 	if errors.Is(err, errs.ErrHTTPUnauthorized) {
-		registry.log.Info().Str("errorType", common.TypeOf(err)).
-			Str("repository", imageReference.Repository).Str("reference", imageReference.Reference).
-			Err(err).Msg("failed to get manifest: unauthorized")
-
 		return zerr.ErrUnauthorizedAccess
 	}
 
 	if errors.Is(err, errs.ErrNotFound) {
-		registry.log.Info().Str("errorType", common.TypeOf(err)).
-			Str("repository", imageReference.Repository).Str("reference", imageReference.Reference).
-			Err(err).Msg("failed to find manifest")
-
 		return zerr.ErrManifestNotFound
 	}
 
 	return err
 }
 
-func (registry *RemoteRegistry) headManifest(ctx context.Context, imageReference ref.Ref,
-) (manifest.Manifest, error) {
-	man, err := registry.client.ManifestHead(ctx, imageReference)
-	if err != nil {
-		return nil, registry.translateManifestErr(imageReference, err)
+// translateManifestErr maps regclient manifest fetch errors to zot errors for sync/on-demand callers.
+func (registry *RemoteRegistry) translateManifestErr(imageReference ref.Ref, err error) error {
+	mapped := mapRegclientManifestErr(err)
+
+	// Log when mapRegclientManifestErr introduced a zot sentinel. Identity "=="
+	// is forbidden by err113; detect remapping by sentinel presence on mapped
+	// that was absent on err.
+	remapped := (errors.Is(mapped, zerr.ErrUnauthorizedAccess) && !errors.Is(err, zerr.ErrUnauthorizedAccess)) ||
+		(errors.Is(mapped, zerr.ErrManifestNotFound) && !errors.Is(err, zerr.ErrManifestNotFound))
+	if remapped {
+		registry.log.Info().Str("errorType", common.TypeOf(err)).
+			Str("repository", imageReference.Repository).Str("reference", imageReference.Reference).
+			Err(err).Msg("failed to get remote manifest")
 	}
 
-	return man, nil
+	return mapped
 }
 
-func (registry *RemoteRegistry) GetDigest(ctx context.Context, repo, tag string,
-) (godigest.Digest, error) {
+// HeadManifest returns the remote digest and media type for repo:tag.
+// Tries ManifestHead first; on not-found falls back to ManifestGet so registries that
+// materialize tags on GET but not HEAD (e.g. some ECR pull-through caches) still work.
+// Transport / dial failures are returned immediately — a second ManifestGet would only
+// repeat the same backoff (see TestOnDemandMultipleImage).
+func (registry *RemoteRegistry) HeadManifest(ctx context.Context, repo, tag string,
+) (godigest.Digest, string, error) {
 	imageReference, err := registry.GetImageReference(repo, tag)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
-	man, err := registry.headManifest(ctx, imageReference)
+	return registry.HeadManifestRef(ctx, imageReference)
+}
+
+// HeadManifestRef is HeadManifest for an already-built remote ref.
+func (registry *RemoteRegistry) HeadManifestRef(ctx context.Context, imageReference ref.Ref,
+) (godigest.Digest, string, error) {
+	man, err := registry.client.ManifestHead(ctx, imageReference)
 	if err != nil {
-		return "", err
+		if !shouldFallbackManifestGet(err) {
+			return "", "", registry.translateManifestErr(imageReference, err)
+		}
+
+		man, err = registry.client.ManifestGet(ctx, imageReference)
+		if err != nil {
+			return "", "", registry.translateManifestErr(imageReference, err)
+		}
 	}
 	defer registry.client.Close(ctx, man.GetRef())
 
-	return man.GetDescriptor().Digest, nil
+	desc := man.GetDescriptor()
+
+	return desc.Digest, desc.MediaType, nil
 }
 
-// GetOCIDigest returns the digest predictOCIDigest computes after regclient
-// mod.WithManifestToOCI conversion, the original remote digest, and whether
-// mod.Apply would modify the image.
-func (registry *RemoteRegistry) GetOCIDigest(ctx context.Context, repo, tag string,
-) (godigest.Digest, godigest.Digest, bool, error) {
-	imageReference, err := registry.GetImageReference(repo, tag)
+// GetManifestList returns child descriptors when reference is an index/manifest list.
+// Non-list images return nil, nil. Errors are mapped via translateManifestErr.
+func (registry *RemoteRegistry) GetManifestList(ctx context.Context, repo, reference string,
+) ([]descriptor.Descriptor, error) {
+	imageReference, err := registry.GetImageReference(repo, reference)
 	if err != nil {
-		return "", "", false, err
+		return nil, err
 	}
 
-	predicted, original, isConverted, err := predictOCIDigest(ctx, registry.client, imageReference)
+	man, err := registry.client.ManifestGet(ctx, imageReference)
 	if err != nil {
-		return "", "", false, registry.translateManifestErr(imageReference, err)
+		return nil, registry.translateManifestErr(imageReference, err)
+	}
+	defer registry.client.Close(ctx, man.GetRef())
+
+	if !man.IsList() {
+		return nil, nil
 	}
 
-	return predicted, original, isConverted, nil
+	indexer, ok := man.(manifest.Indexer)
+	if !ok {
+		return nil, nil
+	}
+
+	return indexer.GetManifestList()
+}
+
+// shouldFallbackManifestGet reports whether a ManifestHead failure is worth retrying
+// with ManifestGet (not-found / not-materialized). Connection and other transport
+// errors are not — GET would pay another full regclient backoff.
+func shouldFallbackManifestGet(err error) bool {
+	return errors.Is(err, errs.ErrNotFound)
 }
 
 func (registry *RemoteRegistry) GetTags(ctx context.Context, repo string) ([]string, error) {

@@ -6,10 +6,15 @@ import (
 	"zotregistry.dev/zot/v2/pkg/api/config"
 	"zotregistry.dev/zot/v2/pkg/api/constants"
 	"zotregistry.dev/zot/v2/pkg/buildinfo"
+	"zotregistry.dev/zot/v2/pkg/extensions/sync"
 	"zotregistry.dev/zot/v2/pkg/log"
 	mTypes "zotregistry.dev/zot/v2/pkg/meta/types"
 	"zotregistry.dev/zot/v2/pkg/scheduler"
+	"zotregistry.dev/zot/v2/pkg/storage"
 )
+
+// SyncOnDemand is the on-demand sync handler exposed to the API layer.
+type SyncOnDemand sync.OnDemand
 
 func GetExtensions(config *config.Config) distext.ExtensionList {
 	extensionList := distext.ExtensionList{}
@@ -58,6 +63,8 @@ func EnableScheduledTasks(conf *config.Config, taskScheduler *scheduler.Schedule
 	EnableImageTrustVerification(conf, taskScheduler, metaDB, log)
 }
 
-func SetupExtensions(conf *config.Config, metaDB mTypes.MetaDB, log log.Logger) error {
-	return SetupImageTrustExtension(conf, metaDB, log)
+func SetupExtensions(conf *config.Config, metaDB mTypes.MetaDB, storeController storage.StoreController,
+	log log.Logger,
+) error {
+	return SetupImageTrustExtension(conf, metaDB, storeController, log)
 }

@@ -22,7 +22,6 @@ import (
 	"zotregistry.dev/zot/v2/pkg/meta/redis"
 	mTypes "zotregistry.dev/zot/v2/pkg/meta/types"
 	reqCtx "zotregistry.dev/zot/v2/pkg/requestcontext"
-	test "zotregistry.dev/zot/v2/pkg/test/common"
 	. "zotregistry.dev/zot/v2/pkg/test/image-utils"
 )
 
@@ -32,9 +31,9 @@ var ErrTestError = errors.New("TestError")
 
 type imgTrustStore struct{}
 
-func (its imgTrustStore) VerifySignature(
-	signatureType string, rawSignature []byte, sigKey string, manifestDigest godigest.Digest, imageMeta mTypes.ImageMeta,
-	repo string,
+func (its imgTrustStore) VerifySignatureLayer(
+	signatureType string, layerDigest godigest.Digest, sigKey string, manifestDigest godigest.Digest,
+	imageMeta mTypes.ImageMeta, repo string,
 ) (mTypes.Author, mTypes.ExpiryDate, mTypes.Validity, error) {
 	return "", time.Time{}, false, nil
 }
@@ -422,7 +421,8 @@ func TestRedisUnreachable(t *testing.T) {
 		So(err, ShouldBeNil)
 		So(metaDB, ShouldNotBeNil)
 
-		connOpts, err = goredis.ParseURL("redis://127.0.0.1:" + test.GetFreePort())
+		// Port 0 is never a bound listener, so a parallel test cannot place a Redis there.
+		connOpts, err = goredis.ParseURL("redis://127.0.0.1:0")
 		So(err, ShouldBeNil)
 		brokenClient := goredis.NewClient(connOpts)
 		defer brokenClient.Close()

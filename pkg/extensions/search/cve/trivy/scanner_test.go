@@ -5,6 +5,7 @@ package trivy_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -29,9 +30,32 @@ import (
 	. "zotregistry.dev/zot/v2/pkg/test/common"
 	. "zotregistry.dev/zot/v2/pkg/test/image-utils"
 	"zotregistry.dev/zot/v2/pkg/test/mocks"
+	"zotregistry.dev/zot/v2/pkg/test/trivycache"
 )
 
 var ErrTestError = errors.New("test error")
+
+// dbSource downloads the vulnerability and Java databases through Scanner.UpdateDB.
+type dbSource struct{}
+
+func (dbSource) Download(cacheRoot string) error {
+	logger := log.NewTestLogger()
+	imageStore := local.NewImageStore(cacheRoot, false, false,
+		logger, monitoring.NewNopMetricServer(), nil, nil, nil, nil)
+
+	scanner := trivy.NewScanner(storage.StoreController{DefaultStore: imageStore}, nil, &extconf.CVEConfig{
+		Trivy: &extconf.TrivyConfig{
+			DBRepository:     "ghcr.io/project-zot/trivy-db",
+			JavaDBRepository: "ghcr.io/project-zot/trivy-java-db",
+		},
+	}, logger)
+
+	if err := scanner.UpdateDB(context.Background()); err != nil {
+		return fmt.Errorf("update trivy test databases: %w", err)
+	}
+
+	return nil
+}
 
 func TestScanBigTestFile(t *testing.T) {
 	Convey("Scan zot-test", t, func() {
@@ -47,7 +71,7 @@ func TestScanBigTestFile(t *testing.T) {
 		conf.Storage.RootDirectory = tempDir
 		conf.Extensions = &extconf.ExtensionConfig{
 			Search: &extconf.SearchConfig{
-				BaseConfig: extconf.BaseConfig{Enable: &defaultVal},
+				Enable: &defaultVal,
 			},
 		}
 		ctlr := api.NewController(conf)
@@ -66,8 +90,7 @@ func TestScanBigTestFile(t *testing.T) {
 			},
 		}, ctlr.Log)
 
-		err = scanner.UpdateDB(context.Background())
-		So(err, ShouldBeNil)
+		trivycache.Install(t, tempDir, false, dbSource{})
 
 		scanResult, err := scanner.ScanImage(context.Background(), "zot-test:0.0.1")
 		cveMap := scanResult.CVEMap
@@ -86,7 +109,7 @@ func TestScanningByDigest(t *testing.T) {
 		conf.Storage.RootDirectory = tempDir
 		conf.Extensions = &extconf.ExtensionConfig{
 			Search: &extconf.SearchConfig{
-				BaseConfig: extconf.BaseConfig{Enable: &defaultVal},
+				Enable: &defaultVal,
 			},
 		}
 		ctlr := api.NewController(conf)
@@ -115,8 +138,7 @@ func TestScanningByDigest(t *testing.T) {
 
 		ctx := context.Background()
 
-		err = scanner.UpdateDB(ctx)
-		So(err, ShouldBeNil)
+		trivycache.Install(t, tempDir, false, dbSource{})
 
 		scanResult, err := scanner.ScanImage(ctx, "multi-arch@"+vulnImage.DigestStr())
 		cveMap := scanResult.CVEMap
@@ -156,11 +178,9 @@ func TestVulnerableLayer(t *testing.T) {
 		So(err, ShouldBeNil)
 
 		config := ispec.Image{
-			Created: &created,
-			Platform: ispec.Platform{
-				Architecture: "amd64",
-				OS:           "linux",
-			},
+			Created:      &created,
+			Architecture: "amd64",
+			OS:           "linux",
 			Config: ispec.ImageConfig{
 				Env: []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"},
 				Cmd: []string{"/bin/sh"},
@@ -180,7 +200,7 @@ func TestVulnerableLayer(t *testing.T) {
 
 		log := log.NewTestLogger()
 		imageStore := local.NewImageStore(tempDir, false, false,
-			log, monitoring.NewMetricsServer(false, log), nil, nil, nil, nil)
+			log, monitoring.NewNopMetricServer(), nil, nil, nil, nil)
 
 		storeController := storage.StoreController{
 			DefaultStore: imageStore,
@@ -207,8 +227,7 @@ func TestVulnerableLayer(t *testing.T) {
 			},
 		}, log)
 
-		err = scanner.UpdateDB(context.Background())
-		So(err, ShouldBeNil)
+		trivycache.Install(t, tempDir, false, dbSource{})
 
 		scanResult, err := scanner.ScanImage(context.Background(), "repo@"+img.DigestStr())
 		cveMap := scanResult.CVEMap
@@ -233,11 +252,9 @@ func TestVulnerableLayer(t *testing.T) {
 		So(err, ShouldBeNil)
 
 		config := ispec.Image{
-			Created: &created,
-			Platform: ispec.Platform{
-				Architecture: "amd64",
-				OS:           "linux",
-			},
+			Created:      &created,
+			Architecture: "amd64",
+			OS:           "linux",
 			Config: ispec.ImageConfig{
 				Env: []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"},
 			},
@@ -256,7 +273,7 @@ func TestVulnerableLayer(t *testing.T) {
 
 		log := log.NewTestLogger()
 		imageStore := local.NewImageStore(tempDir, false, false,
-			log, monitoring.NewMetricsServer(false, log), nil, nil, nil, nil)
+			log, monitoring.NewNopMetricServer(), nil, nil, nil, nil)
 
 		storeController := storage.StoreController{
 			DefaultStore: imageStore,
@@ -284,8 +301,7 @@ func TestVulnerableLayer(t *testing.T) {
 			},
 		}, log)
 
-		err = scanner.UpdateDB(context.Background())
-		So(err, ShouldBeNil)
+		trivycache.Install(t, tempDir, true, dbSource{})
 
 		scanResult, err := scanner.ScanImage(context.Background(), "repo@"+img.DigestStr())
 		cveMap := scanResult.CVEMap
@@ -318,11 +334,9 @@ func TestWithTempDirErrorHandling(t *testing.T) {
 		So(err, ShouldBeNil)
 
 		config := ispec.Image{
-			Created: &created,
-			Platform: ispec.Platform{
-				Architecture: "amd64",
-				OS:           "linux",
-			},
+			Created:      &created,
+			Architecture: "amd64",
+			OS:           "linux",
 			Config: ispec.ImageConfig{
 				Env: []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"},
 				Cmd: []string{"/bin/sh"},
@@ -342,7 +356,7 @@ func TestWithTempDirErrorHandling(t *testing.T) {
 
 		log := log.NewTestLogger()
 		imageStore := local.NewImageStore(tempDir, false, false,
-			log, monitoring.NewMetricsServer(false, log), nil, nil, nil, nil)
+			log, monitoring.NewNopMetricServer(), nil, nil, nil, nil)
 
 		storeController := storage.StoreController{
 			DefaultStore: imageStore,
@@ -396,12 +410,9 @@ func TestWithTempDirErrorHandling(t *testing.T) {
 		_, err = os.Stat(tempDirPath)
 		So(err, ShouldNotBeNil)
 
-		err = scanner.UpdateDB(context.Background())
-		So(err, ShouldBeNil)
-
-		// Verify temp directory no longer exists
-		_, err = os.Stat(tempDirPath)
-		So(err, ShouldNotBeNil)
+		// The scans below need a database. A second UpdateDB would download it
+		// again; TestTrivyDBUrl already covers that success path.
+		trivycache.Install(t, tempDir, false, dbSource{})
 
 		// Test scan with no permissions on temp directory
 		// Ensure directory exists again after cleanup (xos.Cleanup() removed it)
@@ -516,4 +527,41 @@ func TestScannerErrors(t *testing.T) {
 			So(err, ShouldNotBeNil)
 		})
 	})
+}
+
+func TestUpdateDBSkipsFreshDatabase(t *testing.T) {
+	root := t.TempDir()
+	trivycache.Install(t, root, false, dbSource{})
+
+	dbFile := filepath.Join(root, "_trivy", "db", "trivy.db")
+
+	before, err := os.Stat(dbFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logger := log.NewTestLogger()
+	imageStore := local.NewImageStore(root, false, false,
+		logger, monitoring.NewNopMetricServer(), nil, nil, nil, nil)
+	scanner := trivy.NewScanner(storage.StoreController{DefaultStore: imageStore}, nil, &extconf.CVEConfig{
+		Trivy: &extconf.TrivyConfig{
+			DBRepository: "ghcr.io/project-zot/trivy-db",
+		},
+	}, logger)
+
+	ctx, cancel := context.WithTimeout(context.Background(), trivycache.FreshUpdateLimit)
+	defer cancel()
+
+	if err := scanner.UpdateDB(ctx); err != nil {
+		t.Fatalf("UpdateDB on a fresh database: %v", err)
+	}
+
+	after, err := os.Stat(dbFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !before.ModTime().Equal(after.ModTime()) || before.Size() != after.Size() {
+		t.Fatalf("UpdateDB rewrote a fresh vulnerability database (size %d -> %d)", before.Size(), after.Size())
+	}
 }

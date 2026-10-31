@@ -19,12 +19,23 @@ import (
 
 	zerr "zotregistry.dev/zot/v2/errors"
 	"zotregistry.dev/zot/v2/pkg/common"
+	"zotregistry.dev/zot/v2/pkg/compat"
 )
 
 // HTTPClient manages HTTP clients with TLS support and caching.
 type HTTPClient struct {
-	clients map[string]*http.Client
-	mu      sync.Mutex
+	clients     map[string]*http.Client
+	certOptions common.HTTPClientCertOptions
+	mu          sync.Mutex
+}
+
+// setCertOptions sets the CA and client certificate files used for clients created afterwards.
+func (c *HTTPClient) setCertOptions(opts common.HTTPClientCertOptions) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.certOptions = opts
+	c.clients = make(map[string]*http.Client)
 }
 
 // NewHTTPClient creates a new HTTPClient instance.
@@ -106,7 +117,7 @@ func (c *HTTPClient) doHTTPRequest(req *http.Request, verifyTLS bool, debug bool
 			TLSEnabled:  enableTLS,
 			VerifyTLS:   verifyTLS,
 			Host:        host,
-			CertOptions: common.HTTPClientCertOptions{},
+			CertOptions: c.certOptions,
 		})
 		if err != nil {
 			c.mu.Unlock()
@@ -247,9 +258,9 @@ func (p *requestsPool) doJob(ctx context.Context, job *httpJob) {
 
 	verbose := job.config.Verbose
 
-	switch header.Get("Content-Type") {
-	case ispec.MediaTypeImageManifest:
-		image, err := fetchImageManifestStruct(ctx, job)
+	switch contentType := header.Get("Content-Type"); {
+	case compat.IsImageManifestMediaType(contentType):
+		image, err := fetchImageManifestStruct(ctx, job, contentType)
 		if err != nil {
 			if common.IsContextDone(ctx) {
 				return
@@ -275,8 +286,8 @@ func (p *requestsPool) doJob(ctx context.Context, job *httpJob) {
 		}
 
 		p.outputCh <- stringResult{str, nil}
-	case ispec.MediaTypeImageIndex:
-		image, err := fetchImageIndexStruct(ctx, job)
+	case compat.IsImageIndexMediaType(contentType):
+		image, err := fetchImageIndexStruct(ctx, job, contentType)
 		if err != nil {
 			if common.IsContextDone(ctx) {
 				return
@@ -308,7 +319,7 @@ func (p *requestsPool) doJob(ctx context.Context, job *httpJob) {
 	}
 }
 
-func fetchImageIndexStruct(ctx context.Context, job *httpJob) (*imageStruct, error) {
+func fetchImageIndexStruct(ctx context.Context, job *httpJob, mediaType string) (*imageStruct, error) {
 	var indexContent ispec.Index
 
 	httpClient := job.config.SearchService.getHTTPClient()
@@ -360,7 +371,7 @@ func fetchImageIndexStruct(ctx context.Context, job *httpJob) (*imageStruct, err
 		RepoName:  job.imageName,
 		Tag:       job.tagName,
 		Digest:    indexDigest,
-		MediaType: ispec.MediaTypeImageIndex,
+		MediaType: mediaType,
 		Manifests: manifestList,
 		Size:      strconv.FormatInt(imageSize, 10),
 		IsSigned:  isIndexSigned,
@@ -376,7 +387,7 @@ func atoiWithDefault(size string, defaultVal int) int {
 	return val
 }
 
-func fetchImageManifestStruct(ctx context.Context, job *httpJob) (*imageStruct, error) {
+func fetchImageManifestStruct(ctx context.Context, job *httpJob, mediaType string) (*imageStruct, error) {
 	manifest, err := fetchManifestStruct(ctx, job.imageName, job.tagName, job.config, job.username, job.password)
 	if err != nil {
 		return nil, err
@@ -386,7 +397,7 @@ func fetchImageManifestStruct(ctx context.Context, job *httpJob) (*imageStruct, 
 		RepoName:  job.imageName,
 		Tag:       job.tagName,
 		Digest:    manifest.Digest,
-		MediaType: ispec.MediaTypeImageManifest,
+		MediaType: mediaType,
 		Manifests: []common.ManifestSummary{
 			manifest,
 		},
@@ -558,8 +569,10 @@ func isCosignSigned(ctx context.Context, repo, digestStr string, searchConf Sear
 			continue
 		}
 
-		if len(referrers.Manifests) > 0 {
-			return true
+		for _, desc := range referrers.Manifests {
+			if common.IsCosignSignatureArtifact(desc.ArtifactType, desc.Annotations) {
+				return true
+			}
 		}
 	}
 

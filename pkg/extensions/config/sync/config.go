@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/mitchellh/mapstructure"
+
+	syncConstants "zotregistry.dev/zot/v2/pkg/extensions/sync/constants"
 )
 
 // TokenExchangeGrantType is the RFC 8693 token exchange grant, used to trade a subject
@@ -53,22 +55,99 @@ type Config struct {
 }
 
 type RegistryConfig struct {
-	URLs                   []string
-	PollInterval           time.Duration
-	Content                []Content
-	TLSVerify              *bool
-	OnDemand               bool
-	CertDir                string
-	MaxRetries             *int
-	RetryDelay             *time.Duration
-	MaxRetryDelay          *time.Duration // max HTTP retry backoff; when unset defaults to retryDelay (fixed delay)
+	URLs         []string
+	PollInterval time.Duration
+	Content      []Content
+	TLSVerify    *bool
+	OnDemand     bool
+	// OnDemandInBackground returns immediately when a requested manifest is not present
+	// locally and syncs the image into storage in the background. Clients that rely only
+	// on this registry will see 404 until sync completes. Requires OnDemand; incompatible
+	// with ManifestCheckInterval. Default is false when unset.
+	OnDemandInBackground  *bool
+	ManifestCheckInterval time.Duration
+	CertDir               string
+	MaxRetries            *int
+	RetryDelay            *time.Duration
+	MaxRetryDelay         *time.Duration // max HTTP retry backoff; when unset defaults to retryDelay (fixed delay)
+	// OnlySigned: tag sync requires remote signatures; on-demand digest pulls skip that check
+	// (see examples/README.md).
 	OnlySigned             *bool
 	SyncLegacyCosignTags   *bool // when unset, defaults to true
 	CredentialHelper       string
 	Oauth2CredentialHelper map[string]any `mapstructure:",omitempty"` // decoded per CredentialHelper
-	PreserveDigest         bool           // sync without converting
+	PreserveDigest         bool           // deprecated: ignored; docker media types need http.compat docker2s2
 	SyncTimeout            time.Duration  // overall HTTP client timeout for all sync operations
 	ResponseHeaderTimeout  time.Duration  `yaml:"-"` // response header timeout; set in root.go
+	// ReqConcurrent caps the number of in-flight requests per upstream host. The limit is applied
+	// independently to the upstream registry and to each of its mirrors (regclient copies it onto every
+	// host), so it is a per-host cap, not a shared total across hosts. When unset it defaults to
+	// regclient's default (3). Raising it helps when a single zot proxies many concurrent on-demand pulls
+	// of different images from one upstream, where the default causes head-of-line blocking.
+	//
+	// ReqConcurrent and DisableHTTP2 compose, and both are usually needed together: ReqConcurrent
+	// alone still funnels every request through one HTTP/2 connection (one TCP congestion window) if
+	// the upstream negotiates h2, while DisableHTTP2 alone still caps concurrency at ReqConcurrent's
+	// default of 3 connections. To actually open more than 3 parallel connections to an HTTP/2
+	// upstream, raise ReqConcurrent and set DisableHTTP2.
+	ReqConcurrent *int
+	// ReqPerSec caps the request rate (requests/second) per upstream host, applied independently to the
+	// upstream registry and to each of its mirrors (a per-host cap, not a shared total across hosts).
+	// When unset it defaults to regclient's default (0, i.e. unlimited).
+	ReqPerSec *float64
+	// DisableHTTP2 forces HTTP/1.1 to the upstream, so each concurrent request opens its own TCP
+	// connection instead of sharing the single connection (and congestion window) HTTP/2 multiplexes
+	// requests onto. See the ReqConcurrent doc comment above: the two settings compose, and raising
+	// ReqConcurrent is what actually lets more than 3 connections open.
+	DisableHTTP2 *bool
+	// MaxIdleConnsPerHost overrides the transport's per-host idle connection pool size (Go default: 2),
+	// applied whether or not DisableHTTP2 is set (it also helps a plain-HTTP or already-HTTP/1.1
+	// upstream keep its connections pooled). An explicit value here always wins.
+	//
+	// When DisableHTTP2 is true and this is left unset, it defaults to ReqConcurrent's effective
+	// value (the configured value, or regclient's default of 3) instead of Go's default of 2 —
+	// otherwise DisableHTTP2 alone would still hit the handshake-per-request pattern this option
+	// exists to avoid, since concurrent HTTP/1.1 connections beyond 2 would get closed instead of
+	// pooled.
+	MaxIdleConnsPerHost *int
+	// Platforms is the default allowlist of OS/arch children copied during periodic sync of a
+	// multi-arch index (e.g. "linux/amd64", "linux/arm64", or bare "amd64"). The upstream index
+	// digest is preserved; omitted children are left absent (sparse). Empty/unset means all
+	// platforms. A matching content[].platforms value overrides this for that prefix (see Content).
+	// On-demand sync ignores this list and materializes only children the client requests.
+	// Use "" in the list to also copy index entries that have no platform (regclient convention).
+	// Entries are validated with regclient platform.Parse (os/arch[/variant]); extra slash
+	// components beyond three are ignored by that parser, not rejected by zot.
+	Platforms []string `mapstructure:",omitempty"`
+	// Stream serves an on-demand image to the client while it downloads, instead of after the
+	// local commit. Requires OnDemand and https URLs; incompatible with OnDemandInBackground,
+	// MaxRetries/RetryDelay and TLSVerify: false.
+	Stream *bool
+	// MaxConcurrentStreams caps how many distinct blobs stream at once. It is one cap shared by all
+	// streaming registries, so they must agree on it. Past the cap, requests use the plain
+	// on-demand path. Defaults to syncConstants.DefaultMaxConcurrentStreams.
+	MaxConcurrentStreams *int
+	// dockerCompat is set at runtime from http.compat (docker2s2), not from sync config JSON.
+	dockerCompat bool
+}
+
+// SetDockerCompat records whether http.compat includes docker2s2 for this registry's sync path.
+func (r *RegistryConfig) SetDockerCompat(enabled bool) {
+	if r == nil {
+		return
+	}
+
+	r.dockerCompat = enabled
+}
+
+// IsDockerCompatEnabled reports whether Docker media types may be synced as-is.
+func (r RegistryConfig) IsDockerCompatEnabled() bool {
+	return r.dockerCompat
+}
+
+// IsStreamEnabled returns true if streaming is enabled for this registry config.
+func (r RegistryConfig) IsStreamEnabled() bool {
+	return r.Stream != nil && *r.Stream
 }
 
 // OAuth2HelperConfig holds the options used by the "oauth2" credential helper,
@@ -192,11 +271,53 @@ func (r RegistryConfig) ShouldSyncLegacyCosignTags() bool {
 	return r.SyncLegacyCosignTags == nil || *r.SyncLegacyCosignTags
 }
 
+// IsOnDemandInBackgroundEnabled reports whether on-demand-in-background sync is configured.
+// Default is false when OnDemandInBackground is unset (nil).
+func (r RegistryConfig) IsOnDemandInBackgroundEnabled() bool {
+	return r.OnDemandInBackground != nil && *r.OnDemandInBackground
+}
+
+// SyncTimeoutOrDefault returns the configured sync timeout, or DefaultSyncTimeout when unset.
+func (r RegistryConfig) SyncTimeoutOrDefault() time.Duration {
+	if r.SyncTimeout <= 0 {
+		return syncConstants.DefaultSyncTimeout
+	}
+
+	return r.SyncTimeout
+}
+
+// LargestSyncTimeout returns the largest SyncTimeout across registries, with per-registry
+// defaults applied. When sync is not configured it returns DefaultSyncTimeout.
+func (c *Config) LargestSyncTimeout() time.Duration {
+	if c == nil {
+		return syncConstants.DefaultSyncTimeout
+	}
+
+	maxTimeout := time.Duration(0)
+
+	for _, reg := range c.Registries {
+		if timeout := reg.SyncTimeoutOrDefault(); timeout > maxTimeout {
+			maxTimeout = timeout
+		}
+	}
+
+	if maxTimeout == 0 {
+		return syncConstants.DefaultSyncTimeout
+	}
+
+	return maxTimeout
+}
+
 type Content struct {
 	Prefix      string
 	Tags        *Tags
 	Destination string `mapstructure:",omitempty"`
 	StripPrefix bool
+	// Platforms when non-nil overrides registries[].platforms for periodic sync of repos that
+	// match this content prefix. Nil means inherit the registry default. A non-nil empty list
+	// means all platforms (same as an empty registry platforms list). On-demand sync ignores
+	// this field.
+	Platforms *[]string `mapstructure:",omitempty"`
 }
 
 type Tags struct {

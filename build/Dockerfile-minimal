@@ -11,7 +11,7 @@ ARG BASE_IMAGE=gcr.io/distroless/base-nossl-debian13:latest
 # ---
 # Stage 1: Install certs, build binary, create default config file
 # ---
-FROM --platform=$BUILDPLATFORM ghcr.io/project-zot/golang:1.26 AS builder
+FROM --platform=$BUILDPLATFORM ghcr.io/project-zot/golang:1.27 AS builder
 
 ARG TARGETOS
 ARG TARGETARCH
@@ -46,3 +46,5 @@ COPY --from=builder /go/src/github.com/project-zot/zot/config.json /etc/zot/conf
 ENTRYPOINT ["/usr/bin/zot"]
 EXPOSE 5000
 CMD ["serve", "/etc/zot/config.json"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["/usr/bin/zot", "healthcheck", "--insecure-skip-verify", "/etc/zot/config.json"]

@@ -35,12 +35,20 @@ function setup_file() {
 
     # Download test data to folder common for the entire suite, not just this file
     skopeo --insecure-policy copy --format=oci docker://ghcr.io/project-zot/golang:1.20 oci:${TEST_DATA_DIR}/golang:1.20
+    # A second, distinct image used to mutate an upstream tag in the manifestCheckInterval test
+    skopeo --insecure-policy copy --format=oci docker://ghcr.io/project-zot/test-images/busybox:1.36 oci:${TEST_DATA_DIR}/busybox:1.36
     # Setup zot server
     local zot_sync_per_root_dir=${BATS_FILE_TMPDIR}/zot-per
     local zot_sync_ondemand_root_dir=${BATS_FILE_TMPDIR}/zot-ondemand
+    local zot_sync_interval_root_dir=${BATS_FILE_TMPDIR}/zot-interval
+    local zot_sync_platforms_root_dir=${BATS_FILE_TMPDIR}/zot-platforms
+    local zot_sync_ondemand_bg_root_dir=${BATS_FILE_TMPDIR}/zot-ondemand-bg
 
     local zot_sync_per_config_file=${BATS_FILE_TMPDIR}/zot_sync_per_config.json
     local zot_sync_ondemand_config_file=${BATS_FILE_TMPDIR}/zot_sync_ondemand_config.json
+    local zot_sync_interval_config_file=${BATS_FILE_TMPDIR}/zot_sync_interval_config.json
+    local zot_sync_platforms_config_file=${BATS_FILE_TMPDIR}/zot_sync_platforms_config.json
+    local zot_sync_ondemand_bg_config_file=${BATS_FILE_TMPDIR}/zot_sync_ondemand_bg_config.json
 
     local zot_minimal_root_dir=${BATS_FILE_TMPDIR}/zot-minimal
     local zot_minimal_config_file=${BATS_FILE_TMPDIR}/zot_minimal_config.json
@@ -48,6 +56,9 @@ function setup_file() {
     local oci_data_dir=${BATS_FILE_TMPDIR}/oci
     mkdir -p ${zot_sync_per_root_dir}
     mkdir -p ${zot_sync_ondemand_root_dir}
+    mkdir -p ${zot_sync_interval_root_dir}
+    mkdir -p ${zot_sync_platforms_root_dir}
+    mkdir -p ${zot_sync_ondemand_bg_root_dir}
     mkdir -p ${zot_minimal_root_dir}
     mkdir -p ${oci_data_dir}
     zot_port1=$(get_free_port_for_service "zot1")
@@ -56,6 +67,12 @@ function setup_file() {
     echo ${zot_port2} > ${BATS_FILE_TMPDIR}/zot.port2
     zot_port3=$(get_free_port_for_service "zot3")
     echo ${zot_port3} > ${BATS_FILE_TMPDIR}/zot.port3
+    zot_port4=$(get_free_port_for_service "zot4")
+    echo ${zot_port4} > ${BATS_FILE_TMPDIR}/zot.port4
+    zot_port5=$(get_free_port_for_service "zot5")
+    echo ${zot_port5} > ${BATS_FILE_TMPDIR}/zot.port5
+    zot_port6=$(get_free_port_for_service "zot6")
+    echo ${zot_port6} > ${BATS_FILE_TMPDIR}/zot.port6
 
     cat >${zot_sync_per_config_file} <<EOF
 {
@@ -68,7 +85,8 @@ function setup_file() {
         "port": "${zot_port1}"
     },
     "log": {
-        "level": "debug"
+        "level": "debug",
+        "output": "${BATS_FILE_TMPDIR}/zot-per.log"
     },
     "extensions": {
         "sync": {
@@ -80,6 +98,8 @@ function setup_file() {
                     "onDemand": false,
                     "tlsVerify": false,
                     "PollInterval": "10s",
+                    "disableHTTP2": true,
+                    "maxIdleConnsPerHost": 20,
                     "content": [
                         {
                             "prefix": "**"
@@ -103,7 +123,8 @@ EOF
         "port": "${zot_port2}"
     },
     "log": {
-        "level": "debug"
+        "level": "debug",
+        "output": "${BATS_FILE_TMPDIR}/zot-ondemand.log"
     },
     "extensions": {
         "sync": {
@@ -136,7 +157,114 @@ EOF
         "port": "${zot_port3}"
     },
     "log": {
-        "level": "debug"
+        "level": "debug",
+        "output": "${BATS_FILE_TMPDIR}/zot-minimal.log"
+    }
+}
+EOF
+    cat >${zot_sync_interval_config_file} <<EOF
+{
+    "distSpecVersion": "1.1.1",
+    "storage": {
+        "rootDirectory": "${zot_sync_interval_root_dir}"
+    },
+    "http": {
+        "address": "0.0.0.0",
+        "port": "${zot_port4}"
+    },
+    "log": {
+        "level": "debug",
+        "output": "${BATS_FILE_TMPDIR}/zot-interval.log"
+    },
+    "extensions": {
+        "sync": {
+            "registries": [
+                {
+                    "urls": [
+                        "http://localhost:${zot_port3}"
+                    ],
+                    "onDemand": true,
+                    "tlsVerify": false,
+                    "manifestCheckInterval": "30s",
+                    "content": [
+                        {
+                            "prefix": "**"
+                        }
+                    ]
+                }
+            ]
+        }
+    }
+}
+EOF
+    cat >${zot_sync_platforms_config_file} <<EOF
+{
+    "distSpecVersion": "1.1.1",
+    "storage": {
+        "rootDirectory": "${zot_sync_platforms_root_dir}"
+    },
+    "http": {
+        "address": "0.0.0.0",
+        "port": "${zot_port5}"
+    },
+    "log": {
+        "level": "debug",
+        "output": "${BATS_FILE_TMPDIR}/zot-platforms.log"
+    },
+    "extensions": {
+        "sync": {
+            "registries": [
+                {
+                    "urls": [
+                        "http://localhost:${zot_port3}"
+                    ],
+                    "onDemand": false,
+                    "tlsVerify": false,
+                    "PollInterval": "10s",
+                    "platforms": ["linux/amd64"],
+                    "content": [
+                        {
+                            "prefix": "busybox-filtered"
+                        }
+                    ]
+                }
+            ]
+        }
+    }
+}
+EOF
+    cat >${zot_sync_ondemand_bg_config_file} <<EOF
+{
+    "distSpecVersion": "1.1.1",
+    "storage": {
+        "rootDirectory": "${zot_sync_ondemand_bg_root_dir}"
+    },
+    "http": {
+        "address": "0.0.0.0",
+        "port": "${zot_port6}"
+    },
+    "log": {
+        "level": "debug",
+        "output": "${BATS_FILE_TMPDIR}/zot-ondemand-bg.log"
+    },
+    "extensions": {
+        "sync": {
+            "registries": [
+                {
+                    "urls": [
+                        "http://localhost:${zot_port3}"
+                    ],
+                    "onDemand": true,
+                    "onDemandInBackground": true,
+                    "tlsVerify": false,
+                    "content": [
+                        {
+                            "prefix": "**"
+                        }
+                    ]
+                }
+            ]
+        }
     }
 }
 EOF
@@ -150,6 +278,26 @@ EOF
 
     zot_serve ${ZOT_PATH} ${zot_sync_ondemand_config_file}
     wait_zot_reachable ${zot_port2}
+
+    zot_serve ${ZOT_PATH} ${zot_sync_interval_config_file}
+    wait_zot_reachable ${zot_port4}
+
+    zot_serve ${ZOT_PATH} ${zot_sync_platforms_config_file}
+    wait_zot_reachable ${zot_port5}
+
+    zot_serve ${ZOT_PATH} ${zot_sync_ondemand_bg_config_file}
+    wait_zot_reachable ${zot_port6}
+}
+
+# Print zot logs only when a test fails (see dump_zot_logs_on_failure).
+function teardown() {
+    dump_zot_logs_on_failure \
+        "${BATS_FILE_TMPDIR}/zot-minimal.log" \
+        "${BATS_FILE_TMPDIR}/zot-per.log" \
+        "${BATS_FILE_TMPDIR}/zot-ondemand.log" \
+        "${BATS_FILE_TMPDIR}/zot-interval.log" \
+        "${BATS_FILE_TMPDIR}/zot-platforms.log" \
+        "${BATS_FILE_TMPDIR}/zot-ondemand-bg.log"
 }
 
 function teardown_file() {
@@ -212,6 +360,98 @@ function teardown_file() {
     [ $(echo "${lines[-1]}" | jq '.tags[]') = '"1.20"' ]
 }
 
+# onDemandInBackground: first miss returns 404 while sync runs in the background;
+# a later request is served from local storage once sync completes.
+@test "sync golang image ondemand in background" {
+    zot_port3=`cat ${BATS_FILE_TMPDIR}/zot.port3`
+    zot_port6=`cat ${BATS_FILE_TMPDIR}/zot.port6`
+
+    run skopeo --insecure-policy copy --dest-tls-verify=false \
+        oci:${TEST_DATA_DIR}/golang:1.20 \
+        docker://127.0.0.1:${zot_port3}/bg-golang:1.20
+    [ "$status" -eq 0 ]
+
+    upstream_digest=$(manifest_digest http://127.0.0.1:${zot_port3}/v2/bg-golang/manifests/1.20)
+    [ -n "${upstream_digest}" ]
+
+    # first request must not wait for sync — behave like sync disabled
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+        -H "Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json" \
+        http://127.0.0.1:${zot_port6}/v2/bg-golang/manifests/1.20)
+    [ "${http_code}" = "404" ]
+
+    # background sync should populate local storage
+    retry_until_success 60 1 curl -sf \
+        -H "Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json" \
+        http://127.0.0.1:${zot_port6}/v2/bg-golang/manifests/1.20
+
+    run curl http://127.0.0.1:${zot_port6}/v2/_catalog
+    [ "$status" -eq 0 ]
+    [ $(echo "${lines[-1]}" | jq '.repositories[]') = '"bg-golang"' ]
+
+    run curl http://127.0.0.1:${zot_port6}/v2/bg-golang/tags/list
+    [ "$status" -eq 0 ]
+    [ $(echo "${lines[-1]}" | jq '.tags[]') = '"1.20"' ]
+
+    downstream_digest=$(manifest_digest http://127.0.0.1:${zot_port6}/v2/bg-golang/manifests/1.20)
+    [ "${downstream_digest}" = "${upstream_digest}" ]
+
+    # full image (blobs) must be present for a client pull
+    run skopeo --insecure-policy copy --src-tls-verify=false \
+        docker://127.0.0.1:${zot_port6}/bg-golang:1.20 \
+        oci:${BATS_FILE_TMPDIR}/bg-golang-copy:1.20
+    [ "$status" -eq 0 ]
+}
+
+# returns the manifest digest a registry serves for repo:reference on stdout
+function manifest_digest() {
+    local url=$1
+    curl -s -D - -o /dev/null \
+        -H "Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json" \
+        "${url}" | grep -i "docker-content-digest" | tr -d '\r' | awk '{print $2}'
+}
+
+# manifestCheckInterval: within the interval a locally-present manifest is served without
+# re-checking upstream, so a tag mutated upstream is only picked up after the interval elapses.
+@test "sync image ondemand honors manifestCheckInterval" {
+    zot_port3=`cat ${BATS_FILE_TMPDIR}/zot.port3`
+    zot_port4=`cat ${BATS_FILE_TMPDIR}/zot.port4`
+
+    # push image A (golang) upstream under a dedicated repo:tag
+    run skopeo --insecure-policy copy --dest-tls-verify=false \
+        oci:${TEST_DATA_DIR}/golang:1.20 \
+        docker://127.0.0.1:${zot_port3}/interval-test:latest
+    [ "$status" -eq 0 ]
+
+    digest_a=$(manifest_digest http://127.0.0.1:${zot_port3}/v2/interval-test/manifests/latest)
+    [ -n "${digest_a}" ]
+
+    # first on-demand pull contacts upstream and caches image A
+    downstream_digest=$(manifest_digest http://127.0.0.1:${zot_port4}/v2/interval-test/manifests/latest)
+    [ "${downstream_digest}" = "${digest_a}" ]
+
+    # mutate upstream: overwrite the SAME tag with a different image B (busybox)
+    run skopeo --insecure-policy copy --dest-tls-verify=false \
+        oci:${TEST_DATA_DIR}/busybox:1.36 \
+        docker://127.0.0.1:${zot_port3}/interval-test:latest
+    [ "$status" -eq 0 ]
+
+    digest_b=$(manifest_digest http://127.0.0.1:${zot_port3}/v2/interval-test/manifests/latest)
+    [ -n "${digest_b}" ]
+    [ "${digest_b}" != "${digest_a}" ]
+
+    # within the interval the downstream must keep serving cached image A (no upstream re-check)
+    downstream_digest=$(manifest_digest http://127.0.0.1:${zot_port4}/v2/interval-test/manifests/latest)
+    [ "${downstream_digest}" = "${digest_a}" ]
+
+    # wait for manifestCheckInterval (30s) to elapse
+    run sleep 40s
+
+    # after the interval the downstream re-checks upstream and serves the updated image B
+    downstream_digest=$(manifest_digest http://127.0.0.1:${zot_port4}/v2/interval-test/manifests/latest)
+    [ "${downstream_digest}" = "${digest_b}" ]
+}
+
 # sync index
 @test "sync image index periodically" {
     zot_port1=`cat ${BATS_FILE_TMPDIR}/zot.port1`
@@ -219,12 +459,12 @@ function teardown_file() {
     # --multi-arch below pushes an image index (containing many images) instead
     # of an image manifest (single image)
     run skopeo --insecure-policy copy --format=oci --dest-tls-verify=false --multi-arch=all \
-        docker://public.ecr.aws/docker/library/busybox:latest \
+        docker://ghcr.io/project-zot/test-images/busybox:1.38 \
         docker://127.0.0.1:${zot_port3}/busybox:latest
     [ "$status" -eq 0 ]
     run curl http://127.0.0.1:${zot_port3}/v2/_catalog
     [ "$status" -eq 0 ]
-    [ $(echo "${lines[-1]}" | jq '.repositories[0]') = '"busybox"' ]
+    [ $(echo "${lines[-1]}" | jq '.repositories | map(select(. == "busybox")) | .[]') = '"busybox"' ]
     run curl http://127.0.0.1:${zot_port3}/v2/busybox/tags/list
     [ "$status" -eq 0 ]
     [ $(echo "${lines[-1]}" | jq '.tags[]') = '"latest"' ]
@@ -233,7 +473,7 @@ function teardown_file() {
 
     run curl http://127.0.0.1:${zot_port1}/v2/_catalog
     [ "$status" -eq 0 ]
-    [ $(echo "${lines[-1]}" | jq '.repositories[0]') = '"busybox"' ]
+    [ $(echo "${lines[-1]}" | jq '.repositories | map(select(. == "busybox")) | .[]') = '"busybox"' ]
 
     run curl http://127.0.0.1:${zot_port1}/v2/busybox/tags/list
     [ "$status" -eq 0 ]
@@ -246,12 +486,12 @@ function teardown_file() {
     # --multi-arch below pushes an image index (containing many images) instead
     # of an image manifest (single image)
     run skopeo --insecure-policy copy --format=oci --dest-tls-verify=false --multi-arch=all \
-        docker://public.ecr.aws/docker/library/busybox:latest \
+        docker://ghcr.io/project-zot/test-images/busybox:1.38 \
         docker://127.0.0.1:${zot_port3}/busybox:latest
     [ "$status" -eq 0 ]
     run curl http://127.0.0.1:${zot_port3}/v2/_catalog
     [ "$status" -eq 0 ]
-    [ $(echo "${lines[-1]}" | jq '.repositories[1]') = '"golang"' ]
+    [ $(echo "${lines[-1]}" | jq '.repositories | map(select(. == "golang")) | .[]') = '"golang"' ]
     run curl http://127.0.0.1:${zot_port3}/v2/busybox/tags/list
     [ "$status" -eq 0 ]
     [ $(echo "${lines[-1]}" | jq '.tags[]') = '"latest"' ]
@@ -262,11 +502,74 @@ function teardown_file() {
 
     run curl http://127.0.0.1:${zot_port2}/v2/_catalog
     [ "$status" -eq 0 ]
-    [ $(echo "${lines[-1]}" | jq '.repositories[1]') = '"golang"' ]
+    [ $(echo "${lines[-1]}" | jq '.repositories | map(select(. == "golang")) | .[]') = '"golang"' ]
 
     run curl http://127.0.0.1:${zot_port2}/v2/busybox/tags/list
     [ "$status" -eq 0 ]
     [ $(echo "${lines[-1]}" | jq '.tags[]') = '"latest"' ]
+}
+
+# returns Docker-Content-Digest for an OCI index (or manifest) reference
+function index_digest() {
+    local url=$1
+    curl -s -D - -o /dev/null \
+        -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json" \
+        "${url}" | grep -i "docker-content-digest" | tr -d '\r' | awk '{print $2}'
+}
+
+# periodic platforms allowlist: full upstream index digest preserved; only linux/amd64 child materialized
+@test "sync image index platforms filter periodically" {
+    zot_port3=`cat ${BATS_FILE_TMPDIR}/zot.port3`
+    zot_port5=`cat ${BATS_FILE_TMPDIR}/zot.port5`
+
+    run skopeo --insecure-policy copy --format=oci --dest-tls-verify=false --multi-arch=all \
+        docker://ghcr.io/project-zot/test-images/busybox:1.38 \
+        docker://127.0.0.1:${zot_port3}/busybox-filtered:latest
+    [ "$status" -eq 0 ]
+
+    upstream_index=$(curl -s \
+        -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json" \
+        http://127.0.0.1:${zot_port3}/v2/busybox-filtered/manifests/latest)
+    [ -n "${upstream_index}" ]
+
+    amd64_digest=$(echo "${upstream_index}" | jq -r '
+        .manifests[]
+        | select(.platform.os=="linux" and .platform.architecture=="amd64"
+                 and ((.platform.variant // "") == "" or .platform.variant == "v1"))
+        | .digest' | head -n1)
+    arm64_digest=$(echo "${upstream_index}" | jq -r '
+        .manifests[]
+        | select(.platform.os=="linux" and .platform.architecture=="arm64")
+        | .digest' | head -n1)
+    [ -n "${amd64_digest}" ]
+    [ -n "${arm64_digest}" ]
+    [ "${amd64_digest}" != "${arm64_digest}" ]
+
+    upstream_digest=$(index_digest http://127.0.0.1:${zot_port3}/v2/busybox-filtered/manifests/latest)
+    [ -n "${upstream_digest}" ]
+
+    # wait until periodic sync has copied the tag (PollInterval 10s)
+    run sleep 30s
+
+    run curl http://127.0.0.1:${zot_port5}/v2/busybox-filtered/tags/list
+    [ "$status" -eq 0 ]
+    [ $(echo "${lines[-1]}" | jq '.tags[]') = '"latest"' ]
+
+    downstream_digest=$(index_digest http://127.0.0.1:${zot_port5}/v2/busybox-filtered/manifests/latest)
+    [ "${downstream_digest}" = "${upstream_digest}" ]
+
+    run curl -s -o /dev/null -w "%{http_code}" \
+        -H "Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json" \
+        http://127.0.0.1:${zot_port5}/v2/busybox-filtered/manifests/${amd64_digest}
+    [ "$status" -eq 0 ]
+    [ "$output" = "200" ]
+
+    # onDemand is false, so a missing allowlisted-out arch stays 404
+    run curl -s -o /dev/null -w "%{http_code}" \
+        -H "Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json" \
+        http://127.0.0.1:${zot_port5}/v2/busybox-filtered/manifests/${arm64_digest}
+    [ "$status" -eq 0 ]
+    [ "$output" = "404" ]
 }
 
 # sign signatures
@@ -487,7 +790,7 @@ EOF
 @test "sync OCI artifact references periodically" {
     zot_port1=`cat ${BATS_FILE_TMPDIR}/zot.port1`
     # wait for OCI artifacts to be copied
-    run sleep 20
+    run sleep 20s
     run regctl artifact get localhost:${zot_port1}/manifest-ref:demo
     [ "$status" -eq 0 ]
     [ "${lines[-1]}" == "test artifact" ]

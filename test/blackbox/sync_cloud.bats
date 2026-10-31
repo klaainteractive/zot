@@ -79,7 +79,8 @@ function setup_file() {
         "port": "${zot_port1}"
     },
     "log": {
-        "level": "debug"
+        "level": "debug",
+        "output": "${BATS_FILE_TMPDIR}/zot-per.log"
     },
     "extensions": {
         "sync": {
@@ -126,7 +127,8 @@ EOF
         "port": "${zot_port2}"
     },
     "log": {
-        "level": "debug"
+        "level": "debug",
+        "output": "${BATS_FILE_TMPDIR}/zot-ondemand.log"
     },
     "extensions": {
         "sync": {
@@ -160,7 +162,8 @@ EOF
         "port": "${zot_port3}"
     },
     "log": {
-        "level": "debug"
+        "level": "debug",
+        "output": "${BATS_FILE_TMPDIR}/zot-minimal.log"
     }
 }
 EOF
@@ -176,6 +179,14 @@ EOF
 
     zot_serve ${ZOT_PATH} ${zot_sync_ondemand_config_file}
     wait_zot_reachable ${zot_port2}
+}
+
+# Print zot logs only when a test fails (see dump_zot_logs_on_failure).
+function teardown() {
+    dump_zot_logs_on_failure \
+        "${BATS_FILE_TMPDIR}/zot-minimal.log" \
+        "${BATS_FILE_TMPDIR}/zot-per.log" \
+        "${BATS_FILE_TMPDIR}/zot-ondemand.log"
 }
 
 function teardown_file() {
@@ -246,7 +257,7 @@ function teardown_file() {
     # --multi-arch below pushes an image index (containing many images) instead
     # of an image manifest (single image)
     run skopeo --insecure-policy copy --format=oci --dest-tls-verify=false --multi-arch=all \
-        docker://public.ecr.aws/docker/library/busybox:latest \
+        docker://ghcr.io/project-zot/test-images/busybox:1.38 \
         docker://127.0.0.1:${zot_port3}/busybox:latest
     [ "$status" -eq 0 ]
     run curl http://127.0.0.1:${zot_port3}/v2/_catalog
@@ -273,7 +284,7 @@ function teardown_file() {
     # --multi-arch below pushes an image index (containing many images) instead
     # of an image manifest (single image)
     run skopeo --insecure-policy copy --format=oci --dest-tls-verify=false --multi-arch=all \
-        docker://public.ecr.aws/docker/library/busybox:latest \
+        docker://ghcr.io/project-zot/test-images/busybox:1.38 \
         docker://127.0.0.1:${zot_port3}/busybox:latest
     [ "$status" -eq 0 ]
     run curl http://127.0.0.1:${zot_port3}/v2/_catalog
@@ -313,6 +324,8 @@ function teardown_file() {
 
 @test "sign/verify with notation" {
     zot_port3=`cat ${BATS_FILE_TMPDIR}/zot.port3`
+    run notation cert generate-test "notation-sign-sync-test"
+    [ "$status" -eq 0 ]
 
     local trust_policy_file=/tmp/trustpolicy.json
 

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,45 +23,6 @@ import (
 	storageConstants "zotregistry.dev/zot/v2/pkg/storage/constants"
 	. "zotregistry.dev/zot/v2/pkg/test/common"
 )
-
-const (
-	// Must match the log message emitted in pkg/api/controller.go when Port is "0".
-	kernelChosenPortMsg   = "port is unspecified, listening on kernel chosen port"
-	kernelPortWaitTimeout = 30 * time.Second
-)
-
-// waitForKernelChosenPortBaseURL polls a zot log file for the kernel-assigned listen
-// port logged when conf.HTTP.Port is "0", then returns http://127.0.0.1:<port>.
-// Used for CLI serve tests that have no ControllerManager to query after bind.
-func waitForKernelChosenPortBaseURL(logPath string) string {
-	deadline := time.Now().Add(kernelPortWaitTimeout)
-
-	for time.Now().Before(deadline) {
-		content, err := os.ReadFile(logPath)
-		if err == nil {
-			for line := range strings.SplitSeq(string(content), "\n") {
-				if !strings.Contains(line, kernelChosenPortMsg) {
-					continue
-				}
-
-				var entry struct {
-					Port int `json:"port"`
-				}
-
-				if err := json.Unmarshal([]byte(line), &entry); err != nil || entry.Port <= 0 {
-					continue
-				}
-
-				return GetBaseURL(strconv.Itoa(entry.Port))
-			}
-		}
-
-		time.Sleep(SleepTime)
-	}
-
-	panic(fmt.Sprintf("timed out after %s waiting for kernel chosen port in %s",
-		kernelPortWaitTimeout, logPath))
-}
 
 // checkAuthLogEntry checks if a log entry with the given message has the expected enabled value.
 func checkAuthLogEntry(logData []byte, message string, expectedEnabled bool) bool {
@@ -511,6 +473,7 @@ func TestSchema(t *testing.T) {
 		storageProperties, ok := storageSchema["properties"].(map[string]any)
 		So(ok, ShouldBeTrue)
 		So(storageProperties, ShouldContainKey, "rootDirectory")
+		So(storageProperties, ShouldContainKey, "maxRepoBytes")
 		So(storageProperties, ShouldContainKey, "gcDelay")
 		So(storageProperties, ShouldContainKey, "gcInterval")
 		So(storageProperties, ShouldContainKey, "subPaths")
@@ -661,15 +624,8 @@ func TestServe(t *testing.T) {
 			contentStr := string(content)
 			tmpFile := MakeTempFileWithContent(t, "zot-test.json", contentStr)
 
-			os.Args = []string{"cli_test", "serve", tmpFile}
-
-			err := cli.NewServerRootCmd().Execute()
+			err := tryInitControllerFromConfigFile(t, tmpFile)
 			So(err, ShouldNotBeNil)
-
-			// wait for the config reloader goroutine to start watching the config file
-			// if we end the test too fast it will delete the config file
-			// which will cause a panic and mark the test run as a failure
-			time.Sleep(1 * time.Second)
 		})
 	})
 }
@@ -2021,7 +1977,7 @@ storage:
 		So(err, ShouldNotBeNil)
 	})
 
-	Convey("Test verify with bad preserve digest and no compat", t, func(c C) {
+	Convey("Test verify with deprecated preserveDigest warns but loads", t, func(c C) {
 		content := `{"storage":{"rootDirectory":"/tmp/zot"},
 							"http":{"address":"127.0.0.1","port":"8080","realm":"zot",
 							"auth":{"htpasswd":{"path":"test/data/htpasswd"},"failDelay":1}},
@@ -2032,7 +1988,7 @@ storage:
 
 		os.Args = []string{"cli_test", "verify", tmpfile}
 		err := cli.NewServerRootCmd().Execute()
-		So(err, ShouldNotBeNil)
+		So(err, ShouldBeNil)
 	})
 
 	Convey("Test verify with bad sync content config", t, func(c C) {
@@ -2047,6 +2003,115 @@ storage:
 		os.Args = []string{"cli_test", "verify", tmpfile}
 		err := cli.NewServerRootCmd().Execute()
 		So(err, ShouldNotBeNil)
+	})
+
+	Convey("Test verify with non-positive sync reqConcurrent", t, func(c C) {
+		content := `{"storage":{"rootDirectory":"/tmp/zot"},
+							"http":{"address":"127.0.0.1","port":"8080","realm":"zot",
+							"auth":{"htpasswd":{"path":"test/data/htpasswd"},"failDelay":1}},
+							"extensions":{"sync": {"registries": [{"urls":["localhost:9999"],
+							"reqConcurrent": 0}]}}}`
+		tmpfile := MakeTempFileWithContent(t, "zot-test.json", content)
+
+		os.Args = []string{"cli_test", "verify", tmpfile}
+		err := cli.NewServerRootCmd().Execute()
+		So(err, ShouldNotBeNil)
+	})
+
+	Convey("Test verify with non-positive sync reqPerSec", t, func(c C) {
+		content := `{"storage":{"rootDirectory":"/tmp/zot"},
+							"http":{"address":"127.0.0.1","port":"8080","realm":"zot",
+							"auth":{"htpasswd":{"path":"test/data/htpasswd"},"failDelay":1}},
+							"extensions":{"sync": {"registries": [{"urls":["localhost:9999"],
+							"reqPerSec": 0}]}}}`
+		tmpfile := MakeTempFileWithContent(t, "zot-test.json", content)
+
+		os.Args = []string{"cli_test", "verify", tmpfile}
+		err := cli.NewServerRootCmd().Execute()
+		So(err, ShouldNotBeNil)
+	})
+
+	Convey("Test verify rejects non-finite sync reqPerSec", t, func(c C) {
+		// JSON can't express NaN/Inf, so use YAML where `.nan`/`.inf` are valid floats that
+		// would otherwise slip past a naive `<= 0` check.
+		for _, badValue := range []string{".nan", ".inf", "-.inf"} {
+			content := `
+storage:
+  rootDirectory: /tmp/zot
+http:
+  address: 127.0.0.1
+  port: "8080"
+  realm: zot
+  auth:
+    htpasswd:
+      path: test/data/htpasswd
+    failDelay: 1
+extensions:
+  sync:
+    registries:
+      - urls:
+          - localhost:9999
+        reqPerSec: ` + badValue
+			tmpfile := MakeTempFileWithContent(t, "zot-test.yaml", content)
+
+			os.Args = []string{"cli_test", "verify", tmpfile}
+			err := cli.NewServerRootCmd().Execute()
+			So(err, ShouldNotBeNil)
+		}
+	})
+
+	Convey("Test verify with valid sync reqConcurrent and reqPerSec", t, func(c C) {
+		content := `{"storage":{"rootDirectory":"/tmp/zot"},
+							"http":{"address":"127.0.0.1","port":"8080","realm":"zot",
+							"auth":{"htpasswd":{"path":"test/data/htpasswd"},"failDelay":1}},
+							"extensions":{"sync": {"registries": [{"urls":["localhost:9999"],
+							"reqConcurrent": 30, "reqPerSec": 100}]}}}`
+		tmpfile := MakeTempFileWithContent(t, "zot-test.json", content)
+
+		os.Args = []string{"cli_test", "verify", tmpfile}
+		err := cli.NewServerRootCmd().Execute()
+		So(err, ShouldBeNil)
+	})
+
+	Convey("Test verify with non-positive sync maxIdleConnsPerHost", t, func(c C) {
+		content := `{"storage":{"rootDirectory":"/tmp/zot"},
+							"http":{"address":"127.0.0.1","port":"8080","realm":"zot",
+							"auth":{"htpasswd":{"path":"test/data/htpasswd"},"failDelay":1}},
+							"extensions":{"sync": {"registries": [{"urls":["localhost:9999"],
+							"maxIdleConnsPerHost": 0}]}}}`
+		tmpfile := MakeTempFileWithContent(t, "zot-test.json", content)
+
+		os.Args = []string{"cli_test", "verify", tmpfile}
+		err := cli.NewServerRootCmd().Execute()
+		So(err, ShouldNotBeNil)
+	})
+
+	Convey("Test verify with valid sync disableHTTP2 and maxIdleConnsPerHost", t, func(c C) {
+		content := `{"storage":{"rootDirectory":"/tmp/zot"},
+							"http":{"address":"127.0.0.1","port":"8080","realm":"zot",
+							"auth":{"htpasswd":{"path":"test/data/htpasswd"},"failDelay":1}},
+							"extensions":{"sync": {"registries": [{"urls":["localhost:9999"],
+							"reqConcurrent": 16, "disableHTTP2": true, "maxIdleConnsPerHost": 30}]}}}`
+		tmpfile := MakeTempFileWithContent(t, "zot-test.json", content)
+
+		os.Args = []string{"cli_test", "verify", tmpfile}
+		err := cli.NewServerRootCmd().Execute()
+		So(err, ShouldBeNil)
+	})
+
+	Convey("Test verify with disableHTTP2 and maxIdleConnsPerHost omitted", t, func(c C) {
+		// newClient defaults the idle pool to reqConcurrent in this case (see service.go), so
+		// verify must not require maxIdleConnsPerHost to be set alongside disableHTTP2.
+		content := `{"storage":{"rootDirectory":"/tmp/zot"},
+							"http":{"address":"127.0.0.1","port":"8080","realm":"zot",
+							"auth":{"htpasswd":{"path":"test/data/htpasswd"},"failDelay":1}},
+							"extensions":{"sync": {"registries": [{"urls":["localhost:9999"],
+							"disableHTTP2": true}]}}}`
+		tmpfile := MakeTempFileWithContent(t, "zot-test.json", content)
+
+		os.Args = []string{"cli_test", "verify", tmpfile}
+		err := cli.NewServerRootCmd().Execute()
+		So(err, ShouldBeNil)
 	})
 
 	Convey("Test verify with good sync content config", t, func(c C) {
@@ -3355,16 +3420,14 @@ func TestUpdateLDAPConfig(t *testing.T) {
 
 		configPath := MakeTempFileWithContent(t, "config.json", configStr)
 
-		server := cli.NewServerRootCmd()
-		server.SetArgs([]string{"serve", configPath})
-		So(server.Execute(), ShouldNotBeNil)
+		err := cli.LoadConfiguration(config.New(), configPath)
+		So(err, ShouldNotBeNil)
 
-		err := os.Chmod(ldapConfigPath, 0o600)
+		err = os.Chmod(ldapConfigPath, 0o600)
 		So(err, ShouldBeNil)
 
-		server = cli.NewServerRootCmd()
-		server.SetArgs([]string{"serve", configPath})
-		So(server.Execute(), ShouldNotBeNil)
+		err = cli.LoadConfiguration(config.New(), configPath)
+		So(err, ShouldNotBeNil)
 	})
 
 	Convey("unauthenticated LDAP config", t, func() {
@@ -3531,27 +3594,68 @@ func runCLIWithConfig(t *testing.T, config string) (string, string, error) {
 
 	cfgfile := MakeTempFileWithContent(t, "zot-test.json", config)
 
-	os.Args = []string{"cli_test", "serve", cfgfile}
-
-	// Run CLI in a goroutine, but handle errors via a channel
-	errCh := make(chan error, 1)
-
-	go func() {
-		errCh <- cli.NewServerRootCmd().Execute()
-	}()
-
-	select {
-	case err := <-errCh:
-		if err != nil {
-			return "", "", err
-		}
-	case <-time.After(250 * time.Millisecond): // No startup error
+	if err := startServerFromConfigFile(t, cfgfile); err != nil {
+		return "", "", err
 	}
 
-	baseURL := waitForKernelChosenPortBaseURL(logPath)
-	WaitTillServerReady(baseURL)
-
 	return logPath, rootDir, nil
+}
+
+// tryInitControllerFromConfigFile loads config and initializes a controller without
+// starting the HTTP server. InitController shuts down partial init on failure.
+func tryInitControllerFromConfigFile(t *testing.T, cfgPath string) error {
+	t.Helper()
+
+	conf := config.New()
+	if err := cli.LoadConfiguration(conf, cfgPath); err != nil {
+		return err
+	}
+
+	_, _, err := cli.InitController(conf, cfgPath)
+
+	return err
+}
+
+// startServerFromConfigFile loads config, starts a hot-reloading controller, and
+// waits until it serves. It registers shutdown on both Convey Reset (per-case)
+// and t.Cleanup (test end).
+func startServerFromConfigFile(t *testing.T, cfgPath string) error {
+	t.Helper()
+
+	_, err := startServerFromConfigFileURL(t, cfgPath)
+
+	return err
+}
+
+// startServerFromConfigFileURL is startServerFromConfigFile returning the base
+// URL the server bound to, so a test that talks to it can leave the port as "0"
+// rather than reserving one before the bind.
+func startServerFromConfigFileURL(t *testing.T, cfgPath string) (string, error) {
+	t.Helper()
+
+	conf := config.New()
+	if err := cli.LoadConfiguration(conf, cfgPath); err != nil {
+		return "", err
+	}
+
+	ctlr, hotReloader, err := cli.InitController(conf, cfgPath)
+	if err != nil {
+		return "", err
+	}
+
+	ctrlManager := NewControllerManager(ctlr)
+	go ctrlManager.RunServer()
+
+	stop := sync.OnceFunc(func() {
+		hotReloader.Stop()
+		ctlr.Shutdown()
+	})
+	t.Cleanup(stop)
+	Reset(stop)
+
+	ctrlManager.WaitServerReady()
+
+	return ctrlManager.BaseURL(), nil
 }
 
 func TestRetentionDelayDefaults(t *testing.T) {
@@ -4173,6 +4277,409 @@ func TestMetricsConfigurationValidation(t *testing.T) {
 			cfg := config.New()
 			tmpfile := MakeTempFileWithContent(t, "zot-test.json", content)
 			err := cli.LoadConfiguration(cfg, tmpfile)
+			So(err, ShouldBeNil)
+		})
+	})
+}
+
+func TestVerifyEventsConfig(t *testing.T) {
+	Convey("events typePrefix validation", t, func() {
+		makeContent := func(typePrefix string) string {
+			return `{
+				"storage": {"rootDirectory": "/tmp/zot"},
+				"http": {
+					"address": "127.0.0.1", "port": "8080"
+				},
+				"extensions": {
+					"events": {
+						"enable": true,
+						"typePrefix": "` + typePrefix + `",
+						"sinks": [{
+							"type": "http",
+							"address": "http://127.0.0.1:8000",
+							"timeout": "10s"
+						}]
+					}
+				}
+			}`
+		}
+
+		for _, typePrefix := range []string{".example", "example.", "com..example"} {
+			Convey("Reject typePrefix "+typePrefix, func() {
+				cfg := config.New()
+				tmpfile := MakeTempFileWithContent(t, "zot-test.json", makeContent(typePrefix))
+				err := cli.LoadConfiguration(cfg, tmpfile)
+				So(err, ShouldNotBeNil)
+				So(err, ShouldWrap, zerr.ErrBadConfig)
+			})
+		}
+
+		Convey("Allow a valid typePrefix", func() {
+			cfg := config.New()
+			tmpfile := MakeTempFileWithContent(t, "zot-test.json", makeContent("com.example.registry"))
+			err := cli.LoadConfiguration(cfg, tmpfile)
+			So(err, ShouldBeNil)
+		})
+	})
+}
+
+func TestManifestCheckIntervalConfig(t *testing.T) {
+	Convey("manifestCheckInterval validation", t, func() {
+		Convey("Parse a valid manifestCheckInterval", func() {
+			content := `{"storage":{"rootDirectory":"/tmp/zot"},
+				"http":{"address":"127.0.0.1","port":"8080","realm":"zot",
+				"auth":{"htpasswd":{"path":"test/data/htpasswd"},"failDelay":1}},
+				"extensions":{"sync": {"registries": [{"urls":["localhost:9999"],
+				"onDemand": true, "manifestCheckInterval": "10m"}]}}}`
+			cfg := config.New()
+			tmpfile := MakeTempFileWithContent(t, "zot-test.json", content)
+			err := cli.LoadConfiguration(cfg, tmpfile)
+			So(err, ShouldBeNil)
+			So(cfg.Extensions.Sync.Registries[0].ManifestCheckInterval, ShouldEqual, 10*time.Minute)
+		})
+
+		Convey("Omitting manifestCheckInterval leaves it disabled", func() {
+			content := `{"storage":{"rootDirectory":"/tmp/zot"},
+				"http":{"address":"127.0.0.1","port":"8080","realm":"zot",
+				"auth":{"htpasswd":{"path":"test/data/htpasswd"},"failDelay":1}},
+				"extensions":{"sync": {"registries": [{"urls":["localhost:9999"],
+				"onDemand": true}]}}}`
+			cfg := config.New()
+			tmpfile := MakeTempFileWithContent(t, "zot-test.json", content)
+			err := cli.LoadConfiguration(cfg, tmpfile)
+			So(err, ShouldBeNil)
+			So(cfg.Extensions.Sync.Registries[0].ManifestCheckInterval, ShouldEqual, time.Duration(0))
+		})
+
+		Convey("A zero manifestCheckInterval is accepted without onDemand", func() {
+			content := `{"storage":{"rootDirectory":"/tmp/zot"},
+				"http":{"address":"127.0.0.1","port":"8080","realm":"zot",
+				"auth":{"htpasswd":{"path":"test/data/htpasswd"},"failDelay":1}},
+				"extensions":{"sync": {"registries": [{"urls":["localhost:9999"],
+				"onDemand": false, "pollInterval": "12h", "manifestCheckInterval": "0s"}]}}}`
+			cfg := config.New()
+			tmpfile := MakeTempFileWithContent(t, "zot-test.json", content)
+			err := cli.LoadConfiguration(cfg, tmpfile)
+			So(err, ShouldBeNil)
+		})
+
+		Convey("Reject manifestCheckInterval when onDemand is false", func() {
+			content := `{"storage":{"rootDirectory":"/tmp/zot"},
+				"http":{"address":"127.0.0.1","port":"8080","realm":"zot",
+				"auth":{"htpasswd":{"path":"test/data/htpasswd"},"failDelay":1}},
+				"extensions":{"sync": {"registries": [{"urls":["localhost:9999"],
+				"onDemand": false, "pollInterval": "12h", "manifestCheckInterval": "10m"}]}}}`
+			cfg := config.New()
+			tmpfile := MakeTempFileWithContent(t, "zot-test.json", content)
+			err := cli.LoadConfiguration(cfg, tmpfile)
+			So(err, ShouldNotBeNil)
+			So(err, ShouldWrap, zerr.ErrBadConfig)
+			So(err.Error(), ShouldContainSubstring, "manifestCheckInterval requires onDemand to be enabled")
+		})
+
+		Convey("Reject a negative manifestCheckInterval", func() {
+			content := `{"storage":{"rootDirectory":"/tmp/zot"},
+				"http":{"address":"127.0.0.1","port":"8080","realm":"zot",
+				"auth":{"htpasswd":{"path":"test/data/htpasswd"},"failDelay":1}},
+				"extensions":{"sync": {"registries": [{"urls":["localhost:9999"],
+				"onDemand": true, "manifestCheckInterval": "-10m"}]}}}`
+			cfg := config.New()
+			tmpfile := MakeTempFileWithContent(t, "zot-test.json", content)
+			err := cli.LoadConfiguration(cfg, tmpfile)
+			So(err, ShouldNotBeNil)
+			So(err, ShouldWrap, zerr.ErrBadConfig)
+			So(err.Error(), ShouldContainSubstring, "manifestCheckInterval cannot be negative")
+		})
+
+		Convey("manifestCheckInterval coexists with a periodic upstream on another registry", func() {
+			content := `{"storage":{"rootDirectory":"/tmp/zot"},
+				"http":{"address":"127.0.0.1","port":"8080","realm":"zot",
+				"auth":{"htpasswd":{"path":"test/data/htpasswd"},"failDelay":1}},
+				"extensions":{"sync": {"registries": [
+					{"urls":["localhost:9999"], "onDemand": true, "manifestCheckInterval": "1h"},
+					{"urls":["localhost:9998"], "onDemand": true, "pollInterval": "12h", "manifestCheckInterval": "30m"}
+				]}}}`
+			cfg := config.New()
+			tmpfile := MakeTempFileWithContent(t, "zot-test.json", content)
+			err := cli.LoadConfiguration(cfg, tmpfile)
+			So(err, ShouldBeNil)
+		})
+	})
+}
+
+func TestOnDemandInBackgroundConfig(t *testing.T) {
+	Convey("onDemandInBackground validation", t, func() {
+		Convey("Accept onDemandInBackground with onDemand", func() {
+			content := `{"storage":{"rootDirectory":"/tmp/zot"},
+				"http":{"address":"127.0.0.1","port":"8080","realm":"zot",
+				"auth":{"htpasswd":{"path":"test/data/htpasswd"},"failDelay":1}},
+				"extensions":{"sync": {"registries": [{"urls":["localhost:9999"],
+				"onDemand": true, "onDemandInBackground": true}]}}}`
+			cfg := config.New()
+			tmpfile := MakeTempFileWithContent(t, "zot-test.json", content)
+			err := cli.LoadConfiguration(cfg, tmpfile)
+			So(err, ShouldBeNil)
+			So(cfg.Extensions.Sync.Registries[0].IsOnDemandInBackgroundEnabled(), ShouldBeTrue)
+		})
+
+		Convey("Reject onDemandInBackground without onDemand", func() {
+			content := `{"storage":{"rootDirectory":"/tmp/zot"},
+				"http":{"address":"127.0.0.1","port":"8080","realm":"zot",
+				"auth":{"htpasswd":{"path":"test/data/htpasswd"},"failDelay":1}},
+				"extensions":{"sync": {"registries": [{"urls":["localhost:9999"],
+				"onDemand": false, "onDemandInBackground": true}]}}}`
+			cfg := config.New()
+			tmpfile := MakeTempFileWithContent(t, "zot-test.json", content)
+			err := cli.LoadConfiguration(cfg, tmpfile)
+			So(err, ShouldNotBeNil)
+			So(err, ShouldWrap, zerr.ErrBadConfig)
+			So(err.Error(), ShouldContainSubstring, "onDemandInBackground requires onDemand to be enabled")
+		})
+
+		Convey("Reject onDemandInBackground with manifestCheckInterval", func() {
+			content := `{"storage":{"rootDirectory":"/tmp/zot"},
+				"http":{"address":"127.0.0.1","port":"8080","realm":"zot",
+				"auth":{"htpasswd":{"path":"test/data/htpasswd"},"failDelay":1}},
+				"extensions":{"sync": {"registries": [{"urls":["localhost:9999"],
+				"onDemand": true, "onDemandInBackground": true, "manifestCheckInterval": "1h"}]}}}`
+			cfg := config.New()
+			tmpfile := MakeTempFileWithContent(t, "zot-test.json", content)
+			err := cli.LoadConfiguration(cfg, tmpfile)
+			So(err, ShouldNotBeNil)
+			So(err, ShouldWrap, zerr.ErrBadConfig)
+			So(err.Error(), ShouldContainSubstring, "onDemandInBackground is incompatible with manifestCheckInterval")
+		})
+	})
+}
+
+func TestSyncPlatformsConfig(t *testing.T) {
+	Convey("platforms validation", t, func() {
+		Convey("Accept valid platforms including empty string", func() {
+			content := `{"storage":{"rootDirectory":"/tmp/zot"},
+				"http":{"address":"127.0.0.1","port":"8080","realm":"zot",
+				"auth":{"htpasswd":{"path":"test/data/htpasswd"},"failDelay":1}},
+				"extensions":{"sync": {"registries": [{"urls":["localhost:9999"],
+				"onDemand": false, "pollInterval": "12h",
+				"platforms": ["linux/amd64", "linux/arm64", "amd64", ""]}]}}}`
+			cfg := config.New()
+			tmpfile := MakeTempFileWithContent(t, "zot-test.json", content)
+			err := cli.LoadConfiguration(cfg, tmpfile)
+			So(err, ShouldBeNil)
+			So(cfg.Extensions.Sync.Registries[0].Platforms, ShouldResemble,
+				[]string{"linux/amd64", "linux/arm64", "amd64", ""})
+		})
+
+		Convey("Reject invalid platforms entry", func() {
+			content := `{"storage":{"rootDirectory":"/tmp/zot"},
+				"http":{"address":"127.0.0.1","port":"8080","realm":"zot",
+				"auth":{"htpasswd":{"path":"test/data/htpasswd"},"failDelay":1}},
+				"extensions":{"sync": {"registries": [{"urls":["localhost:9999"],
+				"onDemand": false, "pollInterval": "12h",
+				"platforms": ["linux/amd64", "not a platform!!!"]}]}}}`
+			cfg := config.New()
+			tmpfile := MakeTempFileWithContent(t, "zot-test.json", content)
+			err := cli.LoadConfiguration(cfg, tmpfile)
+			So(err, ShouldNotBeNil)
+			So(err, ShouldWrap, zerr.ErrBadConfig)
+			So(err.Error(), ShouldContainSubstring, "invalid platforms entry")
+		})
+
+		Convey("Accept content platforms override and reject invalid content platforms", func() {
+			valid := `{"storage":{"rootDirectory":"/tmp/zot"},
+				"http":{"address":"127.0.0.1","port":"8080","realm":"zot",
+				"auth":{"htpasswd":{"path":"test/data/htpasswd"},"failDelay":1}},
+				"extensions":{"sync": {"registries": [{"urls":["localhost:9999"],
+				"onDemand": false, "pollInterval": "12h",
+				"platforms": ["linux/amd64"],
+				"content": [{"prefix": "special/**", "platforms": ["linux/arm64", ""]}]}]}}}`
+			cfg := config.New()
+			tmpfile := MakeTempFileWithContent(t, "zot-test.json", valid)
+			err := cli.LoadConfiguration(cfg, tmpfile)
+			So(err, ShouldBeNil)
+			So(cfg.Extensions.Sync.Registries[0].Content[0].Platforms, ShouldNotBeNil)
+			So(*cfg.Extensions.Sync.Registries[0].Content[0].Platforms, ShouldResemble,
+				[]string{"linux/arm64", ""})
+
+			invalid := `{"storage":{"rootDirectory":"/tmp/zot"},
+				"http":{"address":"127.0.0.1","port":"8080","realm":"zot",
+				"auth":{"htpasswd":{"path":"test/data/htpasswd"},"failDelay":1}},
+				"extensions":{"sync": {"registries": [{"urls":["localhost:9999"],
+				"onDemand": false, "pollInterval": "12h",
+				"content": [{"prefix": "special/**", "platforms": ["bad!!!"]}]}]}}}`
+			cfg = config.New()
+			tmpfile = MakeTempFileWithContent(t, "zot-test-bad.json", invalid)
+			err = cli.LoadConfiguration(cfg, tmpfile)
+			So(err, ShouldNotBeNil)
+			So(err, ShouldWrap, zerr.ErrBadConfig)
+			So(err.Error(), ShouldContainSubstring, "invalid platforms entry")
+		})
+	})
+}
+
+func TestStreamingSyncConfig(t *testing.T) {
+	Convey("stream validation", t, func() {
+		validRegistry := `{"urls":["https://localhost:9999"], "onDemand": true, "stream": true}`
+
+		loadWithRegistry := func(t *testing.T, registryJSON string) error {
+			t.Helper()
+
+			content := `{"storage":{"rootDirectory":"/tmp/zot"},
+				"http":{"address":"127.0.0.1","port":"8080","realm":"zot","compat": ["docker2s2"],
+				"auth":{"htpasswd":{"path":"test/data/htpasswd"},"failDelay":1}},
+				"extensions":{"sync": {"registries": [` + registryJSON + `]}}}`
+			cfg := config.New()
+			tmpfile := MakeTempFileWithContent(t, "zot-test.json", content)
+
+			return cli.LoadConfiguration(cfg, tmpfile)
+		}
+
+		Convey("A valid stream config is accepted", func() {
+			err := loadWithRegistry(t, validRegistry)
+			So(err, ShouldBeNil)
+		})
+
+		Convey("stream: false is unaffected by the extra restrictions", func() {
+			err := loadWithRegistry(t,
+				`{"urls":["localhost:9999"], "onDemand": true, "maxRetries": 3, "retryDelay": "5s", "stream": false}`)
+			So(err, ShouldBeNil)
+		})
+
+		Convey("Reject stream without onDemand", func() {
+			err := loadWithRegistry(t,
+				`{"urls":["https://localhost:9999"], "onDemand": false, "pollInterval": "12h", "stream": true}`)
+			So(err, ShouldNotBeNil)
+			So(err, ShouldWrap, zerr.ErrBadConfig)
+			So(err.Error(), ShouldContainSubstring, "stream requires onDemand to be enabled")
+		})
+
+		Convey("Reject stream combined with maxRetries", func() {
+			err := loadWithRegistry(t,
+				`{"urls":["https://localhost:9999"], "onDemand": true, "stream": true,`+
+					` "maxRetries": 3, "retryDelay": "5s"}`)
+			So(err, ShouldNotBeNil)
+			So(err, ShouldWrap, zerr.ErrBadConfig)
+			So(err.Error(), ShouldContainSubstring, "stream cannot be combined with maxRetries/retryDelay")
+		})
+
+		Convey("Reject stream combined with onDemandInBackground", func() {
+			err := loadWithRegistry(t,
+				`{"urls":["https://localhost:9999"], "onDemand": true, "stream": true, "onDemandInBackground": true}`)
+			So(err, ShouldNotBeNil)
+			So(err, ShouldWrap, zerr.ErrBadConfig)
+			So(err.Error(), ShouldContainSubstring, "stream cannot be combined with onDemandInBackground")
+		})
+
+		Convey("Accept stream and onDemandInBackground on different registries for the same repo", func() {
+			// Validation is per registry, so this is allowed; onDemandInBackground wins at request
+			// time (see IsStreamingEnabledForRepo).
+			err := loadWithRegistry(t,
+				`{"urls":["https://localhost:9999"], "onDemand": true, "stream": true,`+
+					` "content": [{"prefix": "library/**"}]},`+
+					`{"urls":["https://localhost:9998"], "onDemand": true, "onDemandInBackground": true,`+
+					` "content": [{"prefix": "library/**"}]}`)
+			So(err, ShouldBeNil)
+		})
+
+		Convey("Reject stream combined with tlsVerify: false", func() {
+			err := loadWithRegistry(t,
+				`{"urls":["https://localhost:9999"], "onDemand": true, "stream": true, "tlsVerify": false}`)
+			So(err, ShouldNotBeNil)
+			So(err, ShouldWrap, zerr.ErrBadConfig)
+			So(err.Error(), ShouldContainSubstring, "stream cannot be combined with tlsVerify: false")
+		})
+
+		Convey("Reject stream combined with an http upstream URL", func() {
+			err := loadWithRegistry(t,
+				`{"urls":["http://localhost:9999"], "onDemand": true, "stream": true}`)
+			So(err, ShouldNotBeNil)
+			So(err, ShouldWrap, zerr.ErrBadConfig)
+			So(err.Error(), ShouldContainSubstring, "stream requires https upstream URLs")
+		})
+
+		Convey("Reject stream with a bare host:port upstream URL", func() {
+			// url.Parse reads "localhost:9999" as scheme "localhost" with no host.
+			err := loadWithRegistry(t,
+				`{"urls":["localhost:9999"], "onDemand": true, "stream": true}`)
+			So(err, ShouldNotBeNil)
+			So(err, ShouldWrap, zerr.ErrBadConfig)
+			So(err.Error(), ShouldContainSubstring, "stream requires https upstream URLs")
+		})
+
+		Convey("Reject stream with a non-https scheme or no host", func() {
+			for _, rawURL := range []string{"ftp://localhost:9999", "https://", "https:///v2"} {
+				err := loadWithRegistry(t,
+					`{"urls":["`+rawURL+`"], "onDemand": true, "stream": true}`)
+				So(err, ShouldNotBeNil)
+				So(err, ShouldWrap, zerr.ErrBadConfig)
+				So(err.Error(), ShouldContainSubstring, "stream requires https upstream URLs")
+			}
+		})
+
+		Convey("Reject stream when any one of several URLs isn't https", func() {
+			err := loadWithRegistry(t,
+				`{"urls":["https://localhost:9999", "localhost:9998"], "onDemand": true, "stream": true}`)
+			So(err, ShouldNotBeNil)
+			So(err, ShouldWrap, zerr.ErrBadConfig)
+			So(err.Error(), ShouldContainSubstring, "stream requires https upstream URLs")
+		})
+
+		Convey("Reject a non-positive maxConcurrentStreams", func() {
+			err := loadWithRegistry(t,
+				`{"urls":["https://localhost:9999"], "onDemand": true, "stream": true, "maxConcurrentStreams": 0}`)
+			So(err, ShouldNotBeNil)
+			So(err, ShouldWrap, zerr.ErrBadConfig)
+			So(err.Error(), ShouldContainSubstring, "maxConcurrentStreams must be greater than 0")
+		})
+
+		Convey("A positive maxConcurrentStreams is accepted", func() {
+			err := loadWithRegistry(t,
+				`{"urls":["https://localhost:9999"], "onDemand": true, "stream": true, "maxConcurrentStreams": 8}`)
+			So(err, ShouldBeNil)
+		})
+
+		Convey("Reject disagreeing maxConcurrentStreams across streaming registries", func() {
+			regA := `{"urls":["https://localhost:9999"], "onDemand": true, "stream": true,` +
+				` "maxConcurrentStreams": 8, "content": [{"prefix": "a/**"}]}`
+			regB := `{"urls":["https://localhost:9998"], "onDemand": true, "stream": true,` +
+				` "maxConcurrentStreams": 4, "content": [{"prefix": "b/**"}]}`
+
+			err := loadWithRegistry(t, regA+","+regB)
+			So(err, ShouldNotBeNil)
+			So(err, ShouldWrap, zerr.ErrBadConfig)
+			So(err.Error(), ShouldContainSubstring, "maxConcurrentStreams must be the same across every streaming registry")
+		})
+
+		Convey("Streaming registries that agree on maxConcurrentStreams are accepted", func() {
+			regA := `{"urls":["https://localhost:9999"], "onDemand": true, "stream": true,` +
+				` "maxConcurrentStreams": 8, "content": [{"prefix": "a/**"}]}`
+			regB := `{"urls":["https://localhost:9998"], "onDemand": true, "stream": true,` +
+				` "maxConcurrentStreams": 8, "content": [{"prefix": "b/**"}]}`
+
+			err := loadWithRegistry(t, regA+","+regB)
+			So(err, ShouldBeNil)
+		})
+
+		Convey("Reject an unset maxConcurrentStreams followed by an explicit one that differs from the default", func() {
+			// The shared manager is built from the first streaming registry, so regA (unset,
+			// default 32) would win and regB's 8 be ignored. Unset must be compared as the default.
+			regA := `{"urls":["https://localhost:9999"], "onDemand": true, "stream": true,` +
+				` "content": [{"prefix": "a/**"}]}`
+			regB := `{"urls":["https://localhost:9998"], "onDemand": true, "stream": true,` +
+				` "maxConcurrentStreams": 8, "content": [{"prefix": "b/**"}]}`
+
+			err := loadWithRegistry(t, regA+","+regB)
+			So(err, ShouldNotBeNil)
+			So(err, ShouldWrap, zerr.ErrBadConfig)
+			So(err.Error(), ShouldContainSubstring, "maxConcurrentStreams must be the same across every streaming registry")
+		})
+
+		Convey("Streaming registries that all leave maxConcurrentStreams unset are accepted", func() {
+			regA := `{"urls":["https://localhost:9999"], "onDemand": true, "stream": true,` +
+				` "content": [{"prefix": "a/**"}]}`
+			regB := `{"urls":["https://localhost:9998"], "onDemand": true, "stream": true,` +
+				` "content": [{"prefix": "b/**"}]}`
+
+			err := loadWithRegistry(t, regA+","+regB)
 			So(err, ShouldBeNil)
 		})
 	})

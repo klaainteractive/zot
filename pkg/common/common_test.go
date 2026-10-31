@@ -68,6 +68,53 @@ func TestCommon(t *testing.T) {
 		So(common.IsArtifactTypeCosign("application/example"), ShouldBeFalse)
 	})
 
+	Convey("Test IsCosignSignatureArtifact", t, func() {
+		predicate := func(predicateType string) map[string]string {
+			return map[string]string{common.CosignBundlePredicateTypeAnnotation: predicateType}
+		}
+
+		So(common.IsCosignSignatureArtifact(common.ArtifactTypeCosign, nil), ShouldBeTrue)
+		// bundles written by `cosign sign`, or without the annotation, are signatures
+		So(common.IsCosignSignatureArtifact(common.ArtifactTypeCosignBundle, nil), ShouldBeTrue)
+		So(common.IsCosignSignatureArtifact(common.ArtifactTypeCosignBundle,
+			predicate(common.CosignSignPredicateType)), ShouldBeTrue)
+		// bundles written by `cosign attest` are attestations
+		So(common.IsCosignSignatureArtifact(common.ArtifactTypeCosignBundle,
+			predicate("https://spdx.dev/Document")), ShouldBeFalse)
+		So(common.IsCosignSignatureArtifact(common.ArtifactTypeCosignBundle,
+			predicate("https://cosign.sigstore.dev/attestation/vuln/v1")), ShouldBeFalse)
+		So(common.IsCosignSignatureArtifact(common.ArtifactTypeCosignBundle, predicate("")), ShouldBeFalse)
+		So(common.IsCosignSignatureArtifact(common.ArtifactTypeNotation, nil), ShouldBeFalse)
+		So(common.IsCosignSignatureArtifact("application/example",
+			predicate(common.CosignSignPredicateType)), ShouldBeFalse)
+	})
+
+	Convey("Test legacy cosign tag predicates match only the exact tag shape", t, func() {
+		hex := strings.Repeat("a", 64)
+
+		So(common.IsCosignSignature("sha256-"+hex+".sig"), ShouldBeTrue)
+		So(common.IsCosignSBOM("sha256-"+hex+".sbom"), ShouldBeTrue)
+		So(common.IsCosignTag("sha256-"+hex+".sig"), ShouldBeTrue)
+		So(common.IsCosignTag("sha256-"+hex+".sbom"), ShouldBeTrue)
+
+		for _, tag := range []string{
+			"sha256-abc.sig", // short digest
+			"sha256-" + strings.Repeat("a", 65) + ".sig",  // long digest
+			"sha256-" + strings.Repeat("z", 64) + ".sig",  // non-hex digest
+			"sha256-" + strings.Repeat("A", 64) + ".sig",  // uppercase hex is not a valid sha256 encoding
+			"sha256-not-a-valid-digest.sig",               // hyphenated garbage
+			"v1-sha256-" + hex + ".sig",                   // unanchored prefix
+			"sha256-" + hex + ".sig.bak",                  // unanchored suffix
+			"sha512-" + strings.Repeat("a", 128) + ".sig", // other algorithms were never matched
+		} {
+			So(common.IsCosignSignature(tag), ShouldBeFalse)
+			So(common.IsCosignTag(tag), ShouldBeFalse)
+		}
+
+		So(common.IsCosignSBOM("sha256-abc.sbom"), ShouldBeFalse)
+		So(common.IsCosignSBOM("sha256-"+hex+".sbom.bak"), ShouldBeFalse)
+	})
+
 	Convey("Test GetLocalIPs", t, func() {
 		localIPs, err := common.GetLocalIPs()
 		So(err, ShouldBeNil)
@@ -173,4 +220,40 @@ func TestCommon(t *testing.T) {
 		So(err, ShouldNotBeNil)
 		So(result, ShouldBeFalse)
 	})
+}
+
+func TestIsReferrersTag(t *testing.T) {
+	validTag := "sha256-" + strings.Repeat("a", 64)
+
+	cases := map[string]bool{
+		validTag:                            true,
+		"sha256-x":                          false,
+		"sha256-" + strings.Repeat("a", 63): false,
+		"sha256-" + strings.Repeat("g", 64): false,
+		"prefix-" + validTag:                false,
+		validTag + ".sig":                   false,
+	}
+
+	for tag, expected := range cases {
+		if got := common.IsReferrersTag(tag); got != expected {
+			t.Errorf("IsReferrersTag(%q) = %v, want %v", tag, got, expected)
+		}
+	}
+}
+
+func TestIsCosignSignature(t *testing.T) {
+	validTag := "sha256-" + strings.Repeat("a", 64) + ".sig"
+
+	cases := map[string]bool{
+		validTag:             true,
+		"sha256-x.sig":       false,
+		"prefix-" + validTag: false,
+		"sha256-" + strings.Repeat("a", 63) + ".sig": false,
+	}
+
+	for tag, expected := range cases {
+		if got := common.IsCosignSignature(tag); got != expected {
+			t.Errorf("IsCosignSignature(%q) = %v, want %v", tag, got, expected)
+		}
+	}
 }

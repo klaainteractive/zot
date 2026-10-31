@@ -3,7 +3,9 @@ package main
 import (
 	crand "crypto/rand"
 	"crypto/tls"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math/big"
 	"net"
@@ -43,6 +45,10 @@ const (
 	maxSourceIPs         = 1000
 	httpTimeout          = 30 * time.Second
 	TLSHandshakeTimeout  = 10 * time.Second
+	// Seed uploads must succeed before scored requests can run. Retry a few
+	// times on timeout-class errors (common under concurrent large PUTs).
+	maxSeedPushAttempts  = 3
+	seedPushRetryBackoff = 500 * time.Millisecond
 )
 
 //nolint:gochecknoglobals
@@ -51,62 +57,90 @@ var blobHash map[string]godigest.Digest = map[string]godigest.Digest{}
 //nolint:gochecknoglobals // used only in this test
 var statusRequests sync.Map
 
-func setup(workingDir string, sizesToPrepare []int) {
-	_ = os.MkdirAll(workingDir, defaultDirPerms)
-
-	const rndPageSize = 4 * KiB
+// setup creates the test blobs in workingDir and pre-computes their digests.
+// Errors are returned rather than terminating the process so the caller can
+// clean up the working directory before exiting.
+func setup(workingDir string, sizesToPrepare []int) error {
+	if err := os.MkdirAll(workingDir, defaultDirPerms); err != nil {
+		return err
+	}
 
 	for _, size := range sizesToPrepare {
 		fname := path.Join(workingDir, fmt.Sprintf("%d.blob", size))
 
-		fhandle, err := os.OpenFile(fname, os.O_RDWR|os.O_CREATE|os.O_TRUNC, defaultFilePerms)
+		digest, err := createBlob(fname, size)
 		if err != nil {
-			log.Fatal(err)
-		}
-
-		err = fhandle.Truncate(int64(size))
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		_, err = fhandle.Seek(0, 0)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		// write a random first page so every test run has different blob content
-		rnd := make([]byte, rndPageSize)
-		if _, err := crand.Read(rnd); err != nil {
-			log.Fatal(err)
-		}
-
-		if _, err := fhandle.Write(rnd); err != nil {
-			log.Fatal(err)
-		}
-
-		if _, err := fhandle.Seek(0, 0); err != nil {
-			log.Fatal(err)
-		}
-
-		if err := fhandle.Close(); err != nil { // should flush the write
-			log.Fatal(err)
-		}
-
-		// pre-compute the SHA256
-		fhandle, err = os.OpenFile(fname, os.O_RDONLY, defaultFilePerms)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		defer fhandle.Close()
-
-		digest, err := godigest.FromReader(fhandle)
-		if err != nil {
-			log.Fatal(err) //nolint:gocritic // file closed on exit
+			return err
 		}
 
 		blobHash[fname] = digest
 	}
+
+	return nil
+}
+
+// createBlob creates a sparse file of the given size with a random first page,
+// so every test run has different blob content, and returns its digest.
+func createBlob(fname string, size int) (godigest.Digest, error) {
+	const rndPageSize = 4 * KiB
+
+	fhandle, err := os.OpenFile(fname, os.O_RDWR|os.O_CREATE|os.O_TRUNC, defaultFilePerms)
+	if err != nil {
+		return "", err
+	}
+
+	if err := fhandle.Truncate(int64(size)); err != nil {
+		fhandle.Close()
+
+		return "", err
+	}
+
+	rnd := make([]byte, rndPageSize)
+	if _, err := crand.Read(rnd); err != nil {
+		fhandle.Close()
+
+		return "", err
+	}
+
+	if _, err := fhandle.Write(rnd); err != nil {
+		fhandle.Close()
+
+		return "", err
+	}
+
+	if err := fhandle.Close(); err != nil { // should flush the write
+		return "", err
+	}
+
+	// pre-compute the SHA256
+	fhandle, err = os.OpenFile(fname, os.O_RDONLY, defaultFilePerms)
+	if err != nil {
+		return "", err
+	}
+	defer fhandle.Close()
+
+	return godigest.FromReader(fhandle)
+}
+
+// createWorkDir creates a unique temporary directory under baseDir (or under the
+// current working directory when baseDir is empty) to hold the test blobs.
+// Keeping the blobs in a dedicated directory lets teardown remove exactly what
+// zb created without touching anything else in the user-provided directory.
+func createWorkDir(baseDir string) (string, error) {
+	if baseDir == "" {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return "", err
+		}
+
+		baseDir = cwd
+	}
+
+	if err := os.MkdirAll(baseDir, defaultDirPerms); err != nil {
+		return "", err
+	}
+
+	return os.MkdirTemp(baseDir, "zb-*")
 }
 
 func teardown(workingDir string) {
@@ -129,6 +163,7 @@ type statsSummary struct {
 	rps                  float32
 	mixedSize, mixedType bool
 	errorCount           int
+	timeoutErrorCount    int
 	errors               map[string]int
 	manifestHeadTTFBs    []time.Duration
 	manifestGetTTFBs     []time.Duration
@@ -171,6 +206,10 @@ type statsRecord struct {
 func updateStats(summary *statsSummary, record statsRecord) {
 	if record.isConnFail || record.isErr {
 		summary.errorCount++
+
+		if isTimeoutError(record.err) {
+			summary.timeoutErrorCount++
+		}
 	}
 
 	if record.err != nil {
@@ -356,7 +395,8 @@ func GetCatalog(
 
 	for range suiteCfg.requests {
 		// Push random blob
-		_, repos, err = pushMonolithImage(suiteCfg.workDir, suiteCfg.targetServerURL, suiteCfg.repo, repos, config, client)
+		_, repos, err = pushMonolithImageWithRetry(
+			suiteCfg.workDir, suiteCfg.targetServerURL, suiteCfg.repo, repos, config, client)
 		if err != nil {
 			return err
 		}
@@ -505,7 +545,7 @@ func Pull(
 		config.size = smallBlob
 
 		// Push small blob
-		manifestBySize, repos, err := pushMonolithImage(
+		manifestBySize, repos, err := pushMonolithImageWithRetry(
 			suiteCfg.workDir, pushTargetURL, suiteCfg.repo, repos, config, client)
 		if err != nil {
 			return err
@@ -516,7 +556,7 @@ func Pull(
 		config.size = mediumBlob
 
 		// Push medium blob
-		manifestBySize, repos, err = pushMonolithImage(
+		manifestBySize, repos, err = pushMonolithImageWithRetry(
 			suiteCfg.workDir, pushTargetURL, suiteCfg.repo, repos, config, client)
 		if err != nil {
 			return err
@@ -528,7 +568,7 @@ func Pull(
 
 		// Push large blob
 		//nolint: ineffassign, staticcheck, wastedassign
-		manifestBySize, repos, err = pushMonolithImage(
+		manifestBySize, repos, err = pushMonolithImageWithRetry(
 			suiteCfg.workDir, pushTargetURL, suiteCfg.repo, repos, config, client)
 		if err != nil {
 			return err
@@ -539,7 +579,7 @@ func Pull(
 		// Push blob given size
 		var err error
 
-		manifestHash, repos, err = pushMonolithImage(
+		manifestHash, repos, err = pushMonolithImageWithRetry(
 			suiteCfg.workDir, pushTargetURL, suiteCfg.repo, repos, config, client)
 		if err != nil {
 			return err
@@ -585,7 +625,7 @@ func MixedPullAndPush(
 	statusRequests = sync.Map{}
 
 	// Push blob given size
-	manifestHash, repos, err := pushMonolithImage(
+	manifestHash, repos, err := pushMonolithImageWithRetry(
 		suiteCfg.workDir, suiteCfg.targetServerURL, suiteCfg.repo, repos, config, client)
 	if err != nil {
 		return err
@@ -778,7 +818,7 @@ func Perf(
 	workdir, url, auth, repo string,
 	concurrency int, requests int,
 	outFmt string, srcIPs string, srcCIDR string, skipCleanup bool,
-	testRegex *regexp.Regexp, upstreamServerURL string,
+	testRegex *regexp.Regexp, upstreamServerURL string, maxTimeoutFailures int,
 ) {
 	// logging
 	log.SetFlags(0)
@@ -794,17 +834,15 @@ func Perf(
 	}
 	log.Printf("Concurrency Level:\t%v", concurrency)
 	log.Printf("Total requests:\t%v", requests)
+	log.Printf("Max timeout failures:\t%v", maxTimeoutFailures)
 
-	if workdir == "" {
-		cwd, err := os.Getwd()
-		if err != nil {
-			log.Fatal("unable to get current working dir")
-		}
-
-		log.Printf("Working dir:\t%v", cwd)
-	} else {
-		log.Printf("Working dir:\t%v", workdir)
+	// test data goes into a dedicated temp dir so that teardown only removes what zb created
+	workdir, err := createWorkDir(workdir)
+	if err != nil {
+		log.Fatal("unable to create working dir: ", err)
 	}
+
+	log.Printf("Working dir:\t%v", workdir)
 
 	log.Printf("\n")
 
@@ -845,13 +883,14 @@ func Perf(
 		sizesToPrepare = append(sizesToPrepare, size)
 	}
 
-	setup(workdir, sizesToPrepare)
+	if err := setup(workdir, sizesToPrepare); err != nil {
+		fatalWithCleanup(&teardownOnce, workdir, err)
+	}
 
 	log.Printf("Starting tests ...\n")
 
-	var err error
-
-	zbError := false
+	totalFailures := 0
+	timeoutFailures := 0
 
 	// get host ips from command line to make requests from
 	var ips []string
@@ -920,9 +959,8 @@ func Perf(
 		printStats(requests, &summary)
 		statsSummaries = append(statsSummaries, summary)
 
-		if summary.errorCount != 0 && !zbError {
-			zbError = true
-		}
+		totalFailures += summary.errorCount
+		timeoutFailures += summary.timeoutErrorCount
 	}
 
 	if err = outputTestResults(statsSummaries, outFmt); err != nil {
@@ -934,9 +972,98 @@ func Perf(
 		teardown(workdir)
 	})
 
-	if zbError {
+	hardFailures := totalFailures - timeoutFailures
+
+	printFailureBudget(hardFailures, timeoutFailures, maxTimeoutFailures)
+
+	if shouldFailRun(hardFailures, timeoutFailures, maxTimeoutFailures) {
 		os.Exit(1)
 	}
+}
+
+// isTimeoutError reports whether err looks like a request timeout (or the common
+// client-side symptom when a server closes the connection after its own timeout).
+// That includes unexpected EOF from a truncated response after http.Server
+// WriteTimeout cuts a long blob transfer mid-stream.
+func isTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+
+	if errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+
+	msg := strings.ToLower(err.Error())
+
+	return strings.Contains(msg, "timeout") ||
+		strings.Contains(msg, "deadline exceeded") ||
+		strings.Contains(msg, "use of closed network connection") ||
+		strings.Contains(msg, "unexpected eof")
+}
+
+// retryOnTimeoutError runs op up to maxSeedPushAttempts times while errors are
+// timeout-class. Non-timeout errors fail immediately. backoff is applied between
+// attempts when > 0.
+func retryOnTimeoutError(backoff time.Duration, op func() error) error {
+	var err error
+
+	for attempt := 1; attempt <= maxSeedPushAttempts; attempt++ {
+		err = op()
+		if err == nil {
+			return nil
+		}
+
+		if !isTimeoutError(err) || attempt == maxSeedPushAttempts {
+			return err
+		}
+
+		log.Printf("timeout-class error (attempt %d/%d), retrying: %v",
+			attempt, maxSeedPushAttempts, err)
+
+		if backoff > 0 {
+			time.Sleep(backoff)
+		}
+	}
+
+	return err
+}
+
+// shouldFailRun reports whether the run should exit non-zero.
+// Non-timeout failures always fail the run; timeout failures use the budget.
+func shouldFailRun(hardFailures, timeoutFailures, maxTimeoutFailures int) bool {
+	return hardFailures > 0 || timeoutFailures > maxTimeoutFailures
+}
+
+func printFailureBudget(hardFailures, timeoutFailures, maxTimeoutFailures int) {
+	log.Printf("\n============")
+	log.Printf("Total failed requests:\t%v", hardFailures+timeoutFailures)
+	log.Printf("Timeout failures:\t%v", timeoutFailures)
+	log.Printf("Other failures:\t%v", hardFailures)
+	log.Printf("Timeout failure budget:\t%v", maxTimeoutFailures)
+
+	if hardFailures == 0 && timeoutFailures == 0 {
+		return
+	}
+
+	if shouldFailRun(hardFailures, timeoutFailures, maxTimeoutFailures) {
+		if hardFailures > 0 {
+			log.Printf("Non-timeout failures present:\t%v", hardFailures)
+		}
+
+		if timeoutFailures > maxTimeoutFailures {
+			log.Printf("Timeout failure budget exceeded:\t%v/%v", timeoutFailures, maxTimeoutFailures)
+		}
+
+		return
+	}
+
+	log.Printf("Timeout failure budget used:\t%v/%v", timeoutFailures, maxTimeoutFailures)
 }
 
 // outputTestResults outputs the test results in the specified format.
@@ -1012,7 +1139,7 @@ func getRandomClientIPs(auth string, url string, ips []string) (*resty.Client, e
 
 	parsedURL, err := urlparser.Parse(url)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
 
 	//nolint: gosec

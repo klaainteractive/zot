@@ -7,15 +7,18 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,8 +29,10 @@ import (
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/regclient/regclient"
 	regconfig "github.com/regclient/regclient/config"
+	"github.com/regclient/regclient/types/manifest"
 	"github.com/regclient/regclient/types/ref"
 	. "github.com/smartystreets/goconvey/convey"
+	"golang.org/x/sync/singleflight"
 
 	zerr "zotregistry.dev/zot/v2/errors"
 	"zotregistry.dev/zot/v2/pkg/common"
@@ -153,7 +158,7 @@ func TestService(t *testing.T) {
 			URLs: []string{"http://localhost"},
 		}
 
-		service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, mocks.MetaDBMock{}, log.NewTestLogger())
+		service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, nil, mocks.MetaDBMock{}, log.NewTestLogger())
 		So(err, ShouldBeNil)
 
 		err = service.SyncRepo(context.Background(), "repo")
@@ -165,7 +170,7 @@ func TestService(t *testing.T) {
 			URLs: []string{"http://localhost"},
 		}
 
-		service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, mocks.MetaDBMock{}, log.NewTestLogger())
+		service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, nil, mocks.MetaDBMock{}, log.NewTestLogger())
 		So(err, ShouldBeNil)
 
 		// Create a context that's already cancelled
@@ -182,7 +187,7 @@ func TestService(t *testing.T) {
 			URLs: []string{"http://localhost"},
 		}
 
-		service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, mocks.MetaDBMock{}, log.NewTestLogger())
+		service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, nil, mocks.MetaDBMock{}, log.NewTestLogger())
 		So(err, ShouldBeNil)
 
 		// Create a mock remote that returns tags so we can reach the loop
@@ -209,7 +214,7 @@ func TestService(t *testing.T) {
 			URLs: []string{"http://localhost"},
 		}
 
-		service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, mocks.MetaDBMock{}, log.NewTestLogger())
+		service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, nil, mocks.MetaDBMock{}, log.NewTestLogger())
 		So(err, ShouldBeNil)
 
 		// Create a minimal mock remote that only returns tags
@@ -239,22 +244,22 @@ func TestService(t *testing.T) {
 		So(panicOccurred, ShouldBeTrue)
 	})
 
-	Convey("test syncImage skips OCI conversion but still commits when image already synced", t, func() {
+	Convey("test syncImage commits when image already synced", t, func() {
 		conf := syncconf.RegistryConfig{
 			URLs: []string{"http://localhost"},
 		}
 
-		service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, mocks.MetaDBMock{}, log.NewTestLogger())
+		service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, nil, mocks.MetaDBMock{}, log.NewTestLogger())
 		So(err, ShouldBeNil)
 
-		// Mock remote returns isConverted=true so OCI conversion would be attempted if not skipped
+		digestRef := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
 		mockRemote := &mocks.SyncRemoteMock{
 			GetImageReferenceFn: func(repo string, tag string) (ref.Ref, error) {
-				return ref.New("mock-registry/" + repo + ":" + tag)
+				return ref.New("mock-registry/" + repo + "@" + tag)
 			},
-			GetOCIDigestFn: func(ctx context.Context, repo, tag string) (godigest.Digest, godigest.Digest, bool, error) {
-				// isConverted=true means OCI conversion would be attempted
-				return godigest.Digest("sha256:abc123"), godigest.Digest("sha256:def456"), true, nil
+			HeadManifestFn: func(ctx context.Context, repo, tag string) (godigest.Digest, string, error) {
+				return godigest.Digest(digestRef), ispec.MediaTypeImageManifest, nil
 			},
 		}
 		service.remote = mockRemote
@@ -264,7 +269,7 @@ func TestService(t *testing.T) {
 		// Mock destination returns CanSkipImage=true (already synced)
 		mockDest := &mocks.SyncDestinationMock{
 			GetImageReferenceFn: func(repo string, tag string) (ref.Ref, error) {
-				return ref.New("local/" + repo + ":" + tag)
+				return ref.New("local/" + repo + "@" + tag)
 			},
 			CanSkipImageFn: func(repo string, tag string, digest godigest.Digest) (bool, error) {
 				return true, nil
@@ -280,14 +285,84 @@ func TestService(t *testing.T) {
 		service.destination = mockDest
 
 		ctx := context.Background()
-		err = service.syncImage(ctx, "localrepo", "remoterepo", "tag1", []string{}, false)
+		err = service.syncImage(ctx, "localrepo", "remoterepo", digestRef, []string{}, syncImageOptions{
+			WithReferrers: false,
+			Strategy:      copySparseIndex,
+		})
 
-		// Should succeed without error
 		So(err, ShouldBeNil)
-		// CommitAll should still be called to persist any new referrers even when image was skipped
 		So(commitAllCalled, ShouldBeTrue)
-		// OCI conversion is NOT called because skipped=true guards it.
-		// If mod.Apply were called, it would fail since service.rc is nil - proving the guard works.
+	})
+
+	Convey("test ensureImage flight key separates feeding and non-feeding syncs", t, func() {
+		digest := godigest.FromString("child")
+		opts := syncImageOptions{
+			Strategy:         copySparseIndex,
+			SkipOnlySigned:   true,
+			TagContentDigest: digest,
+		}
+		feeding := opts
+		feeding.FeedStreams = true
+
+		// A stream sync must not join a non-feeding flight: nothing would feed its streams.
+		So(imageFlightKey("repo", "repo", digest.String(), feeding), ShouldNotEqual,
+			imageFlightKey("repo", "repo", digest.String(), opts))
+
+		// MediaType only skips a HeadManifest and does not split flights.
+		withMediaType := opts
+		withMediaType.MediaType = ispec.MediaTypeImageManifest
+		So(imageFlightKey("repo", "repo", digest.String(), withMediaType), ShouldEqual,
+			imageFlightKey("repo", "repo", digest.String(), opts))
+	})
+
+	Convey("test syncImage rejects docker media without docker2s2", t, func() {
+		conf := syncconf.RegistryConfig{
+			URLs: []string{"http://localhost"},
+		}
+
+		service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, nil, mocks.MetaDBMock{}, log.NewTestLogger())
+		So(err, ShouldBeNil)
+
+		digestRef := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+		mockRemote := &mocks.SyncRemoteMock{
+			GetImageReferenceFn: func(repo string, tag string) (ref.Ref, error) {
+				return ref.New("mock-registry/" + repo + "@" + tag)
+			},
+			HeadManifestFn: func(ctx context.Context, repo, tag string) (godigest.Digest, string, error) {
+				return godigest.Digest(digestRef), "application/vnd.docker.distribution.manifest.v2+json", nil
+			},
+		}
+		service.remote = mockRemote
+
+		err = service.syncImage(context.Background(), "localrepo", "remoterepo", digestRef, nil, syncImageOptions{})
+		So(err, ShouldNotBeNil)
+		So(errors.Is(err, zerr.ErrSyncDockerCompatRequired), ShouldBeTrue)
+	})
+
+	Convey("test syncImage rejects unsupported root media types", t, func() {
+		conf := syncconf.RegistryConfig{
+			URLs: []string{"http://localhost"},
+		}
+
+		service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, nil, mocks.MetaDBMock{}, log.NewTestLogger())
+		So(err, ShouldBeNil)
+
+		digestRef := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+		mockRemote := &mocks.SyncRemoteMock{
+			GetImageReferenceFn: func(repo string, tag string) (ref.Ref, error) {
+				return ref.New("mock-registry/" + repo + "@" + tag)
+			},
+			HeadManifestFn: func(ctx context.Context, repo, tag string) (godigest.Digest, string, error) {
+				return godigest.Digest(digestRef), "application/vnd.oci.image.config.v1+json", nil
+			},
+		}
+		service.remote = mockRemote
+
+		err = service.syncImage(context.Background(), "localrepo", "remoterepo", digestRef, nil, syncImageOptions{})
+		So(err, ShouldNotBeNil)
+		So(errors.Is(err, zerr.ErrMediaTypeNotSupported), ShouldBeTrue)
 	})
 
 	Convey("test syncImage ReferrerList error with OnlySigned", t, func() {
@@ -297,7 +372,7 @@ func TestService(t *testing.T) {
 			OnlySigned: &onlySigned,
 		}
 
-		service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, mocks.MetaDBMock{}, log.NewTestLogger())
+		service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, nil, mocks.MetaDBMock{}, log.NewTestLogger())
 		So(err, ShouldBeNil)
 
 		// Create a mock remote that returns an invalid reference to trigger ReferrerList error
@@ -306,8 +381,8 @@ func TestService(t *testing.T) {
 				// Return an invalid reference that will cause ReferrerList to fail with "ref is not set" error
 				return ref.Ref{}, nil
 			},
-			GetDigestFn: func(ctx context.Context, repo, tag string) (godigest.Digest, error) {
-				return godigest.Digest("sha256:abc123"), nil
+			HeadManifestFn: func(ctx context.Context, repo, tag string) (godigest.Digest, string, error) {
+				return godigest.Digest("sha256:abc123"), ispec.MediaTypeImageManifest, nil
 			},
 		}
 		service.remote = mockRemote
@@ -321,11 +396,95 @@ func TestService(t *testing.T) {
 		service.destination = mockDest
 
 		ctx := context.Background()
-		err = service.syncImage(ctx, "localrepo", "remoterepo", "tag1", []string{}, true)
+		err = service.syncImage(ctx, "localrepo", "remoterepo", "tag1", []string{}, syncImageOptions{
+			WithReferrers: true,
+			Strategy:      copySparseIndex,
+		})
 
 		// We expect an error when ReferrerList fails with "ref is not set" error
 		So(err, ShouldNotBeNil)
 		So(err.Error(), ShouldContainSubstring, "ref is not set")
+	})
+
+	Convey("test SyncReferrers remote GetImageReference error", t, func() {
+		conf := syncconf.RegistryConfig{
+			URLs: []string{"http://localhost"},
+		}
+
+		service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, nil, mocks.MetaDBMock{}, log.NewTestLogger())
+		So(err, ShouldBeNil)
+
+		digestRef := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		remoteErr := errors.New("remote ref parse failed")
+
+		service.remote = &mocks.SyncRemoteMock{
+			GetImageReferenceFn: func(repo string, tag string) (ref.Ref, error) {
+				return ref.Ref{}, remoteErr
+			},
+		}
+		service.destination = &mocks.SyncDestinationMock{
+			GetImageReferenceFn: func(repo string, tag string) (ref.Ref, error) {
+				return ref.New("local/" + repo + "@" + tag)
+			},
+		}
+
+		err = service.SyncReferrers(context.Background(), "repo", digestRef, nil)
+		So(err, ShouldEqual, remoteErr)
+	})
+
+	Convey("test syncImage OnlySigned getTagsUnlocked error with empty repoTags", t, func() {
+		onlySigned := true
+		conf := syncconf.RegistryConfig{
+			URLs:       []string{"http://localhost"},
+			OnlySigned: &onlySigned,
+		}
+
+		root := t.TempDir()
+		imgStore := local.NewImageStore(root, true, true, log.NewTestLogger(),
+			monitoring.NewNopMetricServer(), nil, nil, nil, nil)
+		storeController := storage.StoreController{DefaultStore: imgStore}
+
+		image := CreateRandomImage()
+		err := WriteImageToFileSystem(image, "repo", "latest", storeController)
+		So(err, ShouldBeNil)
+
+		service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, nil, mocks.MetaDBMock{}, log.NewTestLogger())
+		So(err, ShouldBeNil)
+		service.rc = regclient.New()
+
+		tagsErr := errors.New("tags unavailable")
+		layoutRef := fmt.Sprintf("ocidir://%s/repo", root)
+
+		service.remote = &mocks.SyncRemoteMock{
+			GetImageReferenceFn: func(repo string, tag string) (ref.Ref, error) {
+				return ref.New(layoutRef + ":" + tag)
+			},
+			HeadManifestFn: func(ctx context.Context, repo, tag string) (godigest.Digest, string, error) {
+				return image.Digest(), ispec.MediaTypeImageManifest, nil
+			},
+			GetTagsFn: func(ctx context.Context, repo string) ([]string, error) {
+				return nil, tagsErr
+			},
+		}
+		service.destination = &mocks.SyncDestinationMock{
+			GetImageReferenceFn: func(repo string, tag string) (ref.Ref, error) {
+				return ref.New("local/" + repo + ":" + tag)
+			},
+			CanSkipImageFn: func(repo string, tag string, digest godigest.Digest) (bool, error) {
+				return true, nil
+			},
+			CommitAllFn: func(repo string, imageReference ref.Ref) error {
+				return nil
+			},
+			CleanupImageFn: func(imageReference ref.Ref, repo string) error {
+				return nil
+			},
+		}
+
+		err = service.syncImage(context.Background(), "localrepo", "repo", "latest", nil, syncImageOptions{
+			Strategy: copySparseIndex,
+		})
+		So(err, ShouldEqual, tagsErr)
 	})
 
 	Convey("test syncReferrers ReferrerList error", t, func() {
@@ -333,7 +492,7 @@ func TestService(t *testing.T) {
 			URLs: []string{"http://localhost"},
 		}
 
-		service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, mocks.MetaDBMock{}, log.NewTestLogger())
+		service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, nil, mocks.MetaDBMock{}, log.NewTestLogger())
 		So(err, ShouldBeNil)
 
 		// Create a mock remote that returns valid references
@@ -341,8 +500,8 @@ func TestService(t *testing.T) {
 			GetImageReferenceFn: func(repo string, tag string) (ref.Ref, error) {
 				return ref.New(repo + ":" + tag)
 			},
-			GetDigestFn: func(ctx context.Context, repo, tag string) (godigest.Digest, error) {
-				return godigest.Digest("sha256:abc123"), nil
+			HeadManifestFn: func(ctx context.Context, repo, tag string) (godigest.Digest, string, error) {
+				return godigest.Digest("sha256:abc123"), ispec.MediaTypeImageManifest, nil
 			},
 		}
 		service.remote = mockRemote
@@ -385,7 +544,7 @@ func TestService(t *testing.T) {
 			RetryDelay: &retryDelay,
 		}
 
-		service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, mocks.MetaDBMock{}, log.NewTestLogger())
+		service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, nil, mocks.MetaDBMock{}, log.NewTestLogger())
 		So(err, ShouldBeNil)
 
 		onDemand := NewOnDemand(log.NewTestLogger())
@@ -402,9 +561,9 @@ func TestService(t *testing.T) {
 
 		// Step 2: Pre-populate image background retry request
 		duplicateImageReq := request{
+			kind:         onDemandKindImage,
 			repo:         "test-duplicate-repo",
 			reference:    "test-duplicate-tag",
-			serviceID:    0,
 			isBackground: true,
 		}
 		onDemand.requestStore.Store(duplicateImageReq, struct{}{})
@@ -444,9 +603,9 @@ func TestService(t *testing.T) {
 
 		// Step 8: Pre-populate referrer background retry request
 		duplicateReferrerReq := request{
+			kind:         onDemandKindReferrers,
 			repo:         "test-duplicate-referrer-repo",
 			reference:    "sha256:duplicate",
-			serviceID:    0,
 			isBackground: true,
 		}
 		onDemand.requestStore.Store(duplicateReferrerReq, struct{}{})
@@ -503,7 +662,7 @@ func TestService(t *testing.T) {
 			}},
 		}
 
-		service1, err := New(conf1, "", nil, t.TempDir(), storage.StoreController{}, mocks.MetaDBMock{}, log.NewTestLogger())
+		service1, err := New(conf1, "", nil, t.TempDir(), storage.StoreController{}, nil, mocks.MetaDBMock{}, log.NewTestLogger())
 		So(err, ShouldBeNil)
 
 		// Create second service for normal processing
@@ -516,7 +675,7 @@ func TestService(t *testing.T) {
 			}},
 		}
 
-		service2, err := New(conf2, "", nil, t.TempDir(), storage.StoreController{}, mocks.MetaDBMock{}, log.NewTestLogger())
+		service2, err := New(conf2, "", nil, t.TempDir(), storage.StoreController{}, nil, mocks.MetaDBMock{}, log.NewTestLogger())
 		So(err, ShouldBeNil)
 
 		onDemand := NewOnDemand(log.NewTestLogger())
@@ -548,7 +707,7 @@ func TestService(t *testing.T) {
 				}},
 			}
 
-			service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, mocks.MetaDBMock{}, log.NewTestLogger())
+			service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, nil, mocks.MetaDBMock{}, log.NewTestLogger())
 			So(err, ShouldBeNil)
 
 			onDemand := NewOnDemand(log.NewTestLogger())
@@ -588,7 +747,7 @@ func TestService(t *testing.T) {
 				}},
 			}
 
-			service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, mocks.MetaDBMock{}, log.NewTestLogger())
+			service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, nil, mocks.MetaDBMock{}, log.NewTestLogger())
 			So(err, ShouldBeNil)
 
 			onDemand := NewOnDemand(log.NewTestLogger())
@@ -621,9 +780,9 @@ func TestService(t *testing.T) {
 
 			// Verify background retry request was stored
 			reqBackground := request{
+				kind:         onDemandKindReferrers,
 				repo:         "test-background-retry",
 				reference:    "sha256:background",
-				serviceID:    0,
 				isBackground: true,
 			}
 			_, existsBackground := onDemand.requestStore.Load(reqBackground)
@@ -662,9 +821,9 @@ func TestService(t *testing.T) {
 
 			// Verify background retry request was stored
 			reqBackground := request{
+				kind:         onDemandKindImage,
 				repo:         "test-background-image-retry",
 				reference:    "background-image-tag",
-				serviceID:    0,
 				isBackground: true,
 			}
 			_, existsBackground := onDemand.requestStore.Load(reqBackground)
@@ -679,76 +838,129 @@ func TestService(t *testing.T) {
 		})
 	})
 
-	Convey("test assured channel waiting path", t, func() {
-		// Strategy: Pre-populate requestStore with a channel to GUARANTEE the channel waiting code path
-		// This ensures the "waiting on channel" message is logged and the channel receive happens
+	Convey("test singleflight deduplicates concurrent on-demand sync calls", t, func() {
+		runConcurrentDedup := func(
+			t *testing.T,
+			flight *singleflight.Group,
+			key string,
+			syncCalls *atomic.Int32,
+			wantErr error,
+			runLeader func(context.Context) error,
+		) {
+			t.Helper()
 
-		Convey("SyncImage assured channel waiting", func() {
-			onDemand := NewOnDemand(log.NewTestLogger())
+			// Buffer of one: only the singleflight leader should signal; a second signal
+			// means dedup failed and must not block the test forever.
+			entered := make(chan struct{}, 1)
 
-			// Create request and pre-populate with a channel that we control
-			req := request{
-				repo:         "test-guaranteed-channel-image",
-				reference:    "guaranteed-image-tag",
-				serviceID:    0,
-				isBackground: false,
+			const numCallers = 4
+			errCh := make(chan error, numCallers)
+
+			var gate sync.WaitGroup
+			gate.Add(numCallers)
+
+			// joined counts callers registered with the group. DoChan registers before it
+			// returns (unlike Do, which gives no signal), so a leader that waits on joined
+			// cannot finish while a caller is still on its way in and would start a second call.
+			var joined sync.WaitGroup
+			joined.Add(numCallers)
+
+			doCall := func() error {
+				gate.Done()
+				gate.Wait()
+
+				resCh := flight.DoChan(key, func() (any, error) {
+					syncCalls.Add(1)
+
+					select {
+					case entered <- struct{}{}:
+					default:
+					}
+
+					joined.Wait()
+
+					if wantErr != nil {
+						return nil, wantErr
+					}
+
+					return nil, runLeader(context.Background())
+				})
+				joined.Done()
+
+				return (<-resCh).Err
 			}
 
-			// Create a channel that we control completely
-			pendingChannel := make(chan error, 1)
-			onDemand.requestStore.Store(req, pendingChannel)
+			for range numCallers {
+				go func() {
+					errCh <- doCall()
+				}()
+			}
 
-			// Start request that will wait on our channel
-			requestCompleted := make(chan error)
-			go func() {
-				err := onDemand.SyncImage(context.Background(), "test-guaranteed-channel-image", "guaranteed-image-tag")
-				requestCompleted <- err
-			}()
+			select {
+			case <-entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("timed out waiting for in-flight sync to start")
+			}
 
-			// Wait a moment for the request to reach the channel waiting code
-			time.Sleep(50 * time.Millisecond)
+			for range numCallers {
+				select {
+				case err := <-errCh:
+					if wantErr == nil {
+						So(err, ShouldBeNil)
+					} else {
+						So(err, ShouldEqual, wantErr)
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatal("timed out waiting for concurrent on-demand sync")
+				}
+			}
 
-			// Send error through our controlled channel - this proves channel waiting worked
-			pendingChannel <- errors.New("guaranteed channel error")
+			So(syncCalls.Load(), ShouldEqual, 1)
+		}
 
-			// Verify the request got our controlled error
-			err := <-requestCompleted
-			So(err, ShouldNotBeNil)
-			So(err.Error(), ShouldEqual, "guaranteed channel error")
+		Convey("SyncImage success", func() {
+			var syncCalls atomic.Int32
+			onDemand := NewOnDemand(log.NewTestLogger())
+
+			runConcurrentDedup(t, &onDemand.flight, onDemandKey(onDemandKindImage, "dedup-repo", "dedup-tag"), &syncCalls, nil,
+				func(ctx context.Context) error {
+					return onDemand.syncImage(ctx, "dedup-repo", "dedup-tag", -1, "", false)
+				})
 		})
 
-		Convey("SyncReferrers assured channel waiting", func() {
+		Convey("SyncReferrers success", func() {
+			var syncCalls atomic.Int32
 			onDemand := NewOnDemand(log.NewTestLogger())
 
-			// Create request and pre-populate with a channel that we control
-			req := request{
-				repo:         "test-guaranteed-channel-referrers",
-				reference:    "sha256:guaranteed",
-				serviceID:    0,
-				isBackground: false,
-			}
+			runConcurrentDedup(t, &onDemand.flight,
+				onDemandKey(onDemandKindReferrers, "dedup-referrer-repo", "sha256:dedup"), &syncCalls, nil,
+				func(ctx context.Context) error {
+					return onDemand.syncReferrers(ctx, "dedup-referrer-repo", "sha256:dedup", nil, false)
+				})
+		})
 
-			// Create a channel that we control completely
-			pendingChannel := make(chan error, 1)
-			onDemand.requestStore.Store(req, pendingChannel)
+		Convey("SyncImage shares leader error", func() {
+			var syncCalls atomic.Int32
+			wantErr := errors.New("sentinel sync image error")
+			onDemand := NewOnDemand(log.NewTestLogger())
 
-			// Start request that will wait on our channel
-			requestCompleted := make(chan error)
-			go func() {
-				err := onDemand.SyncReferrers(context.Background(), "test-guaranteed-channel-referrers", "sha256:guaranteed", []string{"signature"})
-				requestCompleted <- err
-			}()
+			runConcurrentDedup(t, &onDemand.flight, onDemandKey(onDemandKindImage, "dedup-repo-err", "dedup-tag"),
+				&syncCalls, wantErr,
+				func(ctx context.Context) error {
+					return onDemand.syncImage(ctx, "dedup-repo-err", "dedup-tag", -1, "", false)
+				})
+		})
 
-			// Wait a moment for the request to reach the channel waiting code
-			time.Sleep(50 * time.Millisecond)
+		Convey("SyncReferrers shares leader error", func() {
+			var syncCalls atomic.Int32
+			wantErr := errors.New("sentinel sync referrers error")
+			onDemand := NewOnDemand(log.NewTestLogger())
 
-			// Send error through our controlled channel - this proves channel waiting worked
-			pendingChannel <- errors.New("guaranteed referrer channel error")
-
-			// Verify the request got our controlled error
-			err := <-requestCompleted
-			So(err, ShouldNotBeNil)
-			So(err.Error(), ShouldEqual, "guaranteed referrer channel error")
+			runConcurrentDedup(t, &onDemand.flight,
+				onDemandKey(onDemandKindReferrers, "dedup-referrer-repo-err", "sha256:dedup"), &syncCalls, wantErr,
+				func(ctx context.Context) error {
+					return onDemand.syncReferrers(ctx, "dedup-referrer-repo-err", "sha256:dedup", nil, false)
+				})
 		})
 	})
 }
@@ -806,7 +1018,7 @@ func TestServiceGCPCredentialHelper(t *testing.T) {
 			CredentialHelper: "gcp",
 		}
 
-		service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, mocks.MetaDBMock{}, log.NewTestLogger())
+		service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, nil, mocks.MetaDBMock{}, log.NewTestLogger())
 		So(err, ShouldBeNil)
 		So(service.credentialHelper, ShouldNotBeNil)
 
@@ -840,7 +1052,7 @@ func TestServiceOAuth2CredentialHelper(t *testing.T) {
 			},
 		}
 
-		service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, mocks.MetaDBMock{}, log.NewTestLogger())
+		service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, nil, mocks.MetaDBMock{}, log.NewTestLogger())
 		So(err, ShouldBeNil)
 		So(service.credentialHelper, ShouldNotBeNil)
 		So(service.credentials["localhost"].Username, ShouldEqual, "robot")
@@ -854,7 +1066,7 @@ func TestServiceOAuth2CredentialHelper(t *testing.T) {
 			Oauth2CredentialHelper: nil,
 		}
 
-		service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, mocks.MetaDBMock{}, log.NewTestLogger())
+		service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, nil, mocks.MetaDBMock{}, log.NewTestLogger())
 		So(err, ShouldBeNil)
 		So(service.credentialHelper, ShouldBeNil)
 		So(service.config.CredentialHelper, ShouldEqual, "")
@@ -869,7 +1081,7 @@ func TestServiceOAuth2CredentialHelper(t *testing.T) {
 			},
 		}
 
-		service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, mocks.MetaDBMock{}, log.NewTestLogger())
+		service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, nil, mocks.MetaDBMock{}, log.NewTestLogger())
 		So(err, ShouldBeNil)
 		So(service.credentialHelper, ShouldBeNil)
 		So(service.config.CredentialHelper, ShouldEqual, "")
@@ -884,7 +1096,7 @@ func TestServiceOAuth2CredentialHelper(t *testing.T) {
 			},
 		}
 
-		service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, mocks.MetaDBMock{}, log.NewTestLogger())
+		service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, nil, mocks.MetaDBMock{}, log.NewTestLogger())
 		So(err, ShouldBeNil)
 		So(service.credentialHelper, ShouldBeNil)
 		So(service.config.CredentialHelper, ShouldEqual, "")
@@ -902,7 +1114,7 @@ func TestServiceOAuth2CredentialHelper(t *testing.T) {
 			},
 		}
 
-		service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, mocks.MetaDBMock{}, log.NewTestLogger())
+		service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, nil, mocks.MetaDBMock{}, log.NewTestLogger())
 		So(err, ShouldBeNil)
 		So(service.credentialHelper, ShouldNotBeNil)
 	})
@@ -913,7 +1125,7 @@ func TestServiceOAuth2CredentialHelper(t *testing.T) {
 			CredentialHelper: "unsupported",
 		}
 
-		service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, mocks.MetaDBMock{}, log.NewTestLogger())
+		service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, nil, mocks.MetaDBMock{}, log.NewTestLogger())
 		So(err, ShouldBeNil)
 		So(service.credentialHelper, ShouldBeNil)
 		So(service.config.CredentialHelper, ShouldEqual, "")
@@ -1081,7 +1293,7 @@ func TestSyncLegacyCosignTagsSyncReferrers(t *testing.T) {
 			SyncLegacyCosignTags: &syncLegacyFalse,
 		}
 
-		service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, mocks.MetaDBMock{}, log.NewTestLogger())
+		service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, nil, mocks.MetaDBMock{}, log.NewTestLogger())
 		So(err, ShouldBeNil)
 
 		service.rc = regclient.New()
@@ -1094,8 +1306,8 @@ func TestSyncLegacyCosignTagsSyncReferrers(t *testing.T) {
 			GetImageReferenceFn: func(repo, tag string) (ref.Ref, error) {
 				return ref.New(repo + "@" + tag)
 			},
-			GetDigestFn: func(ctx context.Context, repo, tag string) (godigest.Digest, error) {
-				return godigest.Digest("sha256:" + strings.Repeat("a", 64)), nil
+			HeadManifestFn: func(ctx context.Context, repo, tag string) (godigest.Digest, string, error) {
+				return godigest.Digest("sha256:" + strings.Repeat("a", 64)), ispec.MediaTypeImageManifest, nil
 			},
 		}
 		service.remote = mockRemote
@@ -1128,7 +1340,7 @@ func TestSyncLegacyCosignTagsSyncReferrers(t *testing.T) {
 			SyncLegacyCosignTags: &syncLegacyTrue,
 		}
 
-		service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, mocks.MetaDBMock{}, log.NewTestLogger())
+		service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, nil, mocks.MetaDBMock{}, log.NewTestLogger())
 		So(err, ShouldBeNil)
 
 		service.rc = regclient.New()
@@ -1171,7 +1383,7 @@ func TestOnDemandSyncReferrersNonRecursive(t *testing.T) {
 			SyncLegacyCosignTags: &syncLegacyFalse,
 		}
 
-		service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, mocks.MetaDBMock{}, log.NewTestLogger())
+		service, err := New(conf, "", nil, t.TempDir(), storage.StoreController{}, nil, mocks.MetaDBMock{}, log.NewTestLogger())
 		So(err, ShouldBeNil)
 
 		service.rc = regclient.New()
@@ -1180,8 +1392,8 @@ func TestOnDemandSyncReferrersNonRecursive(t *testing.T) {
 			GetImageReferenceFn: func(repo, tag string) (ref.Ref, error) {
 				return ref.New(repo + "@" + tag)
 			},
-			GetDigestFn: func(ctx context.Context, repo, tag string) (godigest.Digest, error) {
-				return godigest.Digest("sha256:" + strings.Repeat("a", 64)), nil
+			HeadManifestFn: func(ctx context.Context, repo, tag string) (godigest.Digest, string, error) {
+				return godigest.Digest("sha256:" + strings.Repeat("a", 64)), ispec.MediaTypeImageManifest, nil
 			},
 			GetTagsFn: func(ctx context.Context, repo string) ([]string, error) {
 				return []string{}, nil
@@ -1210,8 +1422,7 @@ func TestDestinationRegistry(t *testing.T) {
 		dir := t.TempDir()
 
 		log := log.NewTestLogger()
-		metrics := monitoring.NewMetricsServer(false, log)
-		defer metrics.Stop() // Clean up metrics server to prevent resource leaks
+		metrics := monitoring.NewNopMetricServer()
 		cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
 			RootDir:     dir,
 			Name:        "cache",
@@ -1286,8 +1497,8 @@ func TestDestinationRegistry(t *testing.T) {
 						Size:      int64(bsize1),
 					},
 				},
-			}
-			manifest.SchemaVersion = 2
+
+				SchemaVersion: 2}
 			content, err = json.Marshal(manifest)
 			So(err, ShouldBeNil)
 			digest = godigest.FromBytes(content)
@@ -1345,9 +1556,7 @@ func TestDestinationRegistry(t *testing.T) {
 		Convey("trigger linter error in CommitImage()", func() {
 			defaultVal := true
 			linter := lint.NewLinter(&config.LintConfig{
-				BaseConfig: config.BaseConfig{
-					Enable: &defaultVal,
-				},
+				Enable:               &defaultVal,
 				MandatoryAnnotations: []string{"annot1"},
 			}, log)
 
@@ -1416,9 +1625,8 @@ func TestDestinationRegistry(t *testing.T) {
 			So(err, ShouldNotBeNil)
 		})
 
-		Convey("trigger GetBlobContent error on manifest within image index in copyManifest()", func() {
-			// This test specifically targets the error where GetBlobContent fails for a manifest
-			// that is part of an image index.
+		Convey("trigger GetBlobContent missing child in image index in copyManifest()", func() {
+			// Sparse indexes: GetBlobContent fails for a child manifest; copy continues and commits.
 
 			// Create a destination registry using the existing syncImgStore as temp storage
 			storeController := storage.StoreController{DefaultStore: syncImgStore}
@@ -1489,8 +1697,8 @@ func TestDestinationRegistry(t *testing.T) {
 							Size:      int64(buflen),
 						},
 					},
-				}
-				manifest.SchemaVersion = 2
+
+					SchemaVersion: 2}
 
 				manifestContent, err := json.Marshal(manifest)
 				So(err, ShouldBeNil)
@@ -1538,13 +1746,11 @@ func TestDestinationRegistry(t *testing.T) {
 			// Initialize the seen slice
 			seen := &[]godigest.Digest{}
 
-			// Call copyManifest directly with the index manifest - this should trigger the error path at lines 234-239
-			// when it tries to get blob content for the child manifest with the removed blob
+			// Call copyManifest directly with the index manifest - missing child blobs are
+			// skipped so the sparse index can still be committed.
 			err = registry.(*DestinationRegistry).copyManifest(repoName, desc, indexDigest.String(), tempImgStore, seen)
 
-			// Verify the error is returned and contains the expected message
-			So(err, ShouldNotBeNil)
-			So(err.Error(), ShouldContainSubstring, "blob not found")
+			So(err, ShouldBeNil)
 		})
 
 		Convey("push image", func() {
@@ -1607,8 +1813,8 @@ func TestDestinationRegistry(t *testing.T) {
 						Size:      int64(bsize1),
 					},
 				},
-			}
-			manifest.SchemaVersion = 2
+
+				SchemaVersion: 2}
 			content, err = json.Marshal(manifest)
 			So(err, ShouldBeNil)
 			digest = godigest.FromBytes(content)
@@ -1684,6 +1890,7 @@ func TestDestinationRegistry(t *testing.T) {
 			// CommitAll should return an error when directory is not empty but index.json is missing
 			err = registry.CommitAll("inconsistent-repo", imageReference)
 			So(err, ShouldNotBeNil)
+			So(errors.Is(err, zerr.ErrRepoBadLayout), ShouldBeTrue)
 			So(errors.Is(err, zerr.ErrRepoNotFound), ShouldBeTrue)
 		})
 
@@ -1798,8 +2005,7 @@ func TestSyncTempLayoutPathHelpers(t *testing.T) {
 func TestDestinationRegistryCommitAllErrors(t *testing.T) {
 	Convey("CommitAll and CleanupImage temp path errors", t, func() {
 		log := log.NewTestLogger()
-		metrics := monitoring.NewMetricsServer(false, log)
-		defer metrics.Stop()
+		metrics := monitoring.NewNopMetricServer()
 
 		dir := t.TempDir()
 		store := local.NewImageStore(dir, true, true, log, metrics, nil, nil, nil, nil)
@@ -1837,8 +2043,7 @@ func TestDestinationRegistryCommitAllErrors(t *testing.T) {
 func TestCopyManifestInvalidJSON(t *testing.T) {
 	Convey("copyManifest rejects invalid manifest JSON", t, func() {
 		log := log.NewTestLogger()
-		metrics := monitoring.NewMetricsServer(false, log)
-		defer metrics.Stop()
+		metrics := monitoring.NewNopMetricServer()
 
 		tempDir := t.TempDir()
 		destDir := t.TempDir()
@@ -1868,8 +2073,7 @@ func TestCopyManifestInvalidJSON(t *testing.T) {
 func TestCopyManifestReferrersTag(t *testing.T) {
 	Convey("referrers-shaped layout entries are not committed as tags", t, func() {
 		log := log.NewTestLogger()
-		metrics := monitoring.NewMetricsServer(false, log)
-		defer metrics.Stop()
+		metrics := monitoring.NewNopMetricServer()
 
 		repoName := "repo"
 		subjectImage := CreateImageWith().RandomLayers(1, 10).RandomConfig().Build()
@@ -2065,6 +2269,164 @@ func TestNewClientTimeoutBehavior(t *testing.T) {
 	})
 }
 
+// TestNewClientReqConcurrentReqPerSec verifies that reqConcurrent/reqPerSec from the sync config
+// override regclient's per-host defaults, and that configured mirrors inherit the same limits.
+func TestNewClientReqConcurrentReqPerSec(t *testing.T) {
+	Convey("Test newClient reqConcurrent/reqPerSec overrides", t, func() {
+		logger := log.NewTestLogger()
+		regclientDefaults := regconfig.HostNew()
+
+		Convey("Unset keeps regclient defaults", func() {
+			opts := syncconf.RegistryConfig{URLs: []string{"http://localhost:9000"}}
+
+			_, hosts, err := newClient(opts, syncconf.CredentialsFile{}, logger)
+			So(err, ShouldBeNil)
+			So(hosts, ShouldNotBeEmpty)
+			So(hosts[0].ReqConcurrent, ShouldEqual, regclientDefaults.ReqConcurrent)
+			So(hosts[0].ReqPerSec, ShouldEqual, regclientDefaults.ReqPerSec)
+		})
+
+		Convey("Set values override the defaults on the main host", func() {
+			reqConcurrent := 42
+			reqPerSec := 100.0
+			opts := syncconf.RegistryConfig{
+				URLs:          []string{"http://localhost:9000"},
+				ReqConcurrent: &reqConcurrent,
+				ReqPerSec:     &reqPerSec,
+			}
+
+			_, hosts, err := newClient(opts, syncconf.CredentialsFile{}, logger)
+			So(err, ShouldBeNil)
+			So(hosts, ShouldNotBeEmpty)
+			So(hosts[0].ReqConcurrent, ShouldEqual, int64(reqConcurrent))
+			So(hosts[0].ReqPerSec, ShouldEqual, reqPerSec)
+		})
+
+		Convey("Mirrors inherit the configured limits", func() {
+			reqConcurrent := 20
+			reqPerSec := 50.0
+			opts := syncconf.RegistryConfig{
+				// first URL is the main host, the rest are mirrors
+				URLs:          []string{"http://localhost:9000", "http://localhost:9001"},
+				ReqConcurrent: &reqConcurrent,
+				ReqPerSec:     &reqPerSec,
+			}
+
+			_, hosts, err := newClient(opts, syncconf.CredentialsFile{}, logger)
+			So(err, ShouldBeNil)
+			So(len(hosts), ShouldEqual, 2)
+			for _, host := range hosts {
+				So(host.ReqConcurrent, ShouldEqual, int64(reqConcurrent))
+				So(host.ReqPerSec, ShouldEqual, reqPerSec)
+			}
+		})
+	})
+}
+
+// drainNegotiatedProto discards any value left over from a previous request on the channel,
+// so a subtest only ever observes the protocol of the request it is about to issue.
+func drainNegotiatedProto(negotiatedProto chan string) {
+	for {
+		select {
+		case <-negotiatedProto:
+		default:
+			return
+		}
+	}
+}
+
+// TestNewClientDisableHTTP2 verifies that DisableHTTP2 pins the upstream connection to
+// HTTP/1.1 even against a server that supports and would otherwise negotiate HTTP/2.
+func TestNewClientDisableHTTP2(t *testing.T) {
+	Convey("Test newClient DisableHTTP2 behavior", t, func() {
+		logger := log.NewTestLogger()
+
+		// Buffered well past one: a HEAD request can hit the handler more than once (e.g. an
+		// auth-challenge round trip before the real request), and the send below must never
+		// block on a slow/absent reader or the handler goroutine hangs.
+		negotiatedProto := make(chan string, 8)
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case negotiatedProto <- r.Proto:
+			default:
+			}
+			w.WriteHeader(http.StatusOK)
+		})
+
+		server := httptest.NewUnstartedServer(handler)
+		server.EnableHTTP2 = true // advertise "h2" via ALPN, like a real HTTP/2-capable registry
+		server.StartTLS()
+		defer server.Close()
+
+		host := strings.TrimPrefix(server.URL, "https://")
+
+		// httptest's TLS cert is self-signed, so skip verification to isolate this test
+		// from cert trust; DisableHTTP2/ALPN pinning is orthogonal to cert validation.
+		tlsVerifyOff := false
+		tlsVerify := &tlsVerifyOff
+
+		Convey("DisableHTTP2 forces HTTP/1.1 against an HTTP/2-capable server", func() {
+			disableHTTP2 := true
+			opts := syncconf.RegistryConfig{
+				URLs:                  []string{server.URL},
+				TLSVerify:             tlsVerify,
+				SyncTimeout:           syncConstants.DefaultSyncTimeout,
+				ResponseHeaderTimeout: syncConstants.DefaultResponseHeaderTimeout,
+				DisableHTTP2:          &disableHTTP2,
+			}
+
+			client, _, err := newClient(opts, syncconf.CredentialsFile{}, logger)
+			So(err, ShouldBeNil)
+
+			r, err := ref.New(host + "/repo:tag")
+			So(err, ShouldBeNil)
+
+			drainNegotiatedProto(negotiatedProto)
+
+			// The handler returns a bare 200 with no manifest body/headers, so regclient is
+			// expected to fail parsing it as a manifest; only the transport-level protocol
+			// the request actually reached the server on is under test here.
+			_, err = client.ManifestHead(context.Background(), r)
+			t.Logf("ManifestHead (expected to fail on the stub response): %v", err)
+
+			select {
+			case proto := <-negotiatedProto:
+				So(proto, ShouldEqual, "HTTP/1.1")
+			case <-time.After(5 * time.Second):
+				t.Fatalf("server never received a request; ManifestHead error: %v", err)
+			}
+		})
+
+		Convey("without DisableHTTP2, an HTTP/2-capable server negotiates HTTP/2", func() {
+			opts := syncconf.RegistryConfig{
+				URLs:                  []string{server.URL},
+				TLSVerify:             tlsVerify,
+				SyncTimeout:           syncConstants.DefaultSyncTimeout,
+				ResponseHeaderTimeout: syncConstants.DefaultResponseHeaderTimeout,
+			}
+
+			client, _, err := newClient(opts, syncconf.CredentialsFile{}, logger)
+			So(err, ShouldBeNil)
+
+			r, err := ref.New(host + "/repo:tag")
+			So(err, ShouldBeNil)
+
+			drainNegotiatedProto(negotiatedProto)
+
+			// See the comment in the sibling Convey above: the parse failure is expected.
+			_, err = client.ManifestHead(context.Background(), r)
+			t.Logf("ManifestHead (expected to fail on the stub response): %v", err)
+
+			select {
+			case proto := <-negotiatedProto:
+				So(proto, ShouldEqual, "HTTP/2.0")
+			case <-time.After(5 * time.Second):
+				t.Fatalf("server never received a request; ManifestHead error: %v", err)
+			}
+		})
+	})
+}
+
 func TestHTTPRetryDelayBounds(t *testing.T) {
 	Convey("httpRetryDelayBounds maps sync config to regclient delay args", t, func() {
 		retryDelay := 1 * time.Second
@@ -2092,6 +2454,120 @@ func TestHTTPRetryDelayBounds(t *testing.T) {
 			So(ok, ShouldBeTrue)
 			So(delayInit, ShouldEqual, retryDelay)
 			So(delayMax, ShouldEqual, maxRetryDelay)
+		})
+	})
+}
+
+// TestEffectiveMaxIdleConnsPerHost verifies that DisableHTTP2 without an explicit
+// maxIdleConnsPerHost defaults the idle pool to reqConcurrent, so DisableHTTP2 alone is enough
+// to keep concurrent HTTP/1.1 connections pooled instead of being closed at Go's default of 2.
+func TestEffectiveMaxIdleConnsPerHost(t *testing.T) {
+	Convey("effectiveMaxIdleConnsPerHost", t, func() {
+		Convey("neither set leaves the Go default (0: caller doesn't override)", func() {
+			got := effectiveMaxIdleConnsPerHost(syncconf.RegistryConfig{}, 3)
+			So(got, ShouldEqual, 0)
+		})
+
+		Convey("DisableHTTP2 alone defaults to reqConcurrent", func() {
+			disableHTTP2 := true
+			got := effectiveMaxIdleConnsPerHost(syncconf.RegistryConfig{DisableHTTP2: &disableHTTP2}, 16)
+			So(got, ShouldEqual, 16)
+		})
+
+		Convey("DisableHTTP2 false does not default", func() {
+			disableHTTP2 := false
+			got := effectiveMaxIdleConnsPerHost(syncconf.RegistryConfig{DisableHTTP2: &disableHTTP2}, 16)
+			So(got, ShouldEqual, 0)
+		})
+
+		Convey("explicit maxIdleConnsPerHost always wins, with or without DisableHTTP2", func() {
+			disableHTTP2 := true
+			maxIdle := 42
+			got := effectiveMaxIdleConnsPerHost(syncconf.RegistryConfig{
+				DisableHTTP2:        &disableHTTP2,
+				MaxIdleConnsPerHost: &maxIdle,
+			}, 16)
+			So(got, ShouldEqual, 42)
+
+			got = effectiveMaxIdleConnsPerHost(syncconf.RegistryConfig{MaxIdleConnsPerHost: &maxIdle}, 16)
+			So(got, ShouldEqual, 42)
+		})
+	})
+}
+
+// TestPinHTTP1ALPN covers the nil-TLSClientConfig branch directly: http.Transport.Clone() sets a
+// non-nil TLSClientConfig in virtually every real build (Go's own lazy HTTP/2 auto-configuration
+// runs on the source transport first), so that branch is unreachable through newClient in
+// practice; this exercises it without depending on that net/http implementation detail.
+func TestPinHTTP1ALPN(t *testing.T) {
+	Convey("pinHTTP1ALPN", t, func() {
+		Convey("nil input gets a fresh config with NextProtos pinned", func() {
+			got := pinHTTP1ALPN(nil)
+			So(got, ShouldNotBeNil)
+			So(got.NextProtos, ShouldResemble, []string{"http/1.1"})
+		})
+
+		Convey("existing config is reused and NextProtos overwritten", func() {
+			existing := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h2", "http/1.1"}} //nolint:gosec
+			got := pinHTTP1ALPN(existing)
+			So(got, ShouldEqual, existing) // same pointer: mutated in place, not replaced
+			So(got.NextProtos, ShouldResemble, []string{"http/1.1"})
+			So(got.InsecureSkipVerify, ShouldBeTrue) // untouched
+		})
+	})
+}
+
+// TestApplySyncTransportOptions verifies the exact DisableHTTP2 x MaxIdleConnsPerHost x
+// ReqConcurrent combinations that determine the idle connection pool size on the real
+// *http.Transport newClient builds (newClient itself doesn't expose the transport - it only
+// returns a *regclient.RegClient - so this is what actually covers the assignment).
+func TestApplySyncTransportOptions(t *testing.T) {
+	Convey("applySyncTransportOptions", t, func() {
+		Convey("DisableHTTP2 true, ReqConcurrent and MaxIdleConnsPerHost both unset: idle pool is regclient's default of 3", func() {
+			disableHTTP2 := true
+			transport := &http.Transport{}
+
+			applySyncTransportOptions(transport, syncconf.RegistryConfig{DisableHTTP2: &disableHTTP2}, 3)
+
+			So(transport.MaxIdleConnsPerHost, ShouldEqual, 3)
+			So(transport.ForceAttemptHTTP2, ShouldBeFalse)
+			So(transport.TLSNextProto, ShouldNotBeNil)
+			So(transport.TLSNextProto, ShouldBeEmpty)
+			So(transport.TLSClientConfig, ShouldNotBeNil)
+			So(transport.TLSClientConfig.NextProtos, ShouldResemble, []string{"http/1.1"})
+		})
+
+		Convey("DisableHTTP2 true, ReqConcurrent 16, MaxIdleConnsPerHost unset: idle pool follows ReqConcurrent", func() {
+			disableHTTP2 := true
+			transport := &http.Transport{}
+
+			applySyncTransportOptions(transport, syncconf.RegistryConfig{DisableHTTP2: &disableHTTP2}, 16)
+
+			So(transport.MaxIdleConnsPerHost, ShouldEqual, 16)
+		})
+
+		Convey("explicit MaxIdleConnsPerHost wins over the ReqConcurrent-derived default", func() {
+			disableHTTP2 := true
+			maxIdle := 20
+			transport := &http.Transport{}
+
+			applySyncTransportOptions(transport, syncconf.RegistryConfig{
+				DisableHTTP2:        &disableHTTP2,
+				MaxIdleConnsPerHost: &maxIdle,
+			}, 16)
+
+			So(transport.MaxIdleConnsPerHost, ShouldEqual, 20)
+		})
+
+		Convey("DisableHTTP2 unset leaves HTTP/2 transport fields untouched", func() {
+			transport := &http.Transport{ForceAttemptHTTP2: true}
+
+			applySyncTransportOptions(transport, syncconf.RegistryConfig{}, 3)
+
+			So(transport.ForceAttemptHTTP2, ShouldBeTrue)
+			So(transport.TLSNextProto, ShouldBeNil)
+			So(transport.TLSClientConfig, ShouldBeNil)
+			So(transport.MaxIdleConnsPerHost, ShouldEqual, 0)
 		})
 	})
 }
@@ -2348,6 +2824,16 @@ func TestCredentialRefreshOnEverySyncEntryPoint(t *testing.T) {
 				contentManager:   NewContentManager(nil, logger),
 				tagsCache:        newTagsCache(defaultExpireMinutes),
 				log:              logger,
+				// syncImage resolves the local temp ref before remote I/O; init() only
+				// wires remote/rc, so supply a minimal destination like production New().
+				destination: &mocks.SyncDestinationMock{
+					GetImageReferenceFn: func(repo, tag string) (ref.Ref, error) {
+						return ref.New("local/" + repo + ":" + tag)
+					},
+					CleanupImageFn: func(imageReference ref.Ref, repo string) error {
+						return nil
+					},
+				},
 			}
 
 			So(service.init(), ShouldBeNil)
@@ -2447,4 +2933,1467 @@ func TestCredentialRefreshOnEverySyncEntryPoint(t *testing.T) {
 			})
 		})
 	})
+}
+
+// mockCheckService is a minimal Service implementation for exercising
+// BaseOnDemand.ShouldCheckUpstreamManifest and on-demand-in-background helpers.
+type mockCheckService struct {
+	shouldCheckUpstreamFn           func(repo, reference string) bool
+	syncImageFn                     func(ctx context.Context, repo, reference string) error
+	isOnDemandInBackgroundForRepoFn func(repo string) bool
+	syncImageCalls                  atomic.Int32
+}
+
+func (s *mockCheckService) GetNextRepo(_ string) (string, error) { return "", nil }
+
+func (s *mockCheckService) SyncRepo(_ context.Context, _ string) error { return nil }
+
+func (s *mockCheckService) SyncImage(ctx context.Context, repo, reference string) error {
+	s.syncImageCalls.Add(1)
+
+	if s.syncImageFn != nil {
+		return s.syncImageFn(ctx, repo, reference)
+	}
+
+	return nil
+}
+
+func (s *mockCheckService) SyncReferrers(_ context.Context, _ string, _ string, _ []string) error {
+	return nil
+}
+
+func (s *mockCheckService) ResetCatalog() {}
+
+func (s *mockCheckService) CanRetryOnError() bool { return false }
+
+func (s *mockCheckService) GetSyncTimeout() time.Duration { return time.Minute }
+
+func (s *mockCheckService) ShouldCheckUpstream(repo, reference string) bool {
+	if s.shouldCheckUpstreamFn != nil {
+		return s.shouldCheckUpstreamFn(repo, reference)
+	}
+
+	return true
+}
+
+func (s *mockCheckService) IsOnDemandInBackgroundForRepo(repo string) bool {
+	if s.isOnDemandInBackgroundForRepoFn != nil {
+		return s.isOnDemandInBackgroundForRepoFn(repo)
+	}
+
+	return false
+}
+
+func TestOnDemandQueueImage(t *testing.T) {
+	started := make(chan context.Context, 1)
+	release := make(chan struct{})
+	finished := make(chan struct{})
+
+	backgroundService := &mockCheckService{
+		isOnDemandInBackgroundForRepoFn: func(repo string) bool {
+			return repo == "library/test"
+		},
+		syncImageFn: func(ctx context.Context, _, _ string) error {
+			started <- ctx
+			<-release
+			close(finished)
+
+			return nil
+		},
+	}
+	blockingService := &mockCheckService{
+		isOnDemandInBackgroundForRepoFn: func(string) bool { return false },
+		syncImageFn: func(context.Context, string, string) error {
+			t.Fatal("blocking registry should not run for onDemandInBackground repo")
+
+			return nil
+		},
+	}
+
+	onDemand := NewOnDemand(log.NewTestLogger())
+	onDemand.Add(blockingService)
+	onDemand.Add(backgroundService)
+
+	if !onDemand.ShouldQueueOnDemandSync("library/test") {
+		t.Fatal("expected on-demand-in-background sync to be enabled for matching repo")
+	}
+
+	if onDemand.ShouldQueueOnDemandSync("library/other") {
+		t.Fatal("expected on-demand-in-background sync to respect repository filter")
+	}
+
+	requestContext, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	onDemand.QueueImage(requestContext, "library/test", "latest")
+
+	var syncContext context.Context
+
+	select {
+	case syncContext = <-started:
+	case <-time.After(time.Second):
+		t.Fatal("background sync did not start")
+	}
+
+	if syncContext.Err() != nil {
+		t.Fatalf("background sync inherited request cancellation: %v", syncContext.Err())
+	}
+
+	// Second queue while the first is in flight must not spawn another SyncImage.
+	onDemand.QueueImage(requestContext, "library/test", "latest")
+
+	select {
+	case <-started:
+		t.Fatal("expected spawn dedup; second background sync started")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	if backgroundService.syncImageCalls.Load() != 1 {
+		t.Fatalf("expected one background sync, got %d", backgroundService.syncImageCalls.Load())
+	}
+
+	if blockingService.syncImageCalls.Load() != 0 {
+		t.Fatalf("expected blocking registry unused, got %d calls", blockingService.syncImageCalls.Load())
+	}
+
+	close(release)
+
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("background sync did not finish")
+	}
+}
+
+func TestOnDemandQueueImageLogsSyncError(t *testing.T) {
+	finished := make(chan struct{})
+
+	service := &mockCheckService{
+		isOnDemandInBackgroundForRepoFn: func(string) bool { return true },
+		syncImageFn: func(context.Context, string, string) error {
+			defer close(finished)
+
+			return zerr.ErrManifestNotFound
+		},
+	}
+	onDemand := NewOnDemand(log.NewTestLogger())
+	onDemand.Add(service)
+
+	onDemand.QueueImage(context.Background(), "library/test", "latest")
+
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("background sync did not finish")
+	}
+}
+
+func TestOnDemandQueueImagePerRepoServices(t *testing.T) {
+	finished := make(chan struct{})
+
+	libraryService := &mockCheckService{
+		isOnDemandInBackgroundForRepoFn: func(repo string) bool {
+			return repo == "library/test"
+		},
+		syncImageFn: func(context.Context, string, string) error {
+			close(finished)
+
+			return nil
+		},
+	}
+	otherService := &mockCheckService{
+		isOnDemandInBackgroundForRepoFn: func(repo string) bool {
+			return repo == "other/test"
+		},
+		syncImageFn: func(context.Context, string, string) error {
+			t.Fatal("other registry should not sync library/test")
+
+			return nil
+		},
+	}
+
+	onDemand := NewOnDemand(log.NewTestLogger())
+	onDemand.Add(otherService)
+	onDemand.Add(libraryService)
+
+	onDemand.QueueImage(context.Background(), "library/test", "latest")
+
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("background sync did not finish")
+	}
+
+	if otherService.syncImageCalls.Load() != 0 {
+		t.Fatalf("expected zero calls to other registry, got %d", otherService.syncImageCalls.Load())
+	}
+
+	if libraryService.syncImageCalls.Load() != 1 {
+		t.Fatalf("expected one call to library registry, got %d", libraryService.syncImageCalls.Load())
+	}
+}
+
+func TestBaseServiceIsOnDemandInBackgroundForRepo(t *testing.T) {
+	enabled := true
+	content := []syncconf.Content{{Prefix: "library/test"}}
+	service := &BaseService{
+		config: syncconf.RegistryConfig{
+			OnDemand:             true,
+			OnDemandInBackground: &enabled,
+			Content:              content,
+		},
+		contentManager: NewContentManager(content, log.NewTestLogger()),
+	}
+
+	if !service.IsOnDemandInBackgroundForRepo("library/test") {
+		t.Fatal("expected configured repository to use on-demand-in-background sync")
+	}
+
+	if service.IsOnDemandInBackgroundForRepo("library/other") {
+		t.Fatal("expected content filtering to exclude repository")
+	}
+
+	service.config.Content = nil
+	if !service.IsOnDemandInBackgroundForRepo("library/other") {
+		t.Fatal("expected empty content rules to allow any repository")
+	}
+
+	enabled = false
+	if service.IsOnDemandInBackgroundForRepo("library/test") {
+		t.Fatal("expected disabled on-demand-in-background sync to reject repository")
+	}
+
+	enabled = true
+	service.config.OnDemand = false
+	if service.IsOnDemandInBackgroundForRepo("library/test") {
+		t.Fatal("expected on-demand-in-background to require onDemand")
+	}
+}
+func (s *mockCheckService) FetchManifest(_ context.Context, _, _ string) (manifest.Manifest, error) {
+	return nil, nil
+}
+
+func (s *mockCheckService) IsStreamingForRepo(_ string) bool { return false }
+
+func (s *mockCheckService) IsImageLocal(_, _ string, _ godigest.Digest) (bool, error) {
+	return false, nil
+}
+
+func TestManifestCheckTracker(t *testing.T) {
+	Convey("A reference that was never checked is due for an upstream check", t, func() {
+		tracker := newManifestCheckTracker(time.Hour)
+
+		So(tracker.ShouldCheckUpstream("repo", "latest"), ShouldBeTrue)
+	})
+
+	Convey("A reference checked within the interval is served locally", t, func() {
+		tracker := newManifestCheckTracker(time.Hour)
+		tracker.MarkChecked("repo", "latest")
+
+		So(tracker.ShouldCheckUpstream("repo", "latest"), ShouldBeFalse)
+
+		Convey("Only the marked reference is throttled", func() {
+			So(tracker.ShouldCheckUpstream("repo", "v1"), ShouldBeTrue)
+			So(tracker.ShouldCheckUpstream("other", "latest"), ShouldBeTrue)
+		})
+	})
+
+	Convey("A reference checked before the interval elapsed is due again and dropped", t, func() {
+		tracker := newManifestCheckTracker(time.Millisecond)
+		tracker.MarkChecked("repo", "latest")
+
+		time.Sleep(5 * time.Millisecond)
+
+		So(tracker.ShouldCheckUpstream("repo", "latest"), ShouldBeTrue)
+		So(tracker.store, ShouldNotContainKey, trackerKey("repo", "latest"))
+	})
+
+	Convey("Keys of different repo and reference pairs never collide", t, func() {
+		tracker := newManifestCheckTracker(time.Hour)
+		tracker.MarkChecked("a", "b/c")
+
+		So(tracker.ShouldCheckUpstream("a/b", "c"), ShouldBeTrue)
+	})
+
+	Convey("The sweep period is never shorter than the minimum", t, func() {
+		So(newManifestCheckTracker(time.Second).evictPeriod(), ShouldEqual, minEvictPeriod)
+		So(newManifestCheckTracker(24*time.Hour).evictPeriod(), ShouldEqual, 24*time.Hour)
+	})
+
+	Convey("MarkChecked sweeps expired entries once the sweep period has passed", t, func() {
+		tracker := newManifestCheckTracker(time.Millisecond)
+
+		for i := range 100 {
+			tracker.MarkChecked("repo", "tag"+strconv.Itoa(i))
+		}
+
+		So(len(tracker.store), ShouldEqual, 100)
+
+		time.Sleep(5 * time.Millisecond)
+
+		// force the sweep to be due, then mark one more reference
+		tracker.lastEvict = time.Now().Add(-2 * minEvictPeriod)
+		tracker.MarkChecked("repo", "fresh")
+
+		So(len(tracker.store), ShouldEqual, 1)
+		So(tracker.store, ShouldContainKey, trackerKey("repo", "fresh"))
+	})
+
+	Convey("Concurrent access is safe", t, func() {
+		tracker := newManifestCheckTracker(time.Hour)
+
+		var waitGroup sync.WaitGroup
+
+		for i := range 50 {
+			waitGroup.Add(2)
+
+			go func(idx int) {
+				defer waitGroup.Done()
+				tracker.MarkChecked("repo", "tag"+strconv.Itoa(idx))
+			}(i)
+
+			go func(idx int) {
+				defer waitGroup.Done()
+				tracker.ShouldCheckUpstream("repo", "tag"+strconv.Itoa(idx))
+			}(i)
+		}
+
+		waitGroup.Wait()
+
+		So(len(tracker.store), ShouldEqual, 50)
+	})
+}
+
+func TestBaseServiceShouldCheckUpstream(t *testing.T) {
+	Convey("Without manifestCheckInterval every request checks upstream", t, func() {
+		service := &BaseService{config: syncconf.RegistryConfig{}}
+
+		So(service.checkTracker, ShouldBeNil)
+		So(service.ShouldCheckUpstream("repo", "latest"), ShouldBeTrue)
+
+		Convey("Marking a check is a no-op", func() {
+			service.markUpstreamChecked("repo", "latest")
+			So(service.ShouldCheckUpstream("repo", "latest"), ShouldBeTrue)
+		})
+	})
+
+	Convey("With manifestCheckInterval a marked reference is throttled", t, func() {
+		service := &BaseService{checkTracker: newManifestCheckTracker(time.Hour)}
+
+		So(service.ShouldCheckUpstream("repo", "latest"), ShouldBeTrue)
+
+		service.markUpstreamChecked("repo", "latest")
+		So(service.ShouldCheckUpstream("repo", "latest"), ShouldBeFalse)
+	})
+
+	Convey("New wires the tracker only when the interval is configured", t, func() {
+		withInterval, err := New(syncconf.RegistryConfig{
+			URLs:                  []string{"http://localhost:9999"},
+			ManifestCheckInterval: time.Hour,
+		}, "", nil, t.TempDir(), storage.StoreController{}, nil, mocks.MetaDBMock{}, log.NewTestLogger())
+		So(err, ShouldBeNil)
+		So(withInterval.checkTracker, ShouldNotBeNil)
+
+		withoutInterval, err := New(syncconf.RegistryConfig{
+			URLs: []string{"http://localhost:9999"},
+		}, "", nil, t.TempDir(), storage.StoreController{}, nil, mocks.MetaDBMock{}, log.NewTestLogger())
+		So(err, ShouldBeNil)
+		So(withoutInterval.checkTracker, ShouldBeNil)
+	})
+}
+
+func TestBaseServiceIsStreamingForRepo(t *testing.T) {
+	Convey("Streaming disabled means no repo streams, regardless of Content", t, func() {
+		service := &BaseService{config: syncconf.RegistryConfig{}}
+		So(service.IsStreamingForRepo("any/repo"), ShouldBeFalse)
+	})
+
+	stream := true
+
+	Convey("Streaming enabled with no Content rules streams every repo", t, func() {
+		service := &BaseService{config: syncconf.RegistryConfig{Stream: &stream}}
+		So(service.IsStreamingForRepo("any/repo"), ShouldBeTrue)
+	})
+
+	Convey("Streaming enabled with Content rules is gated per repo", t, func() {
+		content := []syncconf.Content{{Prefix: "streamed/**"}}
+		service := &BaseService{
+			config:         syncconf.RegistryConfig{Stream: &stream, Content: content},
+			contentManager: NewContentManager(content, log.NewTestLogger()),
+		}
+		So(service.IsStreamingForRepo("streamed/foo"), ShouldBeTrue)
+		So(service.IsStreamingForRepo("other/foo"), ShouldBeFalse)
+	})
+}
+
+func TestBaseServiceIsImageLocal(t *testing.T) {
+	digest := godigest.FromString("manifest")
+
+	Convey("Local only when the destination already holds repo:reference at digest", t, func() {
+		for _, tc := range []struct {
+			skip  bool
+			err   error
+			local bool
+		}{
+			{skip: true, local: true},
+			{skip: false, local: false},
+			// A storage error is returned, not treated as absence.
+			{skip: false, err: zerr.ErrStoragePermanent, local: false},
+		} {
+			service := &BaseService{destination: mocks.SyncDestinationMock{
+				CanSkipImageFn: func(repo, tag string, dig godigest.Digest) (bool, error) {
+					So(repo, ShouldEqual, "repo")
+					So(tag, ShouldEqual, "latest")
+					So(dig, ShouldEqual, digest)
+
+					return tc.skip, tc.err
+				},
+			}}
+			local, err := service.IsImageLocal("repo", "latest", digest)
+			So(err, ShouldEqual, tc.err)
+			So(local, ShouldEqual, tc.local)
+		}
+	})
+}
+
+func TestOnDemandStreamAndBackgroundOnDifferentRegistries(t *testing.T) {
+	Convey("A stream registry and an onDemandInBackground registry matching the same repo", t, func() {
+		enabled := true
+		content := []syncconf.Content{{Prefix: "library/**"}}
+
+		onDemand := NewOnDemand(log.NewTestLogger())
+		onDemand.Add(&BaseService{
+			config:         syncconf.RegistryConfig{OnDemand: true, Stream: &enabled, Content: content},
+			contentManager: NewContentManager(content, log.NewTestLogger()),
+		})
+		onDemand.Add(&BaseService{
+			config: syncconf.RegistryConfig{
+				OnDemand: true, OnDemandInBackground: &enabled, Content: content,
+			},
+			contentManager: NewContentManager(content, log.NewTestLogger()),
+		})
+
+		// Both are true for the shared repo; getImageManifest checks the queue first, which is why
+		// background mode wins.
+		So(onDemand.ShouldQueueOnDemandSync("library/test"), ShouldBeTrue)
+		So(onDemand.IsStreamingEnabledForRepo("library/test"), ShouldBeTrue)
+
+		So(onDemand.ShouldQueueOnDemandSync("other/test"), ShouldBeFalse)
+		So(onDemand.IsStreamingEnabledForRepo("other/test"), ShouldBeFalse)
+	})
+}
+
+func TestBaseServiceGetSyncTimeout(t *testing.T) {
+	Convey("An unset SyncTimeout falls back to the default", t, func() {
+		service := &BaseService{config: syncconf.RegistryConfig{}}
+		So(service.GetSyncTimeout(), ShouldEqual, syncConstants.DefaultSyncTimeout)
+	})
+
+	Convey("A configured SyncTimeout is used as-is", t, func() {
+		service := &BaseService{config: syncconf.RegistryConfig{SyncTimeout: 5 * time.Minute}}
+		So(service.GetSyncTimeout(), ShouldEqual, 5*time.Minute)
+	})
+}
+
+func TestOnDemandShouldCheckUpstreamManifest(t *testing.T) {
+	Convey("With no services configured the check is due", t, func() {
+		onDemand := NewOnDemand(log.NewTestLogger())
+
+		So(onDemand.ShouldCheckUpstreamManifest("repo", "latest"), ShouldBeTrue)
+	})
+
+	Convey("A single service reporting a recent check is enough to serve locally", t, func() {
+		onDemand := NewOnDemand(log.NewTestLogger())
+		onDemand.Add(&mockCheckService{})
+		onDemand.Add(&mockCheckService{
+			shouldCheckUpstreamFn: func(_, _ string) bool { return false },
+		})
+
+		So(onDemand.ShouldCheckUpstreamManifest("repo", "latest"), ShouldBeFalse)
+	})
+
+	Convey("All services reporting a due check means upstream is contacted", t, func() {
+		onDemand := NewOnDemand(log.NewTestLogger())
+		onDemand.Add(&mockCheckService{})
+
+		So(onDemand.ShouldCheckUpstreamManifest("repo", "latest"), ShouldBeTrue)
+	})
+}
+
+func TestGetRepoListPagination(t *testing.T) {
+	Convey("getRepoList follows catalog pagination", t, func() {
+		type page struct {
+			repos []string
+			link  string
+		}
+
+		// Pages are keyed by the `last` value they accept; anything else gets ECR's 405.
+		listAll := func(pages map[string]page) ([]string, error) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/v2/_catalog" {
+					return // ping
+				}
+
+				page, ok := pages[r.URL.Query().Get("last")]
+				if !ok {
+					w.WriteHeader(http.StatusMethodNotAllowed)
+
+					return
+				}
+
+				if page.link != "" {
+					w.Header().Set("Link", page.link)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string][]string{"repositories": page.repos})
+			}))
+			defer server.Close()
+
+			logger := log.NewTestLogger()
+
+			client, hosts, err := newClient(syncconf.RegistryConfig{URLs: []string{server.URL}}, nil, logger)
+			So(err, ShouldBeNil)
+
+			return NewRemoteRegistry(client, hosts, logger).GetRepositories(context.Background())
+		}
+
+		Convey("opaque Link cursors (ECR)", func() {
+			repos, err := listAll(map[string]page{
+				"":      {[]string{"a", "b"}, `<https://ecr.example/v2/_catalog?n=2&last=tok%3D%3D>; rel=next`},
+				"tok==": {[]string{}, `</v2/_catalog?last=x>; rel="prev", </v2/_catalog?last=tok2>; rel="next"`},
+				"tok2":  {[]string{"c"}, ""},
+			})
+			So(err, ShouldBeNil)
+			So(repos, ShouldResemble, []string{"a", "b", "c"})
+		})
+
+		Convey("RFC 8288 rel forms", func() {
+			repos, err := listAll(map[string]page{
+				"":   {[]string{"a"}, `</v2/_catalog?last=t1>; title="x" ; REL = "alternate next"`},
+				"t1": {[]string{"b"}, `</v2/_catalog?last=t0>; type=x ,  </v2/_catalog?last=t2>;rel=Next`},
+				"t2": {[]string{"c"}, `</v2/_catalog?last=t3>; title="1 < 2, x; rel=prev \" >"; rel="next"`},
+				"t3": {[]string{"d"}, `</v2/_catalog?last=t0>; title="a, rel=next"; rel=prev; rel=next`},
+			})
+			So(err, ShouldBeNil)
+			So(repos, ShouldResemble, []string{"a", "b", "c", "d"})
+		})
+
+		Convey("repository-name Link cursors (distribution)", func() {
+			repos, err := listAll(map[string]page{
+				"":  {[]string{"a", "b"}, `</v2/_catalog?last=b&n=2>; rel="next"`},
+				"b": {[]string{"c"}, `</v2/_catalog?last=a>; rel="prev"`},
+			})
+			So(err, ShouldBeNil)
+			So(repos, ShouldResemble, []string{"a", "b", "c"})
+		})
+
+		Convey("no Link headers", func() {
+			repos, err := listAll(map[string]page{
+				"":  {[]string{"a", "b"}, ""},
+				"b": {[]string{"c"}, ""},
+				"c": {[]string{}, ""},
+			})
+			So(err, ShouldBeNil)
+			So(repos, ShouldResemble, []string{"a", "b", "c"})
+		})
+
+		Convey("cursor cycles terminate", func() {
+			repos, err := listAll(map[string]page{
+				"":   {[]string{"a"}, `</v2/_catalog?last=t1>; rel="next"`},
+				"t1": {[]string{"b"}, `</v2/_catalog?last=t2>; rel="next"`},
+				"t2": {[]string{"c"}, `</v2/_catalog?last=t1>; rel="next"`},
+			})
+			So(err, ShouldBeNil)
+			So(repos, ShouldResemble, []string{"a", "b", "c"})
+		})
+
+		Convey("next links without a usable last stop with the repositories listed so far", func() {
+			for _, link := range []string{`</v2/_catalog?next_page=x>; rel="next"`, `</v2/_catalog?last=%zz>; rel="next"`} {
+				repos, err := listAll(map[string]page{
+					"":   {[]string{"a"}, `</v2/_catalog?last=t1>; rel="next"`},
+					"t1": {[]string{"b"}, link},
+				})
+				So(err, ShouldBeNil)
+				So(repos, ShouldResemble, []string{"a", "b"})
+			}
+		})
+	})
+}
+
+// fakeStreamManagerForOnDemand is a minimal StreamManager for testing FetchManifestForStream.
+type fakeStreamManagerForOnDemand struct {
+	mu       sync.Mutex
+	staged   map[string]*StreamableManifest
+	storeErr error
+}
+
+func newFakeStreamManagerForOnDemand() *fakeStreamManagerForOnDemand {
+	return &fakeStreamManagerForOnDemand{staged: map[string]*StreamableManifest{}}
+}
+
+func (f *fakeStreamManagerForOnDemand) ConnectClient(_, _ string, _ io.Writer) (BlobCopier, error) {
+	return nil, zerr.ErrBlobNotFoundInActiveStreams
+}
+
+func (f *fakeStreamManagerForOnDemand) DownloadStreamedBlobs(_ context.Context, _, _ string, _ BlobFetcher,
+) map[godigest.Digest]string {
+	return nil
+}
+
+// StoreImageForStreaming keeps the real "first stage wins" behavior: a second call for the same
+// repo:reference gets the first manifest back.
+func (f *fakeStreamManagerForOnDemand) StoreImageForStreaming(repo, reference string, m *StreamableManifest,
+) (*StreamableManifest, error) {
+	if f.storeErr != nil {
+		return nil, f.storeErr
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	key := repo + ":" + reference
+	if existing, ok := f.staged[key]; ok {
+		existing.onSynced = append(existing.onSynced, m.onSynced...)
+
+		return existing, nil
+	}
+
+	f.staged[key] = m
+
+	return m, nil
+}
+
+func (f *fakeStreamManagerForOnDemand) StreamingImageManifest(repo, reference string) (*StreamableManifest, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	m, ok := f.staged[repo+":"+reference]
+
+	return m, ok
+}
+
+func (f *fakeStreamManagerForOnDemand) JoinStreamingImage(repo, reference string,
+	onSynced func(manifest.Manifest),
+) (*StreamableManifest, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	m, ok := f.staged[repo+":"+reference]
+	if ok && onSynced != nil {
+		m.onSynced = append(m.onSynced, onSynced)
+	}
+
+	return m, ok
+}
+
+func (f *fakeStreamManagerForOnDemand) RemoveStreamingImage(repo, reference string, synced bool) {
+	f.mu.Lock()
+	m, ok := f.staged[repo+":"+reference]
+	delete(f.staged, repo+":"+reference)
+	f.mu.Unlock()
+
+	if ok && synced {
+		for _, onSynced := range m.onSynced {
+			onSynced(m.referenceManifest)
+		}
+	}
+
+	// As the real one: a flight that joined m waits for this.
+	if ok && m.done != nil {
+		m.synced = synced
+		close(m.done)
+	}
+}
+
+func (f *fakeStreamManagerForOnDemand) HasStreamsForRepo(_ string) bool {
+	return false
+}
+
+func (f *fakeStreamManagerForOnDemand) CachedBlobInfo(_, _ string) (int64, string, error) {
+	return 0, "", zerr.ErrBlobNotFound
+}
+
+// fakeStreamService is a minimal Service for testing FetchManifestForStream with FetchManifest and
+// the deduped SyncImage.
+type fakeStreamService struct {
+	fetchManifestFn func(ctx context.Context, repo, reference string) (manifest.Manifest, error)
+	// syncImageCalls counts SyncImage calls; if syncImageBlock is set, each call waits on it,
+	// holding the sync in flight.
+	syncImageCalls int32
+	syncImageBlock chan struct{}
+	syncImageErr   error
+	// localDigest, if set, is reported as already committed locally by IsImageLocal.
+	localDigest godigest.Digest
+	// localErr, if set, is returned by IsImageLocal as a storage failure.
+	localErr error
+	// notStreaming makes IsStreamingForRepo false, as after a reload that turned streaming off.
+	notStreaming bool
+}
+
+func (s *fakeStreamService) GetNextRepo(_ string) (string, error) { return "", nil }
+
+func (s *fakeStreamService) SyncRepo(_ context.Context, _ string) error { return nil }
+
+func (s *fakeStreamService) SyncImage(_ context.Context, _, _ string) error {
+	atomic.AddInt32(&s.syncImageCalls, 1)
+
+	if s.syncImageBlock != nil {
+		<-s.syncImageBlock
+	}
+
+	return s.syncImageErr
+}
+
+func (s *fakeStreamService) SyncReferrers(_ context.Context, _ string, _ string, _ []string) error {
+	return nil
+}
+
+func (s *fakeStreamService) ResetCatalog() {}
+
+func (s *fakeStreamService) CanRetryOnError() bool { return false }
+
+func (s *fakeStreamService) GetSyncTimeout() time.Duration { return time.Minute }
+
+func (s *fakeStreamService) ShouldCheckUpstream(_, _ string) bool { return true }
+
+func (s *fakeStreamService) FetchManifest(ctx context.Context, repo, reference string,
+) (manifest.Manifest, error) {
+	if s.fetchManifestFn != nil {
+		return s.fetchManifestFn(ctx, repo, reference)
+	}
+
+	return nil, nil
+}
+
+func (s *fakeStreamService) IsStreamingForRepo(_ string) bool { return !s.notStreaming }
+
+func (s *fakeStreamService) IsImageLocal(_, _ string, digest godigest.Digest) (bool, error) {
+	return s.localDigest != "" && s.localDigest == digest, s.localErr
+}
+
+func (s *fakeStreamService) IsOnDemandInBackgroundForRepo(_ string) bool { return false }
+
+// newTestIndexForStream returns a real multi-arch index from a local OCI layout, for fakes to return.
+func newTestIndexForStream(t *testing.T) manifest.Manifest {
+	t.Helper()
+
+	root, storeCtrl := newTestStore(t)
+	writeOCIMultiPlatformIndex(t, storeCtrl, "stream-index-repo")
+
+	regClient := regclient.New()
+	srcRef := mustOCIDirRef(t, repoPath(root, "stream-index-repo"), predictTestTag)
+
+	man, err := regClient.ManifestGet(context.Background(), srcRef)
+	if err != nil {
+		t.Fatalf("failed to fetch test index: %v", err)
+	}
+
+	t.Cleanup(func() { regClient.Close(context.Background(), man.GetRef()) })
+
+	return man
+}
+
+// newTestManifestForStream returns a real manifest.Manifest from a local OCI layout, for fakes to
+// return.
+func newTestManifestForStream(t *testing.T) manifest.Manifest {
+	t.Helper()
+
+	root, storeCtrl := newTestStore(t)
+	writeOCISingleManifest(t, storeCtrl, "stream-repo")
+
+	regClient := regclient.New()
+	srcRef := mustOCIDirRef(t, repoPath(root, "stream-repo"), predictTestTag)
+
+	man, err := regClient.ManifestGet(context.Background(), srcRef)
+	if err != nil {
+		t.Fatalf("failed to fetch test manifest: %v", err)
+	}
+
+	t.Cleanup(func() { regClient.Close(context.Background(), man.GetRef()) })
+
+	return man
+}
+
+// stageOnFirstJoinMiss misses its first JoinStreamingImage and stages manifest right after, as a
+// leader staging (and releasing its slot) in between would.
+type stageOnFirstJoinMiss struct {
+	*fakeStreamManagerForOnDemand
+	manifest manifest.Manifest
+	missed   bool
+}
+
+func (f *stageOnFirstJoinMiss) JoinStreamingImage(repo, reference string,
+	onSynced func(manifest.Manifest),
+) (*StreamableManifest, bool) {
+	if !f.missed {
+		f.missed = true
+
+		_, _ = f.StoreImageForStreaming(repo, reference, NewStreamableManifest(f.manifest))
+
+		return nil, false
+	}
+
+	return f.fakeStreamManagerForOnDemand.JoinStreamingImage(repo, reference, onSynced)
+}
+
+func TestStagingSlotOwnership(t *testing.T) {
+	Convey("A waiter of an ended plain flight does not drop a slot a new streaming leader adopted", t, func() {
+		onDemand := NewOnDemand(log.NewTestLogger())
+		key := onDemandKey(onDemandKindImage, "repo", "latest")
+
+		// A streaming request joined a plain flight, which has since ended.
+		waiterSlot := onDemand.acquireStaging(key)
+
+		// Before that waiter handles its result, a new streaming request leads the next flight.
+		leaderSlot := onDemand.acquireStaging(key)
+		So(leaderSlot, ShouldEqual, waiterSlot)
+
+		closeStaging := onDemand.adoptStaging(key)
+
+		// The old waiter now handles its result.
+		onDemand.releaseStaging(key, waiterSlot)
+
+		// A request arriving before the leader stages still waits on the leader's channel.
+		joiner := onDemand.acquireStaging(key)
+		So(joiner, ShouldEqual, leaderSlot)
+
+		closeStaging()
+
+		select {
+		case <-joiner.done:
+		default:
+			t.Fatal("joiner's staging channel was not closed by the leader")
+		}
+
+		onDemand.releaseStaging(key, joiner)
+		onDemand.releaseStaging(key, leaderSlot)
+
+		So(onDemand.staging, ShouldBeEmpty)
+	})
+
+	Convey("A leader staging between the first check and taking a slot is still joined", t, func() {
+		onDemand := NewOnDemand(log.NewTestLogger())
+		man := newTestManifestForStream(t)
+		fakeSM := &stageOnFirstJoinMiss{
+			fakeStreamManagerForOnDemand: newFakeStreamManagerForOnDemand(),
+			manifest:                     man,
+		}
+		onDemand.SetStreamManager(fakeSM)
+
+		service := &fakeStreamService{
+			fetchManifestFn: func(_ context.Context, _, _ string) (manifest.Manifest, error) {
+				return nil, zerr.ErrBlobNotFound
+			},
+		}
+		onDemand.Add(service)
+
+		result, err := onDemand.FetchManifestForStream(context.Background(), "repo", "latest", nil)
+		So(err, ShouldBeNil)
+		So(result, ShouldEqual, man)
+		// Joined the staged image instead of entering a flight.
+		So(atomic.LoadInt32(&service.syncImageCalls), ShouldEqual, 0)
+		So(onDemand.staging, ShouldBeEmpty)
+	})
+
+	Convey("A canceled request stops waiting while its flight goes on", t, func() {
+		onDemand := NewOnDemand(log.NewTestLogger())
+		fakeSM := newFakeStreamManagerForOnDemand()
+		onDemand.SetStreamManager(fakeSM)
+
+		man := newTestManifestForStream(t)
+		fetching := make(chan struct{})
+		release := make(chan struct{})
+		onDemand.Add(&fakeStreamService{
+			fetchManifestFn: func(_ context.Context, _, _ string) (manifest.Manifest, error) {
+				close(fetching)
+				<-release
+
+				return man, nil
+			},
+		})
+
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+
+		go func() {
+			_, err := onDemand.FetchManifestForStream(ctx, "repo", "latest", nil)
+			done <- err
+		}()
+
+		<-fetching
+		cancel()
+
+		select {
+		case err := <-done:
+			So(errors.Is(err, context.Canceled), ShouldBeTrue)
+		case <-time.After(5 * time.Second):
+			t.Fatal("FetchManifestForStream kept waiting after its context was canceled")
+		}
+
+		// The detached flight still stages and syncs, then cleans up after itself.
+		close(release)
+
+		for i := 0; i < 500; i++ {
+			onDemand.stagingMu.Lock()
+			pending := len(onDemand.staging)
+			onDemand.stagingMu.Unlock()
+
+			fakeSM.mu.Lock()
+			pending += len(fakeSM.staged)
+			fakeSM.mu.Unlock()
+
+			if pending == 0 {
+				break
+			}
+
+			time.Sleep(10 * time.Millisecond)
+		}
+
+		onDemand.stagingMu.Lock()
+		So(onDemand.staging, ShouldBeEmpty)
+		onDemand.stagingMu.Unlock()
+	})
+
+	Convey("A slot no leader adopted is dropped by the last request holding it", t, func() {
+		onDemand := NewOnDemand(log.NewTestLogger())
+		key := onDemandKey(onDemandKindImage, "repo", "latest")
+
+		first := onDemand.acquireStaging(key)
+		second := onDemand.acquireStaging(key)
+
+		onDemand.releaseStaging(key, first)
+		So(onDemand.staging, ShouldContainKey, key)
+
+		onDemand.releaseStaging(key, second)
+		So(onDemand.staging, ShouldBeEmpty)
+	})
+}
+
+func TestFetchManifestForStream(t *testing.T) {
+	Convey("A manifest already staged for streaming is served from cache without contacting any service", t, func() {
+		onDemand := NewOnDemand(log.NewTestLogger())
+		fakeSM := newFakeStreamManagerForOnDemand()
+		onDemand.SetStreamManager(fakeSM)
+
+		man := newTestManifestForStream(t)
+		_, storeErr := fakeSM.StoreImageForStreaming("repo", "latest", NewStreamableManifest(man))
+		So(storeErr, ShouldBeNil)
+
+		called := false
+		onDemand.Add(&fakeStreamService{
+			fetchManifestFn: func(_ context.Context, _, _ string) (manifest.Manifest, error) {
+				called = true
+
+				return nil, nil
+			},
+		})
+
+		result, err := onDemand.FetchManifestForStream(context.Background(), "repo", "latest", nil)
+		So(err, ShouldBeNil)
+		So(result, ShouldEqual, man)
+		So(called, ShouldBeFalse)
+	})
+
+	Convey("After a reload that stopped streaming the repo, a reference still staged is joined", t, func() {
+		onDemand := NewOnDemand(log.NewTestLogger())
+		fakeSM := newFakeStreamManagerForOnDemand()
+		onDemand.SetStreamManager(fakeSM)
+
+		man := newTestManifestForStream(t)
+		_, storeErr := fakeSM.StoreImageForStreaming("repo", "latest", NewStreamableManifest(man))
+		So(storeErr, ShouldBeNil)
+
+		fetched := false
+		service := &fakeStreamService{
+			notStreaming: true,
+			fetchManifestFn: func(_ context.Context, _, _ string) (manifest.Manifest, error) {
+				fetched = true
+
+				return nil, nil
+			},
+		}
+		onDemand.Add(service)
+
+		result, err := onDemand.FetchManifestForStream(context.Background(), "repo", "latest", nil)
+		So(err, ShouldBeNil)
+		So(result, ShouldEqual, man)
+		So(fetched, ShouldBeFalse)
+		So(atomic.LoadInt32(&service.syncImageCalls), ShouldEqual, 0)
+	})
+
+	Convey("If that stream has just ended, the plain on-demand sync runs instead", t, func() {
+		onDemand := NewOnDemand(log.NewTestLogger())
+		onDemand.SetStreamManager(newFakeStreamManagerForOnDemand())
+
+		fetched := false
+		service := &fakeStreamService{
+			notStreaming: true,
+			fetchManifestFn: func(_ context.Context, _, _ string) (manifest.Manifest, error) {
+				fetched = true
+
+				return nil, nil
+			},
+		}
+		onDemand.Add(service)
+
+		result, err := onDemand.FetchManifestForStream(context.Background(), "repo", "latest", nil)
+		So(err, ShouldEqual, zerr.ErrSyncNotStreamed)
+		So(result, ShouldBeNil)
+		So(fetched, ShouldBeFalse)
+		So(atomic.LoadInt32(&service.syncImageCalls), ShouldEqual, 1)
+	})
+
+	Convey("An index is synced by the plain on-demand sync: nothing is staged", t, func() {
+		fakeSM := newFakeStreamManagerForOnDemand()
+		onDemand := NewOnDemand(log.NewTestLogger())
+		onDemand.SetStreamManager(fakeSM)
+
+		index := newTestIndexForStream(t)
+		service := &fakeStreamService{
+			fetchManifestFn: func(_ context.Context, _, _ string) (manifest.Manifest, error) {
+				return index, nil
+			},
+		}
+		onDemand.Add(service)
+
+		result, err := onDemand.FetchManifestForStream(context.Background(), "repo", "latest", nil)
+		So(err, ShouldEqual, zerr.ErrSyncNotStreamed)
+		So(result, ShouldBeNil)
+
+		fakeSM.mu.Lock()
+		So(fakeSM.staged, ShouldBeEmpty)
+		fakeSM.mu.Unlock()
+		So(atomic.LoadInt32(&service.syncImageCalls), ShouldEqual, 1)
+	})
+
+	Convey("An image already local at the upstream digest is synced by the plain on-demand sync: nothing is staged",
+		t, func() {
+			fakeSM := newFakeStreamManagerForOnDemand()
+			onDemand := NewOnDemand(log.NewTestLogger())
+			onDemand.SetStreamManager(fakeSM)
+
+			man := newTestManifestForStream(t)
+			service := &fakeStreamService{
+				fetchManifestFn: func(_ context.Context, _, _ string) (manifest.Manifest, error) {
+					return man, nil
+				},
+				localDigest: man.GetDescriptor().Digest,
+			}
+			onDemand.Add(service)
+
+			result, err := onDemand.FetchManifestForStream(context.Background(), "repo", "latest", nil)
+			So(err, ShouldEqual, zerr.ErrSyncNotStreamed)
+			So(result, ShouldBeNil)
+
+			fakeSM.mu.Lock()
+			So(fakeSM.staged, ShouldBeEmpty)
+			fakeSM.mu.Unlock()
+			// The plain sync still runs: it skips the copy and records the upstream check.
+			So(atomic.LoadInt32(&service.syncImageCalls), ShouldEqual, 1)
+		})
+
+	Convey("A storage error checking the local image is not streamed: the plain sync surfaces it", t, func() {
+		fakeSM := newFakeStreamManagerForOnDemand()
+		onDemand := NewOnDemand(log.NewTestLogger())
+		onDemand.SetStreamManager(fakeSM)
+
+		man := newTestManifestForStream(t)
+		service := &fakeStreamService{
+			fetchManifestFn: func(_ context.Context, _, _ string) (manifest.Manifest, error) {
+				return man, nil
+			},
+			localErr: zerr.ErrStorageTransient,
+		}
+		onDemand.Add(service)
+
+		result, err := onDemand.FetchManifestForStream(context.Background(), "repo", "latest", nil)
+		So(errors.Is(err, zerr.ErrSyncNotStreamed), ShouldBeTrue)
+		So(result, ShouldBeNil)
+
+		fakeSM.mu.Lock()
+		So(fakeSM.staged, ShouldBeEmpty)
+		fakeSM.mu.Unlock()
+		So(atomic.LoadInt32(&service.syncImageCalls), ShouldEqual, 1)
+	})
+
+	Convey("An image local at an older digest is still staged and streamed", t, func() {
+		fakeSM := newFakeStreamManagerForOnDemand()
+		onDemand := NewOnDemand(log.NewTestLogger())
+		onDemand.SetStreamManager(fakeSM)
+
+		man := newTestManifestForStream(t)
+		onDemand.Add(&fakeStreamService{
+			fetchManifestFn: func(_ context.Context, _, _ string) (manifest.Manifest, error) {
+				return man, nil
+			},
+			localDigest: godigest.FromString("an older manifest"),
+		})
+
+		result, err := onDemand.FetchManifestForStream(context.Background(), "repo", "latest", nil)
+		So(err, ShouldBeNil)
+		So(result, ShouldEqual, man)
+	})
+
+	Convey("A request finding a plain sync in flight joins it instead of staging a second one", t, func() {
+		fakeSM := newFakeStreamManagerForOnDemand()
+		onDemand := NewOnDemand(log.NewTestLogger())
+		onDemand.SetStreamManager(fakeSM)
+
+		var fetchCalls int32
+
+		block := make(chan struct{})
+		service := &fakeStreamService{
+			fetchManifestFn: func(_ context.Context, _, _ string) (manifest.Manifest, error) {
+				atomic.AddInt32(&fetchCalls, 1)
+
+				return newTestManifestForStream(t), nil
+			},
+			syncImageBlock: block,
+		}
+		onDemand.Add(service)
+
+		plainDone := make(chan error, 1)
+
+		go func() { plainDone <- onDemand.SyncImage(context.Background(), "repo", "latest") }()
+
+		for i := 0; i < 100 && atomic.LoadInt32(&service.syncImageCalls) < 1; i++ {
+			time.Sleep(10 * time.Millisecond)
+		}
+
+		So(atomic.LoadInt32(&service.syncImageCalls), ShouldEqual, 1)
+
+		streamDone := make(chan error, 1)
+
+		go func() {
+			_, err := onDemand.FetchManifestForStream(context.Background(), "repo", "latest", nil)
+			streamDone <- err
+		}()
+
+		// It waits on the plain sync rather than returning a staged manifest.
+		select {
+		case err := <-streamDone:
+			t.Fatalf("returned before the in-flight sync ended: %v", err)
+		case <-time.After(200 * time.Millisecond):
+		}
+
+		close(block)
+
+		So(<-plainDone, ShouldBeNil)
+		So(<-streamDone, ShouldEqual, zerr.ErrSyncNotStreamed)
+		So(atomic.LoadInt32(&fetchCalls), ShouldEqual, 0)
+		So(atomic.LoadInt32(&service.syncImageCalls), ShouldEqual, 1)
+
+		fakeSM.mu.Lock()
+		So(fakeSM.staged, ShouldBeEmpty)
+		fakeSM.mu.Unlock()
+	})
+
+	Convey("A hard failure of the not-streamed sync reaches the caller as the opaque client error", t, func() {
+		onDemand := NewOnDemand(log.NewTestLogger())
+		onDemand.SetStreamManager(newFakeStreamManagerForOnDemand())
+		onDemand.Add(&fakeStreamService{
+			fetchManifestFn: func(_ context.Context, _, _ string) (manifest.Manifest, error) {
+				return newTestIndexForStream(t), nil
+			},
+			syncImageErr: zerr.ErrStoragePermanent,
+		})
+
+		_, err := onDemand.FetchManifestForStream(context.Background(), "repo", "latest", nil)
+		So(errors.Is(err, zerr.ErrSyncNotStreamed), ShouldBeTrue)
+		So(errors.Is(err, zerr.ErrSyncInternal), ShouldBeTrue)
+		So(errors.Is(err, zerr.ErrStoragePermanent), ShouldBeFalse)
+	})
+
+	Convey("A policy rejection is surfaced by the plain sync, not masked as ErrBlobNotFound", t, func() {
+		onDemand := NewOnDemand(log.NewTestLogger())
+		onDemand.SetStreamManager(newFakeStreamManagerForOnDemand())
+		onDemand.Add(&fakeStreamService{
+			fetchManifestFn: func(_ context.Context, _, _ string) (manifest.Manifest, error) {
+				return nil, zerr.ErrSyncImageNotSigned
+			},
+			syncImageErr: zerr.ErrSyncImageNotSigned,
+		})
+
+		_, err := onDemand.FetchManifestForStream(context.Background(), "repo", "latest", nil)
+		So(errors.Is(err, zerr.ErrSyncNotStreamed), ShouldBeTrue)
+		So(errors.Is(err, zerr.ErrSyncImageNotSigned), ShouldBeTrue)
+		So(errors.Is(err, zerr.ErrBlobNotFound), ShouldBeFalse)
+	})
+
+	Convey("Concurrent calls for the same repo:reference trigger at most one background SyncImage", t, func(conv C) {
+		onDemand := NewOnDemand(log.NewTestLogger())
+		onDemand.SetStreamManager(newFakeStreamManagerForOnDemand())
+
+		man := newTestManifestForStream(t)
+		block := make(chan struct{})
+		service := &fakeStreamService{
+			fetchManifestFn: func(_ context.Context, _, _ string) (manifest.Manifest, error) {
+				return man, nil
+			},
+			syncImageBlock: block,
+		}
+		onDemand.Add(service)
+
+		const numConcurrent = 5
+
+		var wg sync.WaitGroup
+
+		wg.Add(numConcurrent)
+
+		for range numConcurrent {
+			go func() {
+				defer wg.Done()
+
+				_, err := onDemand.FetchManifestForStream(context.Background(), "repo", "latest", nil)
+				conv.So(err, ShouldBeNil)
+			}()
+		}
+
+		wg.Wait()
+
+		// Every call has returned and started its background sync. Let them all reach the
+		// singleflight before releasing the leader, so none becomes a second leader.
+		for i := 0; i < 50 && atomic.LoadInt32(&service.syncImageCalls) < 1; i++ {
+			time.Sleep(10 * time.Millisecond)
+		}
+		time.Sleep(200 * time.Millisecond)
+
+		close(block)
+
+		// Let the leader finish and share its result.
+		time.Sleep(200 * time.Millisecond)
+
+		So(atomic.LoadInt32(&service.syncImageCalls), ShouldEqual, 1)
+	})
+
+	Convey("Requests arriving while the leader is still fetching wait for it to stage and join it", t, func(conv C) {
+		onDemand := NewOnDemand(log.NewTestLogger())
+		fakeSM := newFakeStreamManagerForOnDemand()
+		onDemand.SetStreamManager(fakeSM)
+
+		man := newTestManifestForStream(t)
+
+		var fetchCalls int32
+
+		release := make(chan struct{})
+
+		service := &fakeStreamService{
+			fetchManifestFn: func(_ context.Context, _, _ string) (manifest.Manifest, error) {
+				atomic.AddInt32(&fetchCalls, 1)
+				<-release
+
+				return man, nil
+			},
+			// Hold the leader's sync, so the entry is still staged for the checks below.
+			syncImageBlock: make(chan struct{}),
+		}
+		onDemand.Add(service)
+
+		const numConcurrent = 4
+
+		results := make([]manifest.Manifest, numConcurrent)
+
+		var wg sync.WaitGroup
+
+		wg.Add(numConcurrent)
+
+		for i := range numConcurrent {
+			go func(i int) {
+				defer wg.Done()
+
+				result, err := onDemand.FetchManifestForStream(context.Background(), "repo", "latest", nil)
+				conv.So(err, ShouldBeNil)
+				results[i] = result
+			}(i)
+		}
+
+		// Let every request arrive while the leader's fetch is held.
+		for i := 0; i < 100 && atomic.LoadInt32(&fetchCalls) < 1; i++ {
+			time.Sleep(10 * time.Millisecond)
+		}
+		time.Sleep(100 * time.Millisecond)
+
+		close(release)
+		wg.Wait()
+
+		So(atomic.LoadInt32(&fetchCalls), ShouldEqual, 1)
+
+		staged, ok := fakeSM.StreamingImageManifest("repo", "latest")
+		So(ok, ShouldBeTrue)
+
+		for i := range numConcurrent {
+			So(results[i], ShouldEqual, staged.referenceManifest)
+		}
+
+		close(service.syncImageBlock)
+	})
+}
+
+// TestFetchManifestForStreamJoinerOnSynced: a request that joins an already staged stream still
+// gets its onSynced call once the stager's background sync commits.
+func TestFetchManifestForStreamJoinerOnSynced(t *testing.T) {
+	Convey("Both the stager's and a joiner's onSynced run after the background sync commits", t, func() {
+		onDemand := NewOnDemand(log.NewTestLogger())
+		onDemand.SetStreamManager(newFakeStreamManagerForOnDemand())
+
+		man := newTestManifestForStream(t)
+		block := make(chan struct{})
+		onDemand.Add(&fakeStreamService{
+			fetchManifestFn: func(_ context.Context, _, _ string) (manifest.Manifest, error) {
+				return man, nil
+			},
+			syncImageBlock: block,
+		})
+
+		stagerSynced := make(chan manifest.Manifest, 1)
+		joinerSynced := make(chan manifest.Manifest, 1)
+
+		_, err := onDemand.FetchManifestForStream(context.Background(), "repo", "latest",
+			func(m manifest.Manifest) { stagerSynced <- m })
+		So(err, ShouldBeNil)
+
+		// The background sync is blocked, so this call joins the staged entry.
+		_, err = onDemand.FetchManifestForStream(context.Background(), "repo", "latest",
+			func(m manifest.Manifest) { joinerSynced <- m })
+		So(err, ShouldBeNil)
+
+		close(block)
+
+		for _, ch := range []chan manifest.Manifest{stagerSynced, joinerSynced} {
+			var synced manifest.Manifest
+
+			select {
+			case synced = <-ch:
+			case <-time.After(5 * time.Second):
+			}
+
+			So(synced, ShouldEqual, man)
+		}
+	})
+}
+
+// TestStageForStreamSourceUniqueAcrossReloads: a reload keeps the stream manager but builds a new
+// BaseOnDemand, whose registry at index 0 may be a different upstream. Its streams must not share
+// the pre-reload registry's in-flight downloads of the same digest.
+func TestStageForStreamSourceUniqueAcrossReloads(t *testing.T) {
+	Convey("Registries at the same index before and after a reload don't share streams", t, func() {
+		_, storeCtrl := newTestStore(t)
+		streamManager := newTestStreamManager(t, storeCtrl, 0)
+		man := newTestManifestForStream(t)
+
+		stage := func(repo string) *StreamableManifest {
+			onDemand := NewOnDemand(log.NewTestLogger())
+			onDemand.SetStreamManager(streamManager)
+			onDemand.Add(&fakeStreamService{
+				fetchManifestFn: func(_ context.Context, _, _ string) (manifest.Manifest, error) {
+					return man, nil
+				},
+			})
+
+			staged, idx, joined, err := onDemand.stageForStream(context.Background(), repo, "latest", nil)
+			So(err, ShouldBeNil)
+			So(joined, ShouldBeFalse)
+			So(idx, ShouldEqual, 0)
+
+			t.Cleanup(func() { streamManager.RemoveStreamingImage(repo, "latest", false) })
+
+			return staged
+		}
+
+		before := stage("repo-before-reload")
+		after := stage("repo-after-reload")
+
+		So(after.source, ShouldNotEqual, before.source)
+
+		streamManager.streamLock.Lock()
+		defer streamManager.streamLock.Unlock()
+
+		So(before.streamKeys, ShouldNotBeEmpty)
+
+		for key := range before.streamKeys {
+			So(after.streamKeys, ShouldNotContainKey, key)
+			So(streamManager.refCounts[key], ShouldEqual, 1)
+		}
+	})
+}
+
+// joinChecksMiss wraps a stream manager so that join checks miss, as if another flight staged the
+// reference just after them.
+type joinChecksMiss struct {
+	*ChunkingStreamManager
+}
+
+func (*joinChecksMiss) JoinStreamingImage(_, _ string, _ func(manifest.Manifest)) (*StreamableManifest, bool) {
+	return nil, false
+}
+
+// TestStreamOrSyncImageJoinsPreReloadStream: when a flight from before a reload stages the same
+// reference between this flight's join check and its own staging, this flight serves that staged
+// manifest and waits for its sync, instead of starting a second sync beside it.
+func TestStreamOrSyncImageJoinsPreReloadStream(t *testing.T) {
+	for _, synced := range []bool{true, false} {
+		Convey(fmt.Sprintf("Joining a pre-reload stream whose sync succeeds=%t", synced), t, func() {
+			_, storeCtrl := newTestStore(t)
+			streamManager := newTestStreamManager(t, storeCtrl, 0)
+			man := newTestManifestForStream(t)
+
+			// The pre-reload flight's staged entry.
+			_, err := streamManager.StoreImageForStreaming("repo", "latest", NewStreamableManifest(man))
+			So(err, ShouldBeNil)
+
+			onDemand := NewOnDemand(log.NewTestLogger())
+			onDemand.SetStreamManager(&joinChecksMiss{ChunkingStreamManager: streamManager})
+
+			service := &fakeStreamService{
+				fetchManifestFn: func(_ context.Context, _, _ string) (manifest.Manifest, error) {
+					return man, nil
+				},
+			}
+			onDemand.Add(service)
+
+			var onSyncedCalls atomic.Int32
+
+			onSynced := func(manifest.Manifest) { onSyncedCalls.Add(1) }
+
+			key := onDemandKey(onDemandKindImage, "repo", "latest")
+			slot := onDemand.acquireStaging(key)
+
+			defer onDemand.releaseStaging(key, slot)
+
+			outcome := make(chan manifest.Manifest, 1)
+			result := make(chan error, 1)
+
+			go func() {
+				result <- onDemand.streamOrSyncImage(context.Background(), "repo", "latest", onSynced, outcome)
+			}()
+
+			So(<-outcome, ShouldEqual, man)
+
+			// It waits on the pre-reload sync rather than finishing or syncing itself.
+			select {
+			case err := <-result:
+				t.Fatalf("flight ended (%v) before the joined sync did", err)
+			case <-time.After(100 * time.Millisecond):
+			}
+
+			So(atomic.LoadInt32(&service.syncImageCalls), ShouldEqual, 0)
+
+			// The pre-reload flight finishes and unstages its entry.
+			streamManager.RemoveStreamingImage("repo", "latest", synced)
+
+			select {
+			case err := <-result:
+				if synced {
+					So(err, ShouldBeNil)
+					So(onSyncedCalls.Load(), ShouldEqual, 1)
+				} else {
+					So(err, ShouldEqual, zerr.ErrSyncJoinedStreamFailed)
+					So(onSyncedCalls.Load(), ShouldEqual, 0)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("flight must end once the joined sync is unstaged")
+			}
+
+			So(atomic.LoadInt32(&service.syncImageCalls), ShouldEqual, 0)
+		})
+	}
 }

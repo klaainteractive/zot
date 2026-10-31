@@ -15,11 +15,11 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 	godigest "github.com/opencontainers/go-digest"
-	"github.com/opencontainers/image-spec/specs-go"
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/project-zot/mockoidc"
 	. "github.com/smartystreets/goconvey/convey"
@@ -97,10 +97,9 @@ func TestRoutes(t *testing.T) {
 		ctlr.Config.Storage.Commit = true
 
 		cm := test.NewControllerManager(ctlr)
-		cm.StartAndWait(conf.HTTP.Port)
+		baseURL := cm.StartAndWait()
 		defer cm.StopServer()
 
-		baseURL := test.GetBaseURL(strconv.Itoa(ctlr.GetPort()))
 		rthdlr := api.NewRouteHandler(ctlr)
 
 		// NOTE: the url or method itself doesn't matter below since we are calling the handlers directly,
@@ -148,7 +147,7 @@ func TestRoutes(t *testing.T) {
 					"email":  "test@test.com",
 					"groups": []any{"group1", "group2"},
 				},
-				UserInfoEmail: oidc.UserInfoEmail{Email: "test@test.com"},
+				Email: "test@test.com",
 			}
 
 			callback(response, request, tokens, "state", relyingParty, userinfo)
@@ -199,14 +198,14 @@ func TestRoutes(t *testing.T) {
 			So(err, ShouldBeNil)
 
 			userinfo := &oidc.UserInfo{
-				Subject:         "sub",
-				UserInfoProfile: oidc.UserInfoProfile{PreferredUsername: "mapped-user"},
+				Subject:           "sub",
+				PreferredUsername: "mapped-user",
 				Claims: map[string]any{
 					"email":  "test@test.com",
 					"groups": []any{"ignored-userinfo-group"},
 					"roles":  []any{"dev", "ops"},
 				},
-				UserInfoEmail: oidc.UserInfoEmail{Email: "test@test.com"},
+				Email: "test@test.com",
 			}
 
 			callback(response, request, tokens, state, relyingParty, userinfo)
@@ -263,7 +262,7 @@ func TestRoutes(t *testing.T) {
 				Claims: map[string]any{
 					"roles": []any{"dev"},
 				},
-				UserInfoEmail: oidc.UserInfoEmail{Email: "fallback@test.com"},
+				Email: "fallback@test.com",
 			}
 
 			callback(response, request, tokens, state, relyingParty, userinfo)
@@ -316,10 +315,10 @@ func TestRoutes(t *testing.T) {
 			So(err, ShouldBeNil)
 
 			userinfo := &oidc.UserInfo{
-				Subject:         "sub",
-				UserInfoProfile: oidc.UserInfoProfile{PreferredUsername: "mapped-user"},
-				Claims:          map[string]any{},
-				UserInfoEmail:   oidc.UserInfoEmail{Email: "mapped@test.com"},
+				Subject:           "sub",
+				PreferredUsername: "mapped-user",
+				Claims:            map[string]any{},
+				Email:             "mapped@test.com",
 			}
 
 			callback(response, request, tokens, state, relyingParty, userinfo)
@@ -558,6 +557,29 @@ func TestRoutes(t *testing.T) {
 				})
 			So(statusCode, ShouldEqual, http.StatusBadRequest)
 
+			// A pre-write manifest cache lookup failure must not trigger cleanup of an existing marker.
+			cleanupCalled := false
+			statusCode = testUpdateManifest(
+				map[string]string{
+					"name":      "test",
+					"reference": "reference",
+				},
+				&mocks.MockedImageStore{
+					PutImageManifestFn: func(ctx context.Context, repo, reference, mediaType string,
+						body []byte, extraTags []string,
+					) (godigest.Digest, godigest.Digest, error) {
+						return "", "", zerr.ErrManifestCacheLookup
+					},
+					DeleteImageManifestFn: func(ctx context.Context, repo, reference string, detectCollision bool) error {
+						cleanupCalled = true
+
+						return nil
+					},
+				},
+			)
+			So(statusCode, ShouldEqual, http.StatusInternalServerError)
+			So(cleanupCalled, ShouldBeFalse)
+
 			// malformed digest-shaped manifest reference
 			statusCode = testUpdateManifest(
 				map[string]string{
@@ -592,7 +614,7 @@ func TestRoutes(t *testing.T) {
 			configDigest := godigest.FromBytes(configBlob)
 
 			manifest := ispec.Manifest{
-				Versioned: specs.Versioned{SchemaVersion: 2},
+				SchemaVersion: 2,
 				Config: ispec.Descriptor{
 					MediaType: ispec.MediaTypeImageConfig,
 					Digest:    configDigest,
@@ -710,7 +732,7 @@ func TestRoutes(t *testing.T) {
 					},
 				},
 			)
-			So(statusCode, ShouldEqual, http.StatusBadRequest)
+			So(statusCode, ShouldEqual, http.StatusNotFound)
 
 			// ErrManifestNotFound
 			statusCode = testDeleteManifest(
@@ -827,6 +849,8 @@ func TestRoutes(t *testing.T) {
 
 		// Check Blob
 		Convey("CheckBlob", func() {
+			const validDigest = "sha256:7b8437f04f83f084b7ed68ad8c4a4947e12fc4e1b006b38129bac89114ec3621"
+
 			testCheckBlob := func(urlVars map[string]string, ism *mocks.MockedImageStore) int {
 				ctlr.StoreController.DefaultStore = ism
 				request, _ := http.NewRequestWithContext(context.TODO(), http.MethodHead, baseURL, nil)
@@ -841,15 +865,28 @@ func TestRoutes(t *testing.T) {
 				return resp.StatusCode
 			}
 
-			// ErrBadBlobDigest
+			// invalid digest format is rejected before StatBlob
 			statusCode := testCheckBlob(
 				map[string]string{
 					"name":   "ErrBadBlobDigest",
 					"digest": "1234",
 				},
 				&mocks.MockedImageStore{
-					CheckBlobFn: func(ctx context.Context, repo string, digest godigest.Digest) (bool, int64, error) {
-						return true, 0, zerr.ErrBadBlobDigest
+					StatBlobFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+						panic("StatBlob must not be called for invalid digest format")
+					},
+				})
+			So(statusCode, ShouldEqual, http.StatusBadRequest)
+
+			// ErrBadBlobDigest from storage
+			statusCode = testCheckBlob(
+				map[string]string{
+					"name":   "ErrBadBlobDigest",
+					"digest": validDigest,
+				},
+				&mocks.MockedImageStore{
+					StatBlobFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+						return true, 0, time.Time{}, zerr.ErrBadBlobDigest
 					},
 				})
 			So(statusCode, ShouldEqual, http.StatusBadRequest)
@@ -858,11 +895,11 @@ func TestRoutes(t *testing.T) {
 			statusCode = testCheckBlob(
 				map[string]string{
 					"name":   "ErrRepoNotFound",
-					"digest": "1234",
+					"digest": validDigest,
 				},
 				&mocks.MockedImageStore{
-					CheckBlobFn: func(ctx context.Context, repo string, digest godigest.Digest) (bool, int64, error) {
-						return true, 0, zerr.ErrRepoNotFound
+					StatBlobFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+						return true, 0, time.Time{}, zerr.ErrRepoNotFound
 					},
 				})
 			So(statusCode, ShouldEqual, http.StatusNotFound)
@@ -871,11 +908,11 @@ func TestRoutes(t *testing.T) {
 			statusCode = testCheckBlob(
 				map[string]string{
 					"name":   "ErrBlobNotFound",
-					"digest": "1234",
+					"digest": validDigest,
 				},
 				&mocks.MockedImageStore{
-					CheckBlobFn: func(ctx context.Context, repo string, digest godigest.Digest) (bool, int64, error) {
-						return true, 0, zerr.ErrBlobNotFound
+					StatBlobFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+						return true, 0, time.Time{}, zerr.ErrBlobNotFound
 					},
 				})
 			So(statusCode, ShouldEqual, http.StatusNotFound)
@@ -884,11 +921,11 @@ func TestRoutes(t *testing.T) {
 			statusCode = testCheckBlob(
 				map[string]string{
 					"name":   "ErrUnexpectedError",
-					"digest": "1234",
+					"digest": validDigest,
 				},
 				&mocks.MockedImageStore{
-					CheckBlobFn: func(ctx context.Context, repo string, digest godigest.Digest) (bool, int64, error) {
-						return true, 0, ErrUnexpectedError
+					StatBlobFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+						return true, 0, time.Time{}, ErrUnexpectedError
 					},
 				})
 			So(statusCode, ShouldEqual, http.StatusInternalServerError)
@@ -897,11 +934,11 @@ func TestRoutes(t *testing.T) {
 			statusCode = testCheckBlob(
 				map[string]string{
 					"name":   "Check Blob Not Ok",
-					"digest": "1234",
+					"digest": validDigest,
 				},
 				&mocks.MockedImageStore{
-					CheckBlobFn: func(ctx context.Context, repo string, digest godigest.Digest) (bool, int64, error) {
-						return false, 0, nil
+					StatBlobFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+						return false, 0, time.Time{}, nil
 					},
 				})
 			So(statusCode, ShouldEqual, http.StatusNotFound)
@@ -1038,8 +1075,8 @@ func TestRoutes(t *testing.T) {
 
 						return "https://storage.example.com/zot/repo/blobs/sha256/layer", nil
 					},
-					CheckBlobFn: func(ctx context.Context, repo string, digest godigest.Digest) (bool, int64, error) {
-						return true, 4, nil
+					StatBlobFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+						return true, 4, time.Time{}, nil
 					},
 					GetBlobPartialFn: func(repo string, digest godigest.Digest, mediaType string,
 						from, to int64,
@@ -2340,17 +2377,14 @@ func TestWriteDataFromReader(t *testing.T) {
 	})
 }
 
-// Descriptor-aware Content-Type tests for blob HEAD/GET.
+// Content-Type tests for blob HEAD/GET.
 //
-// The blob endpoints derive the response Content-Type from the OCI
-// descriptor associated with the blob (via the repo's index/manifest
-// chain), and fall back to application/octet-stream when no such
-// descriptor is available. These tests use mock image stores to drive
-// both branches independently of the on-disk storage layer.
+// Blob responses always advertise application/octet-stream. These tests use mock
+// image stores that serve an index and manifest chain, so they can assert both the
+// constant header and that the blob path never reads the index.
 
 // descriptorTestDigests returns deterministic layer, manifest, and
-// config digests (in that order) used by the descriptor-aware
-// Content-Type tests.
+// config digests (in that order) used by the blob Content-Type tests.
 func descriptorTestDigests() (godigest.Digest, godigest.Digest, godigest.Digest) {
 	return godigest.FromString("layer"), godigest.FromString("manifest"), godigest.FromString("config")
 }
@@ -2370,9 +2404,9 @@ func newBlobTestRouteHandler(t *testing.T, store mocks.MockedImageStore) *api.Ro
 	return api.NewRouteHandler(ctlr)
 }
 
-// descriptorFixture builds a minimal index -> manifest -> layer chain
-// that resolves the layer digest from descriptorTestDigests to
-// MediaTypeImageLayerGzip.
+// descriptorFixture builds a minimal index -> manifest -> layer chain that would
+// resolve the layer digest from descriptorTestDigests to MediaTypeImageLayerGzip.
+// It exists so the tests can prove the blob path leaves it untouched.
 func descriptorFixture(t *testing.T) ([]byte, []byte) {
 	t.Helper()
 
@@ -2391,8 +2425,9 @@ func descriptorFixture(t *testing.T) ([]byte, []byte) {
 				Size:      4,
 			},
 		},
+
+		SchemaVersion: 2,
 	}
-	manifest.SchemaVersion = 2
 
 	manifestJSON, err := json.Marshal(manifest)
 	require.NoError(t, err)
@@ -2408,8 +2443,9 @@ func descriptorFixture(t *testing.T) ([]byte, []byte) {
 				},
 			},
 		},
+
+		SchemaVersion: 2,
 	}
-	index.SchemaVersion = 2
 
 	indexJSON, err := json.Marshal(index)
 	require.NoError(t, err)
@@ -2417,10 +2453,11 @@ func descriptorFixture(t *testing.T) ([]byte, []byte) {
 	return indexJSON, manifestJSON
 }
 
-// descriptorStore returns a mock store backed by descriptorFixture.
-// Looking up the layer digest from descriptorTestDigests resolves to a
-// layer with media type MediaTypeImageLayerGzip via the index walk;
-// other digests fall through to the binary fallback.
+// descriptorStore returns a mock store backed by descriptorFixture, whose index
+// and manifest would resolve the layer digest from descriptorTestDigests to
+// MediaTypeImageLayerGzip. Blob responses no longer consult it: the tests below
+// keep the fixture so they can assert that the blob path never reads it, since
+// that lookup was O(manifests) per request (project-zot/zot#4344).
 func descriptorStore(t *testing.T) mocks.MockedImageStore {
 	t.Helper()
 
@@ -2429,12 +2466,12 @@ func descriptorStore(t *testing.T) mocks.MockedImageStore {
 
 	return mocks.MockedImageStore{
 		RootDirFn: func() string { return t.TempDir() },
-		CheckBlobFn: func(ctx context.Context, repo string, digest godigest.Digest) (bool, int64, error) {
+		StatBlobFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
 			if digest == layerDigest {
-				return true, 4, nil
+				return true, 4, time.Time{}, nil
 			}
 
-			return true, 0, nil
+			return true, 0, time.Time{}, nil
 		},
 		GetIndexContentFn: func(repo string) ([]byte, error) {
 			return indexJSON, nil
@@ -2447,10 +2484,23 @@ func descriptorStore(t *testing.T) mocks.MockedImageStore {
 	}
 }
 
-func TestCheckBlobUsesDescriptorContentType(t *testing.T) {
+func TestCheckBlobAlwaysBinaryContentType(t *testing.T) {
 	store := descriptorStore(t)
-	store.CheckBlobFn = func(ctx context.Context, repo string, digest godigest.Digest) (bool, int64, error) {
-		return true, 42, nil
+
+	var indexReads atomic.Int32
+
+	store.GetIndexContentFn = func(repo string) ([]byte, error) {
+		indexReads.Add(1)
+
+		return []byte("{}"), nil
+	}
+	store.GetBlobContentFn = func(repo string, digest godigest.Digest) ([]byte, error) {
+		indexReads.Add(1)
+
+		return []byte("{}"), nil
+	}
+	store.StatBlobFn = func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+		return true, 42, time.Time{}, nil
 	}
 
 	handler := newBlobTestRouteHandler(t, store)
@@ -2476,9 +2526,11 @@ func TestCheckBlobUsesDescriptorContentType(t *testing.T) {
 	defer resp.Body.Close()
 
 	require.Equal(t, http.StatusOK, resp.StatusCode)
-	assert.Equal(t, ispec.MediaTypeImageLayerGzip, resp.Header.Get("Content-Type"))
+	assert.Equal(t, constants.BinaryMediaType, resp.Header.Get("Content-Type"))
 	assert.Equal(t, "bytes", resp.Header.Get("Accept-Ranges"))
 	assert.Equal(t, layerDigest.String(), resp.Header.Get(constants.DistContentDigestKey))
+
+	assert.Zero(t, indexReads.Load(), "blob path must not walk the repo index")
 }
 
 func TestCheckBlobFallsBackToBinaryContentType(t *testing.T) {
@@ -2486,8 +2538,8 @@ func TestCheckBlobFallsBackToBinaryContentType(t *testing.T) {
 	// must fall back to application/octet-stream so OCI clients get a
 	// well-formed Content-Type.
 	handler := newBlobTestRouteHandler(t, mocks.MockedImageStore{
-		CheckBlobFn: func(ctx context.Context, repo string, digest godigest.Digest) (bool, int64, error) {
-			return true, 1024, nil
+		StatBlobFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+			return true, 1024, time.Time{}, nil
 		},
 		GetIndexContentFn: func(repo string) ([]byte, error) {
 			return nil, zerr.ErrManifestNotFound
@@ -2518,13 +2570,26 @@ func TestCheckBlobFallsBackToBinaryContentType(t *testing.T) {
 	assert.Equal(t, constants.BinaryMediaType, resp.Header.Get("Content-Type"))
 }
 
-func TestGetBlobUsesDescriptorContentType(t *testing.T) {
+func TestGetBlobAlwaysBinaryContentType(t *testing.T) {
 	store := descriptorStore(t)
+
+	var indexReads atomic.Int32
+
+	store.GetIndexContentFn = func(repo string) ([]byte, error) {
+		indexReads.Add(1)
+
+		return []byte("{}"), nil
+	}
+	store.GetBlobContentFn = func(repo string, digest godigest.Digest) ([]byte, error) {
+		indexReads.Add(1)
+
+		return []byte("{}"), nil
+	}
 	store.GetBlobFn = func(repo string, digest godigest.Digest, mediaType string) (io.ReadCloser, int64, error) {
 		// The mediaType argument forwarded to the storage layer is a
 		// hint and is currently ignored; we still feed it the resolved
 		// value so the surface stays consistent.
-		assert.Equal(t, ispec.MediaTypeImageLayerGzip, mediaType)
+		assert.Equal(t, constants.BinaryMediaType, mediaType)
 
 		return io.NopCloser(strings.NewReader("blob")), 4, nil
 	}
@@ -2553,58 +2618,9 @@ func TestGetBlobUsesDescriptorContentType(t *testing.T) {
 	defer resp.Body.Close()
 
 	require.Equal(t, http.StatusOK, resp.StatusCode)
-	assert.Equal(t, ispec.MediaTypeImageLayerGzip, resp.Header.Get("Content-Type"))
-}
-
-func TestGetBlobFallsBackOnInvalidDescriptorContentType(t *testing.T) {
-	// Descriptor media types are user-supplied and may be invalid as HTTP
-	// header values. resolveBlobResponseMediaType must sanitize/validate
-	// and fall back to application/octet-stream on parse failure.
-	store := descriptorStore(t)
-	store.GetBlobFn = func(repo string, digest godigest.Digest, mediaType string) (io.ReadCloser, int64, error) {
-		assert.Equal(t, constants.BinaryMediaType, mediaType)
-
-		return io.NopCloser(strings.NewReader("blob")), 4, nil
-	}
-
-	// Force descriptor lookup success but with an invalid media type string.
-	store.GetBlobContentFn = func(repo string, digest godigest.Digest) ([]byte, error) {
-		_, manifestJSON := descriptorFixture(t)
-
-		var manifest ispec.Manifest
-		require.NoError(t, json.Unmarshal(manifestJSON, &manifest))
-		require.Len(t, manifest.Layers, 1)
-		manifest.Layers[0].MediaType = "bad\r\nvalue"
-
-		out, err := json.Marshal(manifest)
-		require.NoError(t, err)
-
-		return out, nil
-	}
-
-	handler := newBlobTestRouteHandler(t, store)
-
-	layerDigest, _, _ := descriptorTestDigests()
-
-	req := httptest.NewRequestWithContext(
-		context.Background(),
-		http.MethodGet,
-		"http://example.com/v2/test/blobs/sha256:test",
-		http.NoBody,
-	)
-	req = mux.SetURLVars(req, map[string]string{
-		"name":   "test",
-		"digest": layerDigest.String(),
-	})
-
-	rec := httptest.NewRecorder()
-	handler.GetBlob(rec, req)
-
-	resp := rec.Result()
-	defer resp.Body.Close()
-
-	require.Equal(t, http.StatusOK, resp.StatusCode)
 	assert.Equal(t, constants.BinaryMediaType, resp.Header.Get("Content-Type"))
+
+	assert.Zero(t, indexReads.Load(), "blob path must not walk the repo index")
 }
 
 func TestGetBlobFallsBackToBinaryContentType(t *testing.T) {
@@ -2646,8 +2662,21 @@ func TestGetBlobFallsBackToBinaryContentType(t *testing.T) {
 	assert.Equal(t, constants.BinaryMediaType, resp.Header.Get("Content-Type"))
 }
 
-func TestGetBlobPartialUsesDescriptorContentType(t *testing.T) {
+func TestGetBlobPartialAlwaysBinaryContentType(t *testing.T) {
 	store := descriptorStore(t)
+
+	var indexReads atomic.Int32
+
+	store.GetIndexContentFn = func(repo string) ([]byte, error) {
+		indexReads.Add(1)
+
+		return []byte("{}"), nil
+	}
+	store.GetBlobContentFn = func(repo string, digest godigest.Digest) ([]byte, error) {
+		indexReads.Add(1)
+
+		return []byte("{}"), nil
+	}
 	store.GetBlobPartialFn = func(
 		repo string,
 		digest godigest.Digest,
@@ -2655,7 +2684,7 @@ func TestGetBlobPartialUsesDescriptorContentType(t *testing.T) {
 		from,
 		to int64,
 	) (io.ReadCloser, int64, int64, error) {
-		assert.Equal(t, ispec.MediaTypeImageLayerGzip, mediaType)
+		assert.Equal(t, constants.BinaryMediaType, mediaType)
 		assert.Equal(t, int64(0), from)
 		assert.Equal(t, int64(1), to)
 
@@ -2685,17 +2714,19 @@ func TestGetBlobPartialUsesDescriptorContentType(t *testing.T) {
 	defer resp.Body.Close()
 
 	require.Equal(t, http.StatusPartialContent, resp.StatusCode)
-	assert.Equal(t, ispec.MediaTypeImageLayerGzip, resp.Header.Get("Content-Type"))
+	assert.Equal(t, constants.BinaryMediaType, resp.Header.Get("Content-Type"))
 	assert.Equal(t, "bytes 0-1/4", resp.Header.Get("Content-Range"))
 	assert.Equal(t, layerDigest.String(), resp.Header.Get(constants.DistContentDigestKey))
+
+	assert.Zero(t, indexReads.Load(), "blob path must not walk the repo index")
 }
 
 func TestGetBlobPartialFallsBackToBinaryContentType(t *testing.T) {
 	// Single-range request for a blob whose repo has no index — same
 	// fallback behaviour as the full-GET case.
 	handler := newBlobTestRouteHandler(t, mocks.MockedImageStore{
-		CheckBlobFn: func(ctx context.Context, repo string, digest godigest.Digest) (bool, int64, error) {
-			return true, 4, nil
+		StatBlobFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+			return true, 4, time.Time{}, nil
 		},
 		GetBlobPartialFn: func(
 			repo string,
@@ -2736,15 +2767,28 @@ func TestGetBlobPartialFallsBackToBinaryContentType(t *testing.T) {
 	assert.Equal(t, constants.BinaryMediaType, resp.Header.Get("Content-Type"))
 }
 
-// TestGetBlobMultipartPartHasDescriptorContentType verifies that each
-// part of a multipart/byteranges response carries the descriptor-
-// derived Content-Type alongside the per-part Content-Range.
-func TestGetBlobMultipartPartHasDescriptorContentType(t *testing.T) {
+// TestGetBlobMultipartPartBinaryContentType verifies that each part of a
+// multipart/byteranges response carries application/octet-stream
+// alongside the per-part Content-Range.
+func TestGetBlobMultipartPartBinaryContentType(t *testing.T) {
 	const blobBody = "0123456789"
 
 	store := descriptorStore(t)
-	store.CheckBlobFn = func(ctx context.Context, repo string, digest godigest.Digest) (bool, int64, error) {
-		return true, int64(len(blobBody)), nil
+
+	var indexReads atomic.Int32
+
+	store.GetIndexContentFn = func(repo string) ([]byte, error) {
+		indexReads.Add(1)
+
+		return []byte("{}"), nil
+	}
+	store.GetBlobContentFn = func(repo string, digest godigest.Digest) ([]byte, error) {
+		indexReads.Add(1)
+
+		return []byte("{}"), nil
+	}
+	store.StatBlobFn = func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+		return true, int64(len(blobBody)), time.Time{}, nil
 	}
 	store.GetBlobPartialFn = func(
 		repo string,
@@ -2753,7 +2797,7 @@ func TestGetBlobMultipartPartHasDescriptorContentType(t *testing.T) {
 		from,
 		to int64,
 	) (io.ReadCloser, int64, int64, error) {
-		assert.Equal(t, ispec.MediaTypeImageLayerGzip, mediaType)
+		assert.Equal(t, constants.BinaryMediaType, mediaType)
 
 		return io.NopCloser(strings.NewReader(blobBody[from : to+1])), to - from + 1, int64(len(blobBody)), nil
 	}
@@ -2802,7 +2846,7 @@ func TestGetBlobMultipartPartHasDescriptorContentType(t *testing.T) {
 		require.NoError(t, err, "read part %d", i)
 
 		assert.Equal(t, want.contentRange, part.Header.Get("Content-Range"), "part %d content-range", i)
-		assert.Equal(t, ispec.MediaTypeImageLayerGzip, part.Header.Get("Content-Type"),
+		assert.Equal(t, constants.BinaryMediaType, part.Header.Get("Content-Type"),
 			"part %d content-type", i)
 
 		body, err := io.ReadAll(part)
@@ -2814,6 +2858,8 @@ func TestGetBlobMultipartPartHasDescriptorContentType(t *testing.T) {
 	require.ErrorIs(t, err, io.EOF)
 
 	assert.Equal(t, layerDigest.String(), resp.Header.Get(constants.DistContentDigestKey))
+
+	assert.Zero(t, indexReads.Load(), "blob path must not walk the repo index")
 }
 
 // Streaming-multipart tests for the lazy-fan-out path.
@@ -2904,8 +2950,8 @@ func TestGetBlobMultipartContentLengthMatchesBody(t *testing.T) {
 	const blobBody = "0123456789abcdef" // 16 bytes
 
 	store := descriptorStore(t)
-	store.CheckBlobFn = func(ctx context.Context, repo string, digest godigest.Digest) (bool, int64, error) {
-		return true, int64(len(blobBody)), nil
+	store.StatBlobFn = func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+		return true, int64(len(blobBody)), time.Time{}, nil
 	}
 	store.GetBlobPartialFn = func(
 		repo string,
@@ -2977,8 +3023,8 @@ func TestGetBlobMultipartOpensOneReaderAtATime(t *testing.T) {
 	var opens partialReaderOpenTracker
 
 	store := descriptorStore(t)
-	store.CheckBlobFn = func(ctx context.Context, repo string, digest godigest.Digest) (bool, int64, error) {
-		return true, int64(len(blobBody)), nil
+	store.StatBlobFn = func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+		return true, int64(len(blobBody)), time.Time{}, nil
 	}
 	store.GetBlobPartialFn = func(
 		repo string,
@@ -3035,8 +3081,8 @@ func TestGetBlobMultipartTruncatesOnReaderError(t *testing.T) {
 	var calls atomic.Int32
 
 	store := descriptorStore(t)
-	store.CheckBlobFn = func(ctx context.Context, repo string, digest godigest.Digest) (bool, int64, error) {
-		return true, int64(len(blobBody)), nil
+	store.StatBlobFn = func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+		return true, int64(len(blobBody)), time.Time{}, nil
 	}
 	store.GetBlobPartialFn = func(
 		repo string,
@@ -3096,8 +3142,8 @@ func TestGetBlobRangeUnsatisfiable(t *testing.T) {
 	// retry with a valid range. parseRangeHeader rejects the header
 	// before the handler reaches GetBlobPartial.
 	handler := newBlobTestRouteHandler(t, mocks.MockedImageStore{
-		CheckBlobFn: func(ctx context.Context, repo string, digest godigest.Digest) (bool, int64, error) {
-			return true, 4, nil
+		StatBlobFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+			return true, 4, time.Time{}, nil
 		},
 		GetIndexContentFn: func(repo string) ([]byte, error) {
 			return nil, zerr.ErrManifestNotFound
@@ -3127,11 +3173,11 @@ func TestGetBlobRangeUnsatisfiable(t *testing.T) {
 }
 
 func TestGetBlobRangeCheckBlobError(t *testing.T) {
-	// CheckBlob returning a non-zerr error must surface as 500 via
+	// StatBlob returning a non-zerr error must surface as 500 via
 	// writeBlobError's default branch.
 	handler := newBlobTestRouteHandler(t, mocks.MockedImageStore{
-		CheckBlobFn: func(ctx context.Context, repo string, digest godigest.Digest) (bool, int64, error) {
-			return false, 0, ErrUnexpectedError
+		StatBlobFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+			return false, 0, time.Time{}, ErrUnexpectedError
 		},
 	})
 
@@ -3157,12 +3203,12 @@ func TestGetBlobRangeCheckBlobError(t *testing.T) {
 }
 
 func TestGetBlobRangeCheckBlobMissing(t *testing.T) {
-	// CheckBlob succeeding with ok=false (e.g. a deleted blob whose
+	// StatBlob succeeding with ok=false (e.g. a deleted blob whose
 	// repo still exists) must short-circuit to 404 BLOB_UNKNOWN before
 	// any range parsing or descriptor lookup.
 	handler := newBlobTestRouteHandler(t, mocks.MockedImageStore{
-		CheckBlobFn: func(ctx context.Context, repo string, digest godigest.Digest) (bool, int64, error) {
-			return false, 0, nil
+		StatBlobFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+			return false, 0, time.Time{}, nil
 		},
 	})
 
@@ -3195,14 +3241,14 @@ func TestGetBlobRangeCheckBlobMissing(t *testing.T) {
 
 func TestGetBlobSingleRangePartialBlobNotFound(t *testing.T) {
 	// Single-range path: GetBlobPartial returning ErrBlobNotFound after
-	// a successful CheckBlob (a blob deleted between the two calls)
-	// must surface as 404 with the BLOB_UNKNOWN error body. CheckBlob
+	// a successful StatBlob (a blob deleted between the two calls)
+	// must surface as 404 with the BLOB_UNKNOWN error body. StatBlob
 	// has already returned ok=true so we get past the length check;
 	// the response is still recoverable because no body bytes have
 	// been written yet.
 	handler := newBlobTestRouteHandler(t, mocks.MockedImageStore{
-		CheckBlobFn: func(ctx context.Context, repo string, digest godigest.Digest) (bool, int64, error) {
-			return true, 4, nil
+		StatBlobFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+			return true, 4, time.Time{}, nil
 		},
 		GetBlobPartialFn: func(
 			repo string,
@@ -3249,8 +3295,8 @@ func TestGetBlobSingleRangePartialUnexpectedError(t *testing.T) {
 	// Single-range path: GetBlobPartial returning a non-zerr error
 	// hits writeBlobError's default branch and produces a 500.
 	handler := newBlobTestRouteHandler(t, mocks.MockedImageStore{
-		CheckBlobFn: func(ctx context.Context, repo string, digest godigest.Digest) (bool, int64, error) {
-			return true, 4, nil
+		StatBlobFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+			return true, 4, time.Time{}, nil
 		},
 		GetBlobPartialFn: func(
 			repo string,
@@ -3296,8 +3342,8 @@ func TestGetBlobSingleRangeLengthMismatch(t *testing.T) {
 	// since on the single-range path the headers haven't been flushed
 	// yet and 5xx is still possible.
 	handler := newBlobTestRouteHandler(t, mocks.MockedImageStore{
-		CheckBlobFn: func(ctx context.Context, repo string, digest godigest.Digest) (bool, int64, error) {
-			return true, 4, nil
+		StatBlobFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+			return true, 4, time.Time{}, nil
 		},
 		GetBlobPartialFn: func(
 			repo string,
@@ -3349,8 +3395,8 @@ func TestGetBlobMultipartShortReaderTruncates(t *testing.T) {
 	var calls atomic.Int32
 
 	store := descriptorStore(t)
-	store.CheckBlobFn = func(ctx context.Context, repo string, digest godigest.Digest) (bool, int64, error) {
-		return true, int64(len(blobBody)), nil
+	store.StatBlobFn = func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+		return true, int64(len(blobBody)), time.Time{}, nil
 	}
 	store.GetBlobPartialFn = func(
 		repo string,
@@ -3401,7 +3447,7 @@ func TestGetBlobMultipartShortReaderTruncates(t *testing.T) {
 }
 
 func TestGetBlobRangeCheckBlobNamedErrors(t *testing.T) {
-	// CheckBlob is the first storage call on the range branch and the
+	// StatBlob is the first storage call on the range branch and the
 	// only place where named storage errors can be turned into proper
 	// 4xx OCI error responses (once the 206 is in flight on the
 	// multipart path it's too late). Each case in the table maps a
@@ -3433,8 +3479,8 @@ func TestGetBlobRangeCheckBlobNamedErrors(t *testing.T) {
 	for name, testCase := range cases {
 		t.Run(name, func(t *testing.T) {
 			handler := newBlobTestRouteHandler(t, mocks.MockedImageStore{
-				CheckBlobFn: func(ctx context.Context, repo string, digest godigest.Digest) (bool, int64, error) {
-					return false, 0, testCase.err
+				StatBlobFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+					return false, 0, time.Time{}, testCase.err
 				},
 			})
 
@@ -3489,8 +3535,8 @@ func TestGetBlobMultipartReaderCloseError(t *testing.T) {
 	var calls atomic.Int32
 
 	store := descriptorStore(t)
-	store.CheckBlobFn = func(ctx context.Context, repo string, digest godigest.Digest) (bool, int64, error) {
-		return true, int64(len(blobBody)), nil
+	store.StatBlobFn = func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+		return true, int64(len(blobBody)), time.Time{}, nil
 	}
 	store.GetBlobPartialFn = func(
 		repo string,
@@ -3551,9 +3597,9 @@ func TestDeleteManifestSucceedsDespiteMetaDBHookFailure(t *testing.T) {
 		subjectDigest := godigest.FromString("subject-manifest")
 
 		manifest := ispec.Manifest{
-			Versioned:    specs.Versioned{SchemaVersion: 2},
-			MediaType:    ispec.MediaTypeImageManifest,
-			ArtifactType: zcommon.ArtifactTypeCosignBundle,
+			SchemaVersion: 2,
+			MediaType:     ispec.MediaTypeImageManifest,
+			ArtifactType:  zcommon.ArtifactTypeCosignBundle,
 			Config: ispec.Descriptor{
 				MediaType: "application/vnd.oci.empty.v1+json",
 				Digest:    godigest.FromString("empty-config"),
@@ -3621,8 +3667,7 @@ func TestDeleteManifestSucceedsAfterSignatureSubjectOrphaned(t *testing.T) {
 	Convey("Deleting a signature referrer whose subject was already untagged", t, func() {
 		rootDir := t.TempDir()
 		testLog := log.NewTestLogger()
-		metrics := monitoring.NewMetricsServer(false, testLog)
-		defer metrics.Stop()
+		metrics := monitoring.NewNopMetricServer()
 
 		imgStore := local.NewImageStore(rootDir, true, true, testLog, metrics, nil, nil, nil, nil)
 
@@ -3667,8 +3712,8 @@ func TestDeleteManifestSucceedsAfterSignatureSubjectOrphaned(t *testing.T) {
 
 		// Push and tag the subject image through the real hook path.
 		subjectManifest := ispec.Manifest{
-			Versioned: specs.Versioned{SchemaVersion: 2},
-			MediaType: ispec.MediaTypeImageManifest,
+			SchemaVersion: 2,
+			MediaType:     ispec.MediaTypeImageManifest,
 			Config: ispec.Descriptor{
 				MediaType: ispec.MediaTypeImageConfig,
 				Digest:    godigest.FromString("{}"),
@@ -3693,9 +3738,9 @@ func TestDeleteManifestSucceedsAfterSignatureSubjectOrphaned(t *testing.T) {
 		So(err, ShouldBeNil)
 
 		referrer := ispec.Manifest{
-			Versioned:    specs.Versioned{SchemaVersion: 2},
-			MediaType:    ispec.MediaTypeImageManifest,
-			ArtifactType: zcommon.ArtifactTypeCosignBundle,
+			SchemaVersion: 2,
+			MediaType:     ispec.MediaTypeImageManifest,
+			ArtifactType:  zcommon.ArtifactTypeCosignBundle,
 			Config: ispec.Descriptor{
 				MediaType: "application/vnd.oci.empty.v1+json",
 				Digest:    emptyConfigDigest,
@@ -3730,5 +3775,78 @@ func TestDeleteManifestSucceedsAfterSignatureSubjectOrphaned(t *testing.T) {
 		// Deleting the now-orphaned referrer must still return 202.
 		statusCode = deleteReq(referrerDigest.String())
 		So(statusCode, ShouldEqual, http.StatusAccepted)
+	})
+}
+
+func TestFinalBlobPutConsumesChunkedBody(t *testing.T) {
+	Convey("final blob PUT appends a chunked body without length headers", t, func() {
+		conf := config.New()
+		conf.HTTP.Port = "0"
+		conf.Storage.RootDirectory = t.TempDir()
+
+		ctlr := api.NewController(conf)
+		cm := test.NewControllerManager(ctlr)
+		baseURL := cm.StartAndWait()
+		defer cm.StopServer()
+
+		client := &http.Client{}
+
+		createReq, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
+			baseURL+"/v2/repo/blobs/uploads/", http.NoBody)
+		So(err, ShouldBeNil)
+		createReq.Header.Set("Content-Type", constants.BinaryMediaType)
+		resp, err := client.Do(createReq)
+		So(err, ShouldBeNil)
+		So(resp.StatusCode, ShouldEqual, http.StatusAccepted)
+		uploadURL := resp.Header.Get("Location")
+		_ = resp.Body.Close()
+		if !strings.HasPrefix(uploadURL, "http") {
+			uploadURL = baseURL + uploadURL
+		}
+
+		prefix := []byte("prefix-")
+		patchReq, err := http.NewRequestWithContext(context.Background(), http.MethodPatch,
+			uploadURL, bytes.NewReader(prefix))
+		So(err, ShouldBeNil)
+
+		resp, err = client.Do(patchReq)
+		So(err, ShouldBeNil)
+		So(resp.StatusCode, ShouldEqual, http.StatusAccepted)
+		_ = resp.Body.Close()
+
+		finalChunk := []byte("remainder")
+		fullPayload := append(append([]byte{}, prefix...), finalChunk...)
+		digest := godigest.FromBytes(fullPayload)
+
+		finalReq, err := http.NewRequestWithContext(context.Background(), http.MethodPut, uploadURL,
+			io.NopCloser(bytes.NewReader(finalChunk)))
+		So(err, ShouldBeNil)
+		finalReq.ContentLength = -1
+		finalReq.TransferEncoding = []string{"chunked"}
+		query := finalReq.URL.Query()
+		query.Set("digest", digest.String())
+		finalReq.URL.RawQuery = query.Encode()
+
+		So(finalReq.Header.Get("Content-Length"), ShouldBeEmpty)
+		So(finalReq.Header.Get("Content-Range"), ShouldBeEmpty)
+
+		resp, err = client.Do(finalReq)
+		So(err, ShouldBeNil)
+		So(resp.StatusCode, ShouldEqual, http.StatusCreated)
+		blobURL := resp.Header.Get("Location")
+		_ = resp.Body.Close()
+		if !strings.HasPrefix(blobURL, "http") {
+			blobURL = baseURL + blobURL
+		}
+
+		getReq, err := http.NewRequestWithContext(context.Background(), http.MethodGet, blobURL, http.NoBody)
+		So(err, ShouldBeNil)
+		resp, err = client.Do(getReq)
+		So(err, ShouldBeNil)
+		body, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		So(err, ShouldBeNil)
+		So(resp.StatusCode, ShouldEqual, http.StatusOK)
+		So(body, ShouldResemble, fullPayload)
 	})
 }

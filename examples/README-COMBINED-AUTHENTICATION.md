@@ -1,0 +1,154 @@
+# Combined Authentication
+
+This document summarizes how Zot behaves when more than one authentication method is enabled for the same registry.
+
+Zot selects the authentication path from the credential style used by the client. This lets browsers, command-line OCI clients, CI systems, and in-cluster workloads share one registry without forcing every client through the same login protocol.
+
+## Supported Combinations
+
+| Configuration | Supported | Behavior |
+| --- | --- | --- |
+| `htpasswd` and `ldap` | Yes | Clients send username/password credentials. Zot tries htpasswd first and tries LDAP when that password does not match. |
+| `htpasswd` or `ldap` with `bearer` | Yes, when the client sends Basic to the registry | Registry routes accept `Authorization: Basic` and validate htpasswd, LDAP, or an API key even when bearer is enabled. `/zot/auth/token` does not validate those passwords. It exchanges an API key, or a JWT whose issuer and audience match `bearer.oidc`. A credential Zot does not recognize is rejected, unless `upstreamTokenEndpoint` is set, in which case Zot forwards the token request. |
+| `openid` and `apikey` | Yes | Users sign in through browser SSO, then create API keys for Docker, Podman, containerd, kubelet, scripts, and other non-browser clients. |
+| `openid`, `apikey`, and `bearer` challenge settings | Yes | OCI clients can exchange API keys for wrapped Bearer credentials, while browser users continue using SSO sessions. |
+| `bearer.oidc` and `openid` | Yes | Workloads use OIDC tokens as Bearer credentials; humans use browser SSO sessions. |
+| `bearer.oidc` and `apikey` | Yes | Workloads can use secret-less OIDC tokens, while users or automation that cannot get workload tokens can use API keys. |
+| `bearer.oidc` and traditional Bearer JWTs | Yes | Zot tries locally trusted workload OIDC tokens first. Traditional Bearer JWTs still work when configured with a certificate or AWS Secrets Manager verification keys. |
+| `bearer.oidc` and an external token service | Yes | Advertise Zot's `/zot/auth/token` endpoint and set `upstreamTokenEndpoint` so Zot can forward only token requests that do not belong to a local Zot credential source. |
+| `mtls` with other authentication methods | Yes | Client certificates remain available as a separate credential style for clients that present TLS certificates. |
+| Anonymous policies with authentication | Yes | Requests without credentials can be allowed by anonymous, management, or metrics policy. Invalid `Authorization` credentials are rejected; browser UI clients with a missing or expired session may still use anonymous policy when configured. |
+| Multiple `Authorization` headers | No | Zot rejects these requests to avoid ambiguous credential handling. |
+
+## Request Flow
+
+```mermaid
+flowchart TD
+  Start[Request reaches Zot] --> Multi{Multiple Authorization headers?}
+  Multi -->|yes| Reject[Reject request]
+  Multi -->|no| BearerHeader{Bearer credential?}
+  BearerHeader -->|yes| BearerLocal{Zot Bearer support enabled?}
+  BearerLocal -->|yes| BearerAuth[Authenticate as wrapped API key, workload OIDC, or traditional Bearer]
+  BearerLocal -->|no| Reject
+  BearerHeader -->|no| BasicHeader{Username/password credential?}
+  BasicHeader -->|yes| BasicAuth[Authenticate with htpasswd, LDAP, or API key]
+  BasicHeader -->|no| SessionHeader{Browser session client?}
+  SessionHeader -->|yes| SessionAuth[Authenticate session cookie]
+  SessionAuth -->|missing or expired session| Anonymous
+  SessionHeader -->|no| ClientCert{Client TLS certificate?}
+  ClientCert -->|yes| MTLSAuth[Authenticate with mTLS identity]
+  ClientCert -->|no| NoCreds{No credentials?}
+  NoCreds -->|yes| Challenge{Bearer challenge needed?}
+  Challenge -->|yes| ReturnChallenge[Return Bearer challenge]
+  Challenge -->|no| Anonymous{Anonymous, management, or metrics policy?}
+  Anonymous -->|yes| Authz
+  Anonymous -->|no| Reject
+  NoCreds -->|no| Reject
+  BearerAuth --> Authz[Apply authorization policy]
+  BasicAuth --> Authz
+  SessionAuth -->|valid session| Authz
+  MTLSAuth --> Authz
+```
+
+## Challenge Advertisement
+
+When Zot rejects a request or asks an OCI client to retry with credentials, the advertised challenge is selected from the server configuration rather than from the credential style the client tried to use.
+
+| When | Challenge |
+| --- | --- |
+| Bearer challenge settings can be advertised, and Bearer OIDC, traditional Bearer, or API keys are enabled | `WWW-Authenticate: Bearer ...` |
+| Bearer is advertised on `/v2/` when anonymous policy coexists with authenticated-only repository policy | `WWW-Authenticate: Bearer ...` |
+| Access control has only anonymous repository policies | No forced Bearer challenge on `/v2/`; anonymous pulls proceed without token exchange. |
+| Otherwise, when htpasswd, LDAP, or API-key Basic authentication is available | `WWW-Authenticate: Basic ...` |
+| Browser UI session clients | No `WWW-Authenticate` challenge; UI authentication and authorization responses suppress it. |
+| Local token-exchange rejection by Zot's token endpoint | `WWW-Authenticate: Basic ...` for the token endpoint realm |
+
+## Admin-Only Routes
+
+Some routes are restricted to principals matched by `accessControl.adminPolicy`: the pprof debug endpoints and the image trust certificate/key upload endpoints (cosign and notation). When any authentication method is enabled, these routes fail closed for requests that do not carry an admin identity.
+
+This is stricter than repository access. Without `accessControl`, every authenticated user has full repository access, but nobody can reach the admin-only routes; configure `accessControl.adminPolicy` to name the administrators. When no authentication method is enabled, these routes are open, like the rest of the registry.
+
+| Credential | Can reach admin-only routes |
+| --- | --- |
+| htpasswd, LDAP, API key (including Zot-wrapped API-key Bearer credentials), OpenID session, mTLS | Yes, when the user or one of its groups is in `adminPolicy` and its conditions hold |
+| Workload OIDC Bearer tokens (`bearer.oidc`) | Yes, when the mapped user or one of its groups is in `adminPolicy` and its conditions hold |
+| Traditional Bearer JWTs (static certificate or AWS Secrets Manager verification keys) | No |
+| Anonymous requests | No |
+
+Traditional Bearer JWTs are authorized by the repository scopes they carry, not by Zot users and groups, so they never match `adminPolicy`. A deployment that only uses traditional Bearer authentication cannot use these routes; add an identity-based method such as `bearer.oidc`, API keys, or mTLS for administrators.
+
+`adminPolicy.conditions` are evaluated for each request to these routes, as they are for admin repository access. These routes have no repository or reference, so `req.repository`, `req.reference`, and `req.action` are empty; conditions such as `req.tls.enabled` or client IP checks apply as written. A condition that denies the request returns `403 Forbidden` with its `message`.
+
+Rejected requests without an identity receive `401 Unauthorized` with the challenge described under "Challenge Advertisement"; authenticated non-admin users receive `403 Forbidden`.
+
+## Token Exchange Behavior
+
+OCI clients usually start by requesting `/v2/`. If Zot advertises a Bearer challenge, the client then calls the advertised token endpoint and retries the registry request with the returned Bearer credential.
+
+In mixed deployments, Zot should be the advertised token endpoint:
+
+```json
+{
+  "http": {
+    "auth": {
+      "bearer": {
+        "realm": "https://zot.example.com/zot/auth/token",
+        "service": "zot.example.com",
+        "upstreamTokenEndpoint": {
+          "realm": "https://auth.example.com/token",
+          "service": "legacy-token-service"
+        }
+      }
+    }
+  }
+}
+```
+
+Zot successfully exchanges these token requests locally:
+
+- API keys that start with Zot's API-key prefix.
+- A JWT whose issuer and audience match `bearer.oidc`. Zot verifies it and returns that same token. The Basic username is not the registry identity. Claim mapping supplies the identity when that JWT is presented later. Zot splits the Basic credential on the first colon, so the username must not contain a colon.
+
+htpasswd and LDAP passwords are not checked here. A registry route accepts them as `Authorization: Basic`. On this endpoint, a password Zot does not recognize as an API key or a matching OIDC JWT is rejected, or forwarded when `upstreamTokenEndpoint` is set. An opaque access token is one of those unrecognized credentials.
+
+Zot also recognizes these credentials as locally owned and refuses to forward them:
+
+- Wrapped API-key Bearer credentials issued by Zot, regardless of whether a client sends them as a Bearer credential, username/password secret, or form credential. They are already Bearer credentials for registry requests, so the token endpoint rejects them with `401 Unauthorized` instead of minting another token or proxying the request.
+- Browser OpenID/OAuth2 tokens from configured `openid.providers`. These are for the browser login flow, not the OCI token service flow, so the token endpoint rejects them locally.
+
+If a token request does not belong to any local Zot credential source, Zot can forward it to `upstreamTokenEndpoint`. This preserves compatibility with an existing external token service while keeping Zot-owned credentials local.
+
+## Real-World Scenarios
+
+### Browser SSO and CLI Image Pulls
+
+Organizations often want users to sign in to the Zot UI with GitHub, GitLab, Google, Dex, or another OIDC/OAuth2 provider. Docker and Podman cannot complete that browser redirect flow. With `openid` and `apikey` enabled together, the user signs in through the browser, creates an API key in Zot, and uses that key with Docker, Podman, containerd, kubelet image pull secrets, or scripts.
+
+When a Bearer challenge is also configured, those API keys can be exchanged through Zot's token endpoint so OCI clients still use the standard Bearer retry flow.
+
+### Workload Identity for Kubernetes and Flux
+
+Kubernetes workloads can use projected ServiceAccount tokens instead of stored registry passwords. Zot validates those OIDC tokens with `bearer.oidc`, maps their claims to Zot users/groups, and applies normal repository authorization policy.
+
+This supports Kubernetes image pulls and Flux OCIRepository-style integrations where the workload identity, namespace, ServiceAccount, repository, or other claims decide registry access.
+
+### GitHub Actions Without Long-Lived Secrets
+
+GitHub Actions can request short-lived OIDC tokens from GitHub and present them to Zot. Zot validates the GitHub issuer and audience, then uses claim mapping and policy to authorize the workflow. This avoids storing a static registry password in GitHub secrets for workflows that can use OIDC.
+
+### Existing Bearer Token Service Migration
+
+Some deployments already have an external OAuth2 or Docker Registry token service that issues scoped JWTs. Those deployments can add Zot workload OIDC without removing the old token service. Zot advertises its own token endpoint, handles Zot-owned credentials locally, and forwards unknown token requests to the upstream service.
+
+For traditional Bearer JWT verification, Zot can load a static public key/certificate or fetch verification keys from AWS Secrets Manager. AWS Secrets Manager is useful when keys rotate and multiple Zot instances need to share the same verification material.
+
+### Anonymous Mirrors With Protected Pushes
+
+Public or internal mirrors often allow unauthenticated pulls while requiring authentication for pushes or private repositories. Anonymous policy can coexist with the other methods above. Invalid `Authorization` credentials are rejected; browser UI clients with a missing or expired session may still use anonymous policy when configured.
+
+## Related Examples
+
+- [OIDC Workload Identity Authentication](README-OIDC-WORKLOAD-IDENTITY.md)
+- [AWS Secrets Manager Bearer Authentication](README-AWS-SECRETS-MANAGER-BEARER-AUTH.md)
+- [Main configuration reference](README.md#authentication)

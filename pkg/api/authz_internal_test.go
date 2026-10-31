@@ -5,16 +5,21 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/gorilla/mux"
 	"github.com/stretchr/testify/assert"
 
+	zerr "zotregistry.dev/zot/v2/errors"
 	"zotregistry.dev/zot/v2/pkg/api/config"
 	"zotregistry.dev/zot/v2/pkg/api/constants"
 	"zotregistry.dev/zot/v2/pkg/log"
 	reqCtx "zotregistry.dev/zot/v2/pkg/requestcontext"
-	zerr "zotregistry.dev/zot/v2/errors"
+	"zotregistry.dev/zot/v2/pkg/test/mocks"
 )
 
 // permitted returns just the bool from AccessController.isPermitted; tests
@@ -22,6 +27,75 @@ import (
 func permitted(ac *AccessController, evalReq *evalRequest, pg config.PolicyGroup) bool {
 	ok, _ := ac.isPermitted(evalReq, pg)
 	return ok
+}
+
+func TestAuthzFailWithReasonChallengeHeaders(t *testing.T) {
+	t.Parallel()
+
+	request := httptest.NewRequest(http.MethodPost, "/v2/repo/blobs/uploads/", nil)
+	request = mux.SetURLVars(request, map[string]string{"name": "repo"})
+
+	basicResponse := httptest.NewRecorder()
+	authzFailWithReason(
+		basicResponse,
+		request,
+		"",
+		&config.AuthConfig{HTPasswd: config.AuthHTPasswd{Path: "/tmp/htpasswd"}},
+		"zot",
+		0,
+		"",
+	)
+
+	assert.Equal(t, http.StatusUnauthorized, basicResponse.Code)
+	assert.Equal(t, `Basic realm="zot"`, basicResponse.Header().Get("WWW-Authenticate"))
+
+	bearerResponse := httptest.NewRecorder()
+	authzFailWithReason(
+		bearerResponse,
+		request,
+		"alice",
+		&config.AuthConfig{
+			Bearer: &config.BearerConfig{
+				Realm:   "https://auth.example.test/token",
+				Service: "zot",
+				Cert:    "/tmp/server.cert",
+			},
+		},
+		"zot",
+		0,
+		"write denied",
+	)
+
+	assert.Equal(t, http.StatusForbidden, bearerResponse.Code)
+	assert.Equal(t,
+		`Bearer realm="https://auth.example.test/token",service="zot",scope="repository:repo:push"`,
+		bearerResponse.Header().Get("WWW-Authenticate"),
+	)
+	assert.True(t, strings.Contains(bearerResponse.Body.String(), "write denied"))
+
+	sessionRequest := httptest.NewRequest(http.MethodPost, "/v2/repo/blobs/uploads/", nil)
+	sessionRequest = mux.SetURLVars(sessionRequest, map[string]string{"name": "repo"})
+	sessionRequest.Header.Set(constants.SessionClientHeaderName, constants.SessionClientHeaderValue)
+
+	sessionResponse := httptest.NewRecorder()
+	authzFailWithReason(
+		sessionResponse,
+		sessionRequest,
+		"alice",
+		&config.AuthConfig{
+			Bearer: &config.BearerConfig{
+				Realm:   "https://auth.example.test/token",
+				Service: "zot",
+				Cert:    "/tmp/server.cert",
+			},
+		},
+		"zot",
+		0,
+		"",
+	)
+
+	assert.Equal(t, http.StatusForbidden, sessionResponse.Code)
+	assert.Empty(t, sessionResponse.Header().Get("WWW-Authenticate"))
 }
 
 func TestPolicyConditions(t *testing.T) {
@@ -545,6 +619,154 @@ func TestControllerLoadNewConfigRecompilesConditions(t *testing.T) {
 	assert.False(t, hasOld, "old expression should be evicted after reload")
 }
 
+// TestControllerLoadNewConfigWarnsWhenLdapHasNoClient verifies that ldap turned
+// on by a reload is reported once, by the reload, rather than on every request
+// that reaches the ldap branch of the auth middleware.
+func TestControllerLoadNewConfigWarnsWhenLdapHasNoClient(t *testing.T) {
+	t.Parallel()
+
+	logPath := path.Join(t.TempDir(), "zot.log")
+
+	htp := NewHTPasswd(log.NewLogger("debug", ""))
+	htw, err := NewHTPasswdWatcher(htp, "")
+	assert.NoError(t, err)
+
+	original := config.New()
+	original.HTTP.Auth = &config.AuthConfig{}
+
+	ctlr := &Controller{
+		Config:          original,
+		Log:             log.NewLogger("debug", logPath),
+		HTPasswd:        htp,
+		HTPasswdWatcher: htw,
+	}
+
+	// the client is built during startup, which this config had no ldap for
+	assert.Nil(t, ctlr.LDAPClient)
+
+	newConfig := config.New()
+	newConfig.HTTP.Auth = &config.AuthConfig{LDAP: &config.LDAPConfig{}}
+
+	ctlr.LoadNewConfig(newConfig)
+
+	logs, err := os.ReadFile(logPath)
+	assert.NoError(t, err)
+	assert.Equal(t, 1,
+		strings.Count(string(logs), "ldap auth enabled by config reload requires a restart to take effect"),
+		"the warning belongs to the reload, not to every request reaching ldap")
+}
+
+// TestControllerLoadNewConfigWarnsOnStartupOnlyLdapFields verifies that ldap
+// settings a reload cannot push into the live client are reported. Only the
+// bind credentials reach it, so an address or baseDN change is applied to the
+// config and nowhere else.
+func TestControllerLoadNewConfigWarnsOnStartupOnlyLdapFields(t *testing.T) {
+	t.Parallel()
+
+	logPath := path.Join(t.TempDir(), "zot.log")
+
+	htp := NewHTPasswd(log.NewLogger("debug", ""))
+	htw, err := NewHTPasswdWatcher(htp, "")
+	assert.NoError(t, err)
+
+	original := config.New()
+	original.HTTP.Auth = &config.AuthConfig{LDAP: &config.LDAPConfig{
+		Address: "ldap.example.com",
+		Port:    389,
+		BaseDN:  "ou=users,dc=example,dc=org",
+	}}
+
+	ctlr := &Controller{
+		Config:          original,
+		Log:             log.NewLogger("debug", logPath),
+		HTPasswd:        htp,
+		HTPasswdWatcher: htw,
+		// the client the server is actually authenticating against
+		LDAPClient: &LDAPClient{
+			Host:       "ldap.example.com",
+			Port:       389,
+			Base:       "ou=users,dc=example,dc=org",
+			UseSSL:     true,
+			CACertPath: "/etc/zot/ldap-ca.pem",
+			Log:        log.NewLogger("debug", ""),
+		},
+	}
+
+	newConfig := config.New()
+	newConfig.HTTP.Auth = &config.AuthConfig{LDAP: &config.LDAPConfig{
+		Address: "ldap-2.example.com",
+		Port:    636,
+		BaseDN:  "ou=people,dc=example,dc=org",
+		CACert:  "/etc/zot/ldap-ca-2.pem",
+	}}
+
+	ctlr.LoadNewConfig(newConfig)
+
+	logs, err := os.ReadFile(logPath)
+	assert.NoError(t, err)
+
+	line := string(logs)
+	assert.Contains(t, line, "ldap changes are outside the reloadable set")
+	for _, field := range []string{"address", "port", "baseDN", "caCert"} {
+		assert.Contains(t, line, field, "the changed field should be named in the warning")
+	}
+}
+
+// TestLdapRestartRequiredFields pins which ldap settings a reload can and
+// cannot apply to a client that is already serving.
+func TestLdapRestartRequiredFields(t *testing.T) {
+	t.Parallel()
+
+	client := &LDAPClient{
+		Host:               "ldap.example.com",
+		Port:               389,
+		Base:               "ou=users,dc=example,dc=org",
+		UseSSL:             true,
+		SkipTLS:            true,
+		InsecureSkipVerify: false,
+		SubtreeSearch:      false,
+		UserAttribute:      "uid",
+		UserGroupAttribute: "memberOf",
+		UserFilter:         "(!(nsaccountlock=TRUE))",
+	}
+
+	matching := &config.LDAPConfig{
+		Address:            "ldap.example.com",
+		Port:               389,
+		BaseDN:             "ou=users,dc=example,dc=org",
+		Insecure:           false,
+		StartTLS:           false,
+		SkipVerify:         false,
+		SubtreeSearch:      false,
+		UserAttribute:      "uid",
+		UserGroupAttribute: "memberOf",
+		UserFilter:         "(!(nsaccountlock=TRUE))",
+	}
+
+	assert.Empty(t, ldapRestartRequiredFields(client, matching),
+		"a config the client already matches needs no restart")
+
+	assert.Nil(t, ldapRestartRequiredFields(nil, matching))
+	assert.Nil(t, ldapRestartRequiredFields(client, nil))
+
+	// the bind credentials are the part a reload does apply, so changing them
+	// alone must not ask for a restart
+	credsOnly := *matching
+	credsOnly.CredentialsFile = "/etc/zot/ldap-creds.json"
+	assert.Empty(t, ldapRestartRequiredFields(client, &credsOnly))
+
+	changed := *matching
+	changed.Address = "ldap-2.example.com"
+	changed.SubtreeSearch = true
+	assert.Equal(t, []string{"address", "subtreeSearch"}, ldapRestartRequiredFields(client, &changed))
+
+	// the trust anchors are read into a pool at startup, so pointing caCert at a
+	// new file leaves the client verifying against the old one
+	rotatedCA := *matching
+	rotatedCA.CACert = "/etc/zot/ldap-ca-2.pem"
+	assert.Equal(t, []string{"caCert"}, ldapRestartRequiredFields(client, &rotatedCA))
+}
+
 // TestPolicyConditionForwardedFor verifies that req.client.forwardedFor
 // exposes the X-Forwarded-For chain split into a list, and that conditions
 // can express "trust XFF only when the TCP peer is the configured proxy".
@@ -649,6 +871,47 @@ func TestSetGlobPatternsOrderIndependence(t *testing.T) {
 	uac2.SetIsAdmin(true)
 	uac2.SetGlobPatterns(constants.ReadPermission, map[string]bool{"**": true})
 	assert.True(t, uac2.IsAdmin())
+}
+
+func TestCanOnResourceUsesPermissionEvaluator(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.AccessControlConfig{
+		Repositories: config.Repositories{
+			"**": config.PolicyGroup{
+				Policies: []config.Policy{
+					{
+						Users:   []string{"limited"},
+						Actions: []string{constants.ReadPermission, constants.CreatePermission},
+						Conditions: []config.Condition{
+							{
+								Expression: `req.action != "read" || !req.repository.startsWith("private/")`,
+								Message:    "read under private/ not permitted",
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	programs, err := CompileAccessControl(cfg)
+	assert.NoError(t, err)
+	cfg.StoreCompiledConditions(programs)
+
+	uac := reqCtx.NewUserAccessControl()
+	uac.SetUsername("limited")
+	uac.SetIsAdmin(false)
+	uac.SetGlobPatterns(constants.ReadPermission, map[string]bool{"**": true})
+
+	// Optimistic glob patterns allow read on private/src.
+	assert.True(t, uac.Can(constants.ReadPermission, "private/src"))
+
+	ac := &AccessController{Config: cfg, Log: log.NewLogger("debug", "")}
+	req := httptest.NewRequest(http.MethodHead, "/v2/private/src/blobs/sha256:abc", nil)
+	ac.attachPermissionEvaluator(req, uac)
+
+	assert.False(t, uac.CanOnResource(constants.ReadPermission, "private/src", "sha256:abc"))
+	assert.True(t, uac.CanOnResource(constants.ReadPermission, "public/src", "sha256:abc"))
 }
 
 func TestPolicyConditionsAnonymousAndAdminFlags(t *testing.T) {
@@ -1054,5 +1317,50 @@ func TestRepoTagsForManifestWriteAuthz(t *testing.T) {
 		got, err := repoTagsForManifestWriteAuthz(nil, expected)
 		assert.Nil(t, got)
 		assert.ErrorIs(t, err, expected)
+	})
+}
+
+func TestDistSpecAuthzHandlerStorageClassOnTagLookup(t *testing.T) {
+	t.Parallel()
+
+	run := func(t *testing.T, tagsErr error, wantStatus int) {
+		t.Helper()
+
+		conf := config.New()
+		ctlr := NewController(conf)
+		ctlr.Log = log.NewTestLogger()
+		ctlr.StoreController.DefaultStore = mocks.MockedImageStore{
+			GetImageTagsFn: func(_ string) ([]string, error) {
+				return nil, tagsErr
+			},
+		}
+
+		nextCalled := false
+		handler := DistSpecAuthzHandler(ctlr)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			nextCalled = true
+			w.WriteHeader(http.StatusOK)
+		}))
+
+		req := httptest.NewRequest(http.MethodPut, "/v2/repo/manifests/v1", nil)
+		req = mux.SetURLVars(req, map[string]string{"name": "repo", "reference": "v1"})
+		userAc := reqCtx.NewUserAccessControl()
+		userAc.SetUsername("alice")
+		userAc.SaveOnRequest(req)
+
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		assert.Equal(t, wantStatus, rec.Code)
+		assert.False(t, nextCalled)
+	}
+
+	t.Run("Transient → 503", func(t *testing.T) {
+		t.Parallel()
+		run(t, zerr.ErrStorageTransient, http.StatusServiceUnavailable)
+	})
+
+	t.Run("Permanent → 500", func(t *testing.T) {
+		t.Parallel()
+		run(t, zerr.ErrStoragePermanent, http.StatusInternalServerError)
 	})
 }

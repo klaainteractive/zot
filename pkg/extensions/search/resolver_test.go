@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/99designs/gqlgen/graphql"
+	dockerList "github.com/distribution/distribution/v3/manifest/manifestlist"
+	docker "github.com/distribution/distribution/v3/manifest/schema2"
 	godigest "github.com/opencontainers/go-digest"
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
 	. "github.com/smartystreets/goconvey/convey"
@@ -247,10 +249,8 @@ func TestRepoListWithNewestImage(t *testing.T) {
 							},
 							StarCount: 100,
 							LastUpdatedImage: &mTypes.LastUpdatedImage{
-								Descriptor: mTypes.Descriptor{
-									Digest:    img1.DigestStr(),
-									MediaType: ispec.MediaTypeImageManifest,
-								},
+								Digest:      img1.DigestStr(),
+								MediaType:   ispec.MediaTypeImageManifest,
 								Tag:         "1.0.1",
 								LastUpdated: &createTime,
 							},
@@ -272,10 +272,8 @@ func TestRepoListWithNewestImage(t *testing.T) {
 							},
 							StarCount: 100,
 							LastUpdatedImage: &mTypes.LastUpdatedImage{
-								Descriptor: mTypes.Descriptor{
-									Digest:    img2.DigestStr(),
-									MediaType: ispec.MediaTypeImageManifest,
-								},
+								Digest:      img2.DigestStr(),
+								MediaType:   ispec.MediaTypeImageManifest,
 								Tag:         "1.0.2",
 								LastUpdated: &createTime2,
 							},
@@ -288,9 +286,9 @@ func TestRepoListWithNewestImage(t *testing.T) {
 				) (map[string]mTypes.ImageMeta, error) {
 					return map[string]mTypes.ImageMeta{
 						img1.DigestStr(): mConvert.GetImageManifestMeta(img1.Manifest, img1.Config,
-							img1.ManifestDescriptor.Size, img1.ManifestDescriptor.Digest),
+							img1.ManifestDescriptor.Size, img1.ManifestDescriptor.Digest, img1.Manifest.MediaType),
 						img2.DigestStr(): mConvert.GetImageManifestMeta(img2.Manifest, img2.Config,
-							img2.ManifestDescriptor.Size, img2.ManifestDescriptor.Digest),
+							img2.ManifestDescriptor.Size, img2.ManifestDescriptor.Digest, img2.Manifest.MediaType),
 					}, nil
 				},
 			}
@@ -1063,29 +1061,23 @@ func TestCVEResolvers(t *testing.T) { //nolint:gocyclo
 	}
 
 	image1 := CreateImageWith().RandomLayers(5, 2).ImageConfig(ispec.Image{
-		Created: DateRef(2008, 1, 1, 12, 0, 0, 0, time.UTC),
-		Platform: ispec.Platform{
-			Architecture: AMD,
-			OS:           LINUX,
-		},
+		Created:      DateRef(2008, 1, 1, 12, 0, 0, 0, time.UTC),
+		Architecture: AMD,
+		OS:           LINUX,
 	}).Build()
 	digest1 := image1.Digest()
 
 	image2 := CreateImageWith().RandomLayers(5, 2).ImageConfig(ispec.Image{
-		Created: DateRef(2009, 1, 1, 12, 0, 0, 0, time.UTC),
-		Platform: ispec.Platform{
-			Architecture: AMD,
-			OS:           LINUX,
-		},
+		Created:      DateRef(2009, 1, 1, 12, 0, 0, 0, time.UTC),
+		Architecture: AMD,
+		OS:           LINUX,
 	}).Build()
 	digest2 := image2.Digest()
 
 	image3 := CreateImageWith().RandomLayers(5, 2).ImageConfig(ispec.Image{
-		Created: DateRef(2010, 1, 1, 12, 0, 0, 0, time.UTC),
-		Platform: ispec.Platform{
-			Architecture: ARM,
-			OS:           LINUX,
-		},
+		Created:      DateRef(2010, 1, 1, 12, 0, 0, 0, time.UTC),
+		Architecture: ARM,
+		OS:           LINUX,
 	}).Build()
 	digest3 := image3.Digest()
 
@@ -1198,10 +1190,10 @@ func TestCVEResolvers(t *testing.T) { //nolint:gocyclo
 
 			return cvemodel.ScanResult{CVEMap: getCveResults(repoMeta.Tags[ref].Digest)}, nil
 		},
-		GetCachedResultFn: func(digestStr string) map[string]zcommon.CVE {
+		GetCachedResultFn: func(repo, digestStr string) map[string]zcommon.CVE {
 			return getCveResults(digestStr)
 		},
-		IsResultCachedFn: func(digestStr string) bool {
+		IsResultCachedFn: func(repo, digestStr string) bool {
 			return true
 		},
 	}
@@ -2061,10 +2053,10 @@ func TestCVEResolvers(t *testing.T) { //nolint:gocyclo
 
 				return cvemodel.ScanResult{CVEMap: getCveResults(repoMeta.Tags[ref].Digest)}, nil
 			},
-			GetCachedResultFn: func(digestStr string) map[string]zcommon.CVE {
+			GetCachedResultFn: func(repo, digestStr string) map[string]zcommon.CVE {
 				return getCveResults(digestStr)
 			},
-			IsResultCachedFn: func(digestStr string) bool {
+			IsResultCachedFn: func(repo, digestStr string) bool {
 				return true
 			},
 		}
@@ -3172,7 +3164,7 @@ func TestUtils(t *testing.T) {
 						Manifests: []mTypes.ManifestMeta{
 							{
 								Digest: manifestDigest,
-								Config: ispec.Image{Platform: ispec.Platform{OS: "linux", Architecture: "amd64"}},
+								Config: ispec.Image{OS: "linux", Architecture: "amd64"},
 							},
 						},
 					}, nil
@@ -3228,4 +3220,47 @@ func getGQLPageInput(limit int, offset int) *gql_generated.PageInput {
 		Offset: &offset,
 		SortBy: &sortCriteria,
 	}
+}
+
+func TestFilterByTagInfoDockerMediaTypes(t *testing.T) {
+	Convey("FilterByTagInfo accepts Docker schema2 media types", t, func() {
+		childDigest := godigest.FromString("docker-child")
+		indexDigest := godigest.FromString("docker-list")
+		imageMeta := mTypes.ImageMeta{
+			Manifests: []mTypes.ManifestMeta{
+				{Digest: childDigest},
+			},
+		}
+
+		Convey("Docker manifest list matches child digests", func() {
+			filter := FilterByTagInfo([]cvemodel.TagInfo{
+				{
+					Tag: "latest",
+					Descriptor: cvemodel.Descriptor{
+						Digest:    indexDigest,
+						MediaType: dockerList.MediaTypeManifestList,
+					},
+					Manifests: []cvemodel.DescriptorInfo{
+						{Digest: childDigest},
+					},
+				},
+			})
+
+			So(filter(mTypes.RepoMeta{}, imageMeta), ShouldBeTrue)
+		})
+
+		Convey("Docker schema2 manifest matches descriptor digest", func() {
+			filter := FilterByTagInfo([]cvemodel.TagInfo{
+				{
+					Tag: "v1",
+					Descriptor: cvemodel.Descriptor{
+						Digest:    childDigest,
+						MediaType: docker.MediaTypeManifest,
+					},
+				},
+			})
+
+			So(filter(mTypes.RepoMeta{}, imageMeta), ShouldBeTrue)
+		})
+	})
 }

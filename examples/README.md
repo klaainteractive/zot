@@ -35,6 +35,7 @@ Examples of working configurations for various use cases are available [here](..
   - [Top-level Configuration Map](#top-level-configuration-map)
   - [Network](#network)
   - [Storage](#storage)
+    - [Hydrate blob on read](#hydrate-blob-on-read)
     - [Fast restart](#fast-restart)
   - [Authentication](#authentication)
     - [TLS Mutual Authentication](#tls-mutual-authentication)
@@ -69,7 +70,7 @@ includes supported field aliases where the config loader accepts them.
 | Key | Type | Purpose |
 | --- | --- | --- |
 | `distSpecVersion` | string | Distribution spec version declared by the config. zot warns if it differs from the supported version and then uses the supported version. |
-| `storage` | object | Registry storage root, dedupe, garbage collection, retention, storage drivers, cache drivers, and repository subpaths. |
+| `storage` | object | Registry storage root, dedupe, hydrate blob on read, garbage collection, retention, storage drivers, cache drivers, and repository subpaths. |
 | `http` | object | Listener address and port, TLS, authentication, authorization, CORS, rate limits, realm, and client compatibility settings. |
 | `log` | object | Log level, primary log output, and audit log output. |
 | `extensions` | object | Optional sync, search, UI, metrics, scrub, lint, image trust, API key, management, and event-recorder settings. |
@@ -123,6 +124,32 @@ support hard links, inline deduplication can be enabled with:
         "dedupe": true,
 ```
 
+### Hydrate blob on read
+
+With `dedupe` enabled, `POST /v2/<name>/blobs/uploads/?mount=<digest>` can still
+link a blob from this store's dedupe cache into another repository. By default,
+blob **reads** (`HEAD` and ranged `GET`) only look at the repository-local blob
+path, so a digest deleted from one repository stays missing there even if the
+same digest remains in another repository or in the cache (OCI distribution-spec
+AtomicDelete behavior).
+
+To restore the older behavior where `HEAD` / ranged `GET` may materialize a
+cached digest into the target repository when it is not present locally, set:
+
+```
+        "hydrateBlobOnRead": true,
+```
+
+The default is `false` (omit the field or set it explicitly). The setting is
+per store: it can be set under top-level `storage` or under a `subPaths` entry,
+and it only applies within that store (not across different `subPaths` /
+storage drivers). Explicit mounts via `POST ...?mount=` are unchanged.
+When `accessControl` is enabled, both hydration and explicit mounts also require
+`create` on the destination repository and `read` on at least one repository that
+already holds the digest; otherwise `HEAD` / ranged `GET` stay repo-local
+(`StatBlob`) and can still return 404 for digests missing from the destination.
+A complete example is in [config-hydrate-blob-on-read.json](config-hydrate-blob-on-read.json).
+
 When an image is deleted (either by tag or reference), orphaned blobs can lead
 to wasted storage, and background garbage collection can be enabled with:
 
@@ -162,8 +189,35 @@ To limit the maximum number of repositories that can be created, set:
 ```
 
 When the limit is reached, pushes that would create a new repository are
-rejected with HTTP 429. Pushes to existing repositories are always allowed.
+rejected with HTTP 413. Pushes to existing repositories are always allowed.
 Setting maxRepos to 0 or omitting it disables enforcement.
+
+A repository stops counting towards the limit when it is removed from
+storage: immediately when its last manifest is deleted and no blobs or
+uploads remain, or otherwise in a garbage collection cycle once its
+remaining blobs pass the GC delay.
+
+To limit the logical size of each repository, set `maxRepoBytes`:
+
+```
+        "maxRepoBytes": 10737418240
+```
+
+The value is measured in bytes and counts the unique manifest, index, config,
+and layer blobs reachable from the repository's tagged references. The same
+digest is counted only once within a repository. When a manifest push would
+increase the logical size beyond the limit, zot returns HTTP 413 with the
+current, projected, and configured sizes in the error detail. A value of 0 or
+omitting `maxRepoBytes` disables this enforcement. The setting can also be
+configured under a matching `subPaths` entry and takes effect after restart.
+Foreign and other non-distributable layers that are not stored locally use
+their descriptor sizes for logical quota accounting.
+
+This is a logical repository quota, not a physical disk quota. Shared physical
+blobs across repositories are not charged as a single-repository allocation.
+For deployments with multiple Zot instances sharing a metadata backend, use the
+existing single-writer cluster routing for repository writes; independent
+writers are not atomically coordinated by this quota implementation.
 
 It is also possible to store and serve images from multiple filesystems with
 their own repository paths, dedupe and garbage collection settings with:
@@ -177,7 +231,8 @@ their own repository paths, dedupe and garbage collection settings with:
             },
             "/b": {
                 "rootDirectory": "/tmp/zot2",
-                "dedupe": true
+                "dedupe": true,
+                "hydrateBlobOnRead": true
             },
             "/c": {
                 "rootDirectory": "/tmp/zot3",
@@ -305,6 +360,8 @@ For safety purpose you can have a default policy as the last policy in list, all
 ## Authentication
 
 TLS mutual authentication and passphrase-based authentication are supported.
+For deployments that enable more than one authentication method, see
+[Combined Authentication](README-COMBINED-AUTHENTICATION.md).
 
 ### TLS Mutual Authentication
 
@@ -421,6 +478,10 @@ zot supports several openID/OAuth2 providers:
  - gitlab
  - dex
 
+For OIDC providers (those configured with an `issuer`) zot accepts the ID token signing algorithms
+advertised in the issuer's discovery document (`id_token_signing_alg_values_supported`), for example RS256,
+ES256, PS256 or PS512.
+
 zot can be configured to use the above providers with:
 ```
 {
@@ -458,6 +519,11 @@ To login with either provider use http://127.0.0.1:8080/zot/auth/login?provider=
 for example to login with github use http://127.0.0.1:8080/zot/auth/login?provider=github&callback_ui=/home
 
 callback_ui query parameter is used by zot to redirect to UI after a successful openid/oauth2 authentication
+
+OpenID Connect providers are initialized lazily, on the first login attempt, so zot startup does not depend on
+the provider issuer being reachable. While the issuer is unreachable, the login and callback endpoints of that
+provider respond with `503 Service Unavailable` and initialization is retried on the next attempt; other
+authentication methods (htpasswd, LDAP, API keys) and registry operations keep working.
 
 By default, `callback_ui` must be a relative path (starting with `/`) to prevent open redirects.
 If your UI runs on a different origin (e.g. different port during development), you can allowlist
@@ -545,6 +611,22 @@ zot can be configured to use dex with:
 To login using openid dex provider use http://127.0.0.1:8080/zot/auth/login?provider=oidc
 
 `claimMapping.username` defaults to `email`, and `claimMapping.groups` defaults to `groups`.
+
+zot fetches the discovery document from `<issuer>/.well-known/openid-configuration`. If zot cannot reach the
+issuer's public URL, for example when the identity provider runs in the same cluster behind a gateway that
+blocks internal traffic, set `discoveryurl` to the full URL of the discovery document on an address zot can reach:
+
+```
+"oidc": {
+  "issuer": "https://auth.example.com/realms/zot",
+  "discoveryurl": "http://keycloak.auth.svc:8080/realms/zot/.well-known/openid-configuration",
+  ...
+}
+```
+
+The `issuer` in the fetched document must still equal the configured `issuer`. zot also calls the token, JWKS and
+userinfo endpoints listed in that document, so they must be reachable from zot as well. Keycloak, for example,
+lists internal URLs for these when `hostname-backchannel-dynamic` is enabled.
 
 NOTE: Social login is not supported by command line tools, or other software responsible for pushing/pulling
 images to/from zot.
@@ -996,6 +1078,23 @@ When authentication is configured and repositories have non-anonymous policies, 
 
 See [config-metrics-authn-anonymous-access.json](config-metrics-authn-anonymous-access.json) for a complete example.
 
+##### Disabling anonymous catalog listing
+
+By default, an `anonymousPolicy` with `read` also lets unauthenticated users list repositories through `GET /v2/_catalog` (filtered to the repositories they can read). Set `disableAnonymousCatalog` to `true` in `accessControl` to reject anonymous catalog requests with `401 Unauthorized`:
+
+```
+"accessControl": {
+    "disableAnonymousCatalog": true,
+    "repositories": {
+        "**": { "anonymousPolicy": ["read"] }
+    }
+}
+```
+
+Anonymous pulls from repositories allowed by `anonymousPolicy` keep working, and authenticated users can still list the catalog. The option can be changed with a config hot reload (SIGHUP). It only affects `/v2/_catalog`; it does not restrict the search extension's GraphQL repository listings.
+
+See [config-anonymous-catalog-disabled.json](config-anonymous-catalog-disabled.json) for a complete example.
+
 ##### Conditional access on policies
 
 Policy entries can carry an optional list of `conditions`: CEL boolean
@@ -1392,13 +1491,22 @@ Configure each registry sync:
 			"registries": [{
 				"urls": ["https://registry1:5000"],
 				"onDemand": false,                  # pull any image which the local registry doesn't have
+				"onDemandInBackground": false,      # return immediately when the manifest is missing locally and sync it into storage in the background; requires onDemand; incompatible with manifestCheckInterval
+				"stream": false,                    # serve an on-demand image to the client while it downloads instead of after it is synced; requires onDemand and https urls with tlsVerify; incompatible with onDemandInBackground and maxRetries/retryDelay. See "Streaming on-demand sync" below
+				"maxConcurrentStreams": 32,         # with stream: cap on distinct blobs streaming at once, shared by all streaming registries (all must agree); past it, requests use blocking on-demand sync (default: 32)
 				"pollInterval": "6h",               # polling interval, if not set then periodically polling will not run
+				"platforms": ["linux/amd64"],       # periodic sync default: sparse-copy these OS/arch[/variant] children; omit/empty = all. Overridden by content[].platforms when set. On-demand ignores both. Extra slash tokens beyond three are ignored by platform.Parse (not rejected).
+				"manifestCheckInterval": "1h",      # minimum interval between upstream manifest checks for the same repo:tag when serving on-demand requests; when 0 or unset every request checks upstream. Requires onDemand.
 				"tlsVerify": true,                  # whether or not to verify tls (default is true)
 				"certDir": "/home/user/certs",      # use certificates at certDir path similar to Docker's /etc/docker/certs.d., if not specified then use the default certs dir,
 				"maxRetries": 5,                    # maxRetries in case of temporary errors (default: no retries)
 				"retryDelay": "1s",                 # initial HTTP retry delay; mandatory when using maxRetries
 				"maxRetryDelay": "30s",             # max HTTP retry backoff; optional, defaults to retryDelay (fixed interval). Set higher than retryDelay for exponential backoff.
-				"onlySigned": true,                 # sync only signed images (either notary or cosign)
+				"reqConcurrent": 30,                # max concurrent in-flight requests per host, applied independently to this upstream and to each of its mirrors, not shared across them (default: 3); raise it when one zot proxies many concurrent on-demand pulls from a single upstream
+				"reqPerSec": 100,                   # max request rate (requests/second) per host, applied independently to this upstream and to each of its mirrors, not shared across them (default: unlimited)
+				"disableHTTP2": true,               # force HTTP/1.1 to the upstream, so each concurrent request opens its own TCP connection instead of sharing the single connection (and congestion window) HTTP/2 multiplexes requests onto (default: false, i.e. HTTP/2 is negotiated when the upstream supports it)
+				"maxIdleConnsPerHost": 30,           # per-host idle connection pool size (default: 2; when disableHTTP2 is true and this is unset, defaults to reqConcurrent instead, so pooled HTTP/1.1 connections aren't closed under concurrency)
+				"onlySigned": true,                 # when true, tag sync requires a remote signature (notary/cosign/referrers). On-demand digest pulls skip that check so multi-arch tag→digest client flows work (signatures normally cover the index, not each platform child). A client that already knows an upstream digest can therefore sync that manifest without a per-manifest signature. Periodic child digests after a signed tag also skip re-checking.
 				"content":[                         # which content to periodically pull, also it's used for filtering ondemand images, if not set then periodically polling will not run
 					{
 						"prefix":"/repo1/repo",         # pull image repo1/repo
@@ -1412,6 +1520,10 @@ Configure each registry sync:
 					},
 					{
 						"prefix":"/repo3/**"            # pull all images under repo3/ (matches recursively all repos under repo3/)
+					},
+					{
+						"prefix":"/repo4/**",           # pull all images under repo4/
+						"platforms": ["linux/amd64"]   # optional: overrides registries[].platforms for this prefix only (periodic); omit to inherit; [] means all platforms
 					},
           {
             "prefix":"/repo1/repo",          # pull /repo1/repo
@@ -1452,6 +1564,92 @@ Configure each registry sync:
 ```
 Prefixes can be strings that exactly match repositories or they can be [glob](https://en.wikipedia.org/wiki/Glob_(programming)) patterns.
 
+### Sync's manifestCheckInterval option
+
+With `onDemand` enabled, every request for a tag validates the manifest against the upstream
+registry, because a tag is mutable and may have been repushed. When pulls are frequent and
+upstream rarely changes, `manifestCheckInterval` throttles that validation:
+
+```
+			"registries": [{
+				"urls": ["https://registry-1.docker.io"],
+				"onDemand": true,
+				"manifestCheckInterval": "10m"
+			}]
+```
+
+While the interval has not elapsed since the last successful upstream check, a locally present
+manifest is served without contacting upstream, which makes already synced images effectively
+local. Notes:
+
+ - the default is 0, which keeps checking upstream on every request
+ - it requires `onDemand`, since it only affects on-demand requests, never periodic sync
+ - requests by digest are unaffected, a locally present digest is already served without contacting upstream
+ - a local miss, for instance after garbage collection, always falls back to a normal sync
+ - the last check time is kept in memory, so the first request after a restart checks upstream again
+
+### On-demand sync in the background
+
+Set `"onDemand": true` and `"onDemandInBackground": true` so that when a requested manifest is not
+present locally, zot returns immediately and syncs the image into storage in the background (only from
+registries that enable onDemandInBackground for that repo). Later requests can be served from local
+storage once sync completes.
+
+```
+			"registries": [{
+				"urls": ["https://registry-1.docker.io"],
+				"onDemand": true,
+				"onDemandInBackground": true
+			}]
+```
+
+Useful when a client can fall back to another registry for the same pull. Clients that talk only to
+zot will receive a real `404` until the background sync finishes. Do not enable
+`onDemandInBackground` for registries that are the client's only source.
+
+Blob requests that miss locally still return `404`; the background sync is started from the
+manifest request and populates the full image in storage.
+
+Notes:
+
+ - requires `onDemand`
+ - incompatible with `manifestCheckInterval` (this mode does not revalidate tags on hit)
+ - when multiple sync registries are configured, background sync applies per repo: only registries with
+   `onDemandInBackground` whose content rules match the local repo are used for the background sync;
+   other registries keep normal blocking on-demand for their repos
+
+### Streaming on-demand sync
+
+With `"stream": true`, a client pulling an image that is not yet local gets the upstream manifest
+right away and its blobs as they arrive from upstream, instead of waiting for the whole image to be
+synced. The sync into storage runs in the background. See `examples/config-sync-streaming.json`:
+
+```
+			"registries": [{
+				"urls": ["https://registry-1.docker.io"],
+				"onDemand": true,
+				"stream": true,
+				"maxConcurrentStreams": 32
+			}]
+```
+
+Notes:
+
+ - requires `onDemand` and `https://` URLs with `tlsVerify` (the default): bytes reach the client before
+   the blob's digest is verified, so the upstream must be authenticated
+ - incompatible with `onDemandInBackground`, `maxRetries`/`retryDelay` and `"tlsVerify": false`
+ - `maxConcurrentStreams` (default 32, must be > 0) is a single cap shared by every streaming registry, so
+   all of them must set the same value; past it, requests fall back to blocking on-demand sync
+ - `preserveDigest` is not needed: it is deprecated and ignored, and a streamed manifest is never converted
+ - each blob being streamed is staged on local disk once, as for plain on-demand sync: its stream temp file
+   is hard-linked into the sync session. It lives under the storage root dir or, for S3/Azure/GCS, under
+   `extensions.sync.downloadDir`, which must then be set
+ - a streamed blob is sent within one response, so `http.writeTimeout` (default `60s`, an absolute deadline
+   for writing the whole response) must cover the slowest blob pull expected, or the client is cut off
+   mid-blob; the example sets `30m`. It applies to every response, so a higher value also lets a slow or
+   stalled client hold its connection longer
+ - design and on-disk layout: `pkg/extensions/sync/README_streaming_sync.md`
+
 ### Sync's certDir option
 
 sync uses the same logic for reading cert directory as docker: https://docs.docker.com/engine/security/certificates/#understand-the-configuration
@@ -1474,8 +1672,17 @@ A minimal configuration only sets how often the DB is refreshed; zot applies def
 
 To set those options explicitly (for example to mirror standalone Trivy’s `--vuln-severity-source` behavior), use a `trivy` object under `cve`:
 
-- [config-cve-trivy.json](config-cve-trivy.json) — shows optional `dbRepository`, `javaDBRepository`, `vulnSeveritySources`, and `sbom`.
+- [config-cve-trivy.json](config-cve-trivy.json) — shows optional `dbRepository`, `javaDBRepository`, `vulnSeveritySources`, `detectionPriority`, `scanRemovedPkgs`, and `includeDevDeps`.
+- [config-sbom-trivy.json](config-sbom-trivy.json) — adds `sbom` to generate SBOMs during scanning.
+
+`ignoreFile` specifies the path to a [Trivy ignore file](https://trivy.dev/docs/latest/configuration/filtering/#trivyignore) and supports the same plain-text and YAML formats as Trivy's `--ignorefile` option. The file must exist and be readable when zot loads its configuration. Relative paths are resolved from zot's process working directory, not from the directory containing the zot configuration file, so use an absolute path in deployments, for example `"ignoreFile": "/etc/zot/.trivyignore"`. A sample [`.trivyignore`](.trivyignore) is included in this directory.
+
+Scan results are cached by manifest digest. Editing an ignore file does not invalidate existing cached results: newly ignored vulnerabilities can remain visible, and newly unignored vulnerabilities can remain hidden, until the CVE database refresh purges the scan cache or zot restarts. The minimum database `updateInterval` is two hours.
 
 `vulnSeveritySources` is a list of source names in priority order (for example `auto`, `nvd`, or vendor IDs such as `redhat`, `alpine`). If omitted, zot defaults it to `["auto"]`, consistent with the Trivy CLI. See [Trivy: severity selection](https://trivy.dev/docs/latest/scanner/vulnerability/#severity-selection).
+
+`detectionPriority` mirrors Trivy's [`--detection-priority`](https://trivy.dev/docs/latest/scanner/vulnerability/#detection-priority) and accepts `precise` (default) or `comprehensive`. `comprehensive` stops Trivy filtering files owned by the OS package manager, so those files are reported a second time as language packages matched against NVD. On distributions that backport security fixes (RHEL, SLES) this typically results in reported vulnerabilities that the vendor has already patched.
+
+`scanRemovedPkgs` mirrors Trivy's `--removed-pkgs` and reports vulnerabilities for packages deleted in later image layers. `includeDevDeps` mirrors Trivy's `--include-dev-deps` and reports development dependencies. Both default to `false`.
 
 `sbom.enable` lets zot generate SBOMs while scanning and store them as OCI artifacts attached to the scanned image. `sbom.format` supports `spdx-json` (default) and `cyclonedx`.

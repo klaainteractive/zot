@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/url"
 	"os"
 	"path"
@@ -112,8 +113,7 @@ func generateTestData(dbDir string) error { //nolint: gocyclo
 		return err
 	}
 
-	index := ispec.Index{}
-	index.SchemaVersion = 2
+	index := ispec.Index{SchemaVersion: 2}
 
 	buf, err := json.Marshal(index)
 	if err != nil {
@@ -318,7 +318,7 @@ func TestImageFormat(t *testing.T) {
 		imgDir := "../../../../test/data"
 		dbDir := t.TempDir()
 
-		metrics := monitoring.NewMetricsServer(false, log)
+		metrics := monitoring.NewNopMetricServer()
 		defaultStore := local.NewImageStore(imgDir, false, false, log, metrics, nil, nil, nil, nil)
 		storeController := storage.StoreController{DefaultStore: defaultStore}
 
@@ -443,7 +443,7 @@ func TestCVESearchDisabled(t *testing.T) {
 		conf.Storage.RootDirectory = dbDir
 		defaultVal := true
 		searchConfig := &extconf.SearchConfig{
-			BaseConfig: extconf.BaseConfig{Enable: &defaultVal},
+			Enable: &defaultVal,
 		}
 		conf.Extensions = &extconf.ExtensionConfig{
 			Search: searchConfig,
@@ -515,8 +515,8 @@ func TestCVESearch(t *testing.T) {
 		}
 		defaultVal := true
 		searchConfig := &extconf.SearchConfig{
-			BaseConfig: extconf.BaseConfig{Enable: &defaultVal},
-			CVE:        cveConfig,
+			Enable: &defaultVal,
+			CVE:    cveConfig,
 		}
 		conf.Extensions = &extconf.ExtensionConfig{
 			Search: searchConfig,
@@ -1046,11 +1046,13 @@ func TestCVEStruct(t *testing.T) { //nolint:gocyclo
 						},
 					}
 
-					// Simulate scanning an index results in scanning its manifests
+					// Index scan only populates per-manifest cache entries (matches scanIndex).
 					if ref == indexDigest {
 						cache.Add(indexM1Digest, result)
 						cache.Add(indexM2Digest, map[string]zcommon.CVE{})
 						cache.Add(indexM3Digest, map[string]zcommon.CVE{})
+
+						return cvemodel.ScanResult{CVEMap: result}, nil
 					}
 
 					cache.Add(ref, result)
@@ -1172,13 +1174,40 @@ func TestCVEStruct(t *testing.T) { //nolint:gocyclo
 
 				return true, nil
 			},
-			IsResultCachedFn: func(digest string) bool {
-				t.Logf("IsResultCachedFn found in cache for digest %s: %v", digest, cache.Get(digest))
+			IsResultCachedFn: func(repo, digest string) bool {
+				t.Logf("IsResultCachedFn repo %s digest %s: %v", repo, digest, cache.Get(digest))
+
+				imgMeta, err := metaDB.GetImageMeta(godigest.Digest(digest))
+				if err == nil && imgMeta.Index != nil {
+					for _, desc := range imgMeta.Index.Manifests {
+						if cache.Get(desc.Digest.String()) == nil {
+							return false
+						}
+					}
+
+					return true
+				}
 
 				return cache.Contains(digest)
 			},
-			GetCachedResultFn: func(digest string) map[string]zcommon.CVE {
-				t.Logf("GetCachedResultFn found in cache for digest %s: %v", digest, cache.Get(digest))
+			GetCachedResultFn: func(repo, digest string) map[string]zcommon.CVE {
+				t.Logf("GetCachedResultFn repo %s digest %s: %v", repo, digest, cache.Get(digest))
+
+				imgMeta, err := metaDB.GetImageMeta(godigest.Digest(digest))
+				if err == nil && imgMeta.Index != nil {
+					result := map[string]zcommon.CVE{}
+
+					for _, desc := range imgMeta.Index.Manifests {
+						cached := cache.Get(desc.Digest.String())
+						if cached == nil {
+							return map[string]zcommon.CVE{}
+						}
+
+						maps.Copy(result, cached)
+					}
+
+					return result
+				}
 
 				return cache.Get(digest)
 			},
@@ -1549,6 +1578,15 @@ func TestCVEStruct(t *testing.T) { //nolint:gocyclo
 		So(err, ShouldBeNil)
 		So(len(tagList), ShouldEqual, 0)
 
+		// Index is affected through one of its manifests
+		tagList, err = cveInfo.GetImageListForCVE(ctx, repoMultiarch, "CVE1")
+		So(err, ShouldBeNil)
+		So(len(tagList), ShouldEqual, 1)
+		So(tagList[0].Tag, ShouldEqual, "tagIndex")
+		So(tagList[0].Descriptor.Digest.String(), ShouldEqual, indexDigest)
+		So(len(tagList[0].Manifests), ShouldEqual, 1)
+		So(tagList[0].Manifests[0].Digest.String(), ShouldEqual, indexM1Digest)
+
 		// Image is not scannable
 		tagList, err = cveInfo.GetImageListForCVE(ctx, repo2, "CVE100")
 		// Image is not considered affected with CVE as scan is not possible
@@ -1738,7 +1776,7 @@ func TestFixedTagsWithIndex(t *testing.T) {
 		conf.Storage.GC = false
 		conf.Extensions = &extconf.ExtensionConfig{
 			Search: &extconf.SearchConfig{
-				BaseConfig: extconf.BaseConfig{Enable: &defaultVal},
+				Enable: &defaultVal,
 				CVE: &extconf.CVEConfig{
 					UpdateInterval: 24 * time.Hour,
 					Trivy: &extconf.TrivyConfig{
@@ -1824,6 +1862,47 @@ func TestFixedTagsWithIndex(t *testing.T) {
 		So(len(responseStruct.Results[0].Manifests), ShouldEqual, 1)
 		fixedManifestResp := responseStruct.Results[0].Manifests[0]
 		So(fixedManifestResp.Digest, ShouldResemble, fixedSingleArchImage.ManifestDescriptor.Digest.String())
+
+		// the index is affected through its vulnerable manifest only
+		tagsInfo, err = cveInfo.GetImageListForCVE(context.Background(), "repo", Vulnerability1ID)
+		So(err, ShouldBeNil)
+		So(len(tagsInfo), ShouldEqual, 2)
+
+		const affectedQuery = `
+		{
+			ImageListForCVE(id:"%s"){
+				Results{
+					RepoName
+					Tag
+					Manifests {Digest}
+				}
+			}
+		}`
+
+		resp, _ = resty.R().Get(baseURL + constants.FullSearchPrefix + "?query=" +
+			url.QueryEscape(fmt.Sprintf(affectedQuery, Vulnerability1ID)))
+		So(resp, ShouldNotBeNil)
+		So(resp.StatusCode(), ShouldEqual, 200)
+
+		affectedResponseStruct := &zcommon.ImagesForCve{}
+		err = json.Unmarshal(resp.Body(), &affectedResponseStruct)
+		So(err, ShouldBeNil)
+		So(len(affectedResponseStruct.Results), ShouldEqual, 2)
+
+		affectedManifests := map[string][]string{}
+
+		for _, image := range affectedResponseStruct.Results {
+			So(image.RepoName, ShouldEqual, "repo")
+
+			for _, manifest := range image.Manifests {
+				affectedManifests[image.Tag] = append(affectedManifests[image.Tag], manifest.Digest)
+			}
+		}
+
+		So(affectedManifests, ShouldResemble, map[string][]string{
+			"multi-arch-tag": {vulnSingleArchImage.ManifestDescriptor.Digest.String()},
+			"vuln-img":       {simpleVulnImage.ManifestDescriptor.Digest.String()},
+		})
 	})
 }
 

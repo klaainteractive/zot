@@ -5,6 +5,7 @@ package meta_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path"
@@ -13,12 +14,13 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	dockerList "github.com/distribution/distribution/v3/manifest/manifestlist"
+	docker "github.com/distribution/distribution/v3/manifest/schema2"
 	guuid "github.com/gofrs/uuid"
 	"github.com/notaryproject/notation-core-go/signature/jws"
 	"github.com/notaryproject/notation-go"
 	"github.com/notaryproject/notation-go/signer"
 	godigest "github.com/opencontainers/go-digest"
-	"github.com/opencontainers/image-spec/specs-go"
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
 	. "github.com/smartystreets/goconvey/convey"
 
@@ -200,6 +202,17 @@ func TestRedisDB(t *testing.T) {
 
 		RunMetaDBTests(t, metaDB)
 	})
+}
+
+var errStorageUnavailable = errors.New("storage unavailable")
+
+// trustStoreFunc is an ImageTrustStore that answers every verification by calling itself.
+type trustStoreFunc func() (mTypes.Author, mTypes.ExpiryDate, mTypes.Validity, error)
+
+func (verify trustStoreFunc) VerifySignatureLayer(signatureType string, layerDigest godigest.Digest, sigKey string,
+	manifestDigest godigest.Digest, imageMeta mTypes.ImageMeta, repo string,
+) (mTypes.Author, mTypes.ExpiryDate, mTypes.Validity, error) {
+	return verify()
 }
 
 func RunMetaDBTests(t *testing.T, metaDB mTypes.MetaDB, preparationFuncs ...func() error) { //nolint: thelper,gocyclo
@@ -464,7 +477,9 @@ func RunMetaDBTests(t *testing.T, metaDB mTypes.MetaDB, preparationFuncs ...func
 			})
 
 			Convey("Test API keys with short expiration date", func() {
-				expirationDate := time.Now().Add(1 * time.Second)
+				// A few seconds gives headroom for slow CI between Add and the
+				// not-expired check; then wait until After(expirationDate).
+				expirationDate := time.Now().Add(3 * time.Second)
 				apiKeyDetails.ExpirationDate = expirationDate
 
 				userAc := reqCtx.NewUserAccessControl()
@@ -486,7 +501,10 @@ func RunMetaDBTests(t *testing.T, metaDB mTypes.MetaDB, preparationFuncs ...func
 				So(isExpired, ShouldBeFalse)
 				So(err, ShouldBeNil)
 
-				time.Sleep(1 * time.Second)
+				// Production uses time.Now().After(expirationDate); sleep only the remainder.
+				if d := time.Until(expirationDate) + time.Millisecond; d > 0 {
+					time.Sleep(d)
+				}
 
 				Convey("GetUserAPIKeys detects api key expired", func() {
 					storedAPIKeys, err = metaDB.GetUserAPIKeys(ctx)
@@ -516,15 +534,13 @@ func RunMetaDBTests(t *testing.T, metaDB mTypes.MetaDB, preparationFuncs ...func
 			imgData := CreateImageWith().
 				DefaultLayers().
 				ImageConfig(ispec.Image{
-					Created: DateRef(2000, 10, 10, 10, 10, 10, 10, time.UTC),
-					Author:  "author",
-					Platform: ispec.Platform{
-						Architecture: "arch",
-						OS:           "os",
-						OSVersion:    "os-vers",
-						OSFeatures:   []string{"os-features"},
-						Variant:      "variant",
-					},
+					Created:      DateRef(2000, 10, 10, 10, 10, 10, 10, time.UTC),
+					Author:       "author",
+					Architecture: "arch",
+					OS:           "os",
+					OSVersion:    "os-vers",
+					OSFeatures:   []string{"os-features"},
+					Variant:      "variant",
 					Config: ispec.ImageConfig{
 						Labels:       map[string]string{"test": "test"},
 						Env:          []string{"test"},
@@ -556,6 +572,30 @@ func RunMetaDBTests(t *testing.T, metaDB mTypes.MetaDB, preparationFuncs ...func
 			retrievedImgMultiData, err := metaDB.GetImageMeta(imgMulti.Digest())
 			So(err, ShouldBeNil)
 			So(imgMulti.AsImageMeta(), ShouldEqual, retrievedImgMultiData)
+
+			dockerImage := CreateRandomImage().AsDockerImage()
+			err = metaDB.SetImageMeta(dockerImage.Digest(), dockerImage.AsImageMeta())
+			So(err, ShouldBeNil)
+
+			retrievedDockerImage, err := metaDB.GetImageMeta(dockerImage.Digest())
+			So(err, ShouldBeNil)
+			So(retrievedDockerImage.MediaType, ShouldEqual, docker.MediaTypeManifest)
+			So(retrievedDockerImage.Manifests[0].Manifest.MediaType, ShouldEqual, docker.MediaTypeManifest)
+
+			dockerMultiarch := CreateRandomMultiarch().AsDockerImage()
+
+			for i := range dockerMultiarch.Images {
+				err = metaDB.SetImageMeta(dockerMultiarch.Images[i].Digest(), dockerMultiarch.Images[i].AsImageMeta())
+				So(err, ShouldBeNil)
+			}
+
+			err = metaDB.SetImageMeta(dockerMultiarch.Digest(), dockerMultiarch.AsImageMeta())
+			So(err, ShouldBeNil)
+
+			retrievedDockerMultiarch, err := metaDB.GetImageMeta(dockerMultiarch.Digest())
+			So(err, ShouldBeNil)
+			So(retrievedDockerMultiarch.MediaType, ShouldEqual, dockerList.MediaTypeManifestList)
+			So(retrievedDockerMultiarch.Index.MediaType, ShouldEqual, dockerList.MediaTypeManifestList)
 		})
 
 		Convey("GetFullImageMeta", func() {
@@ -594,8 +634,8 @@ func RunMetaDBTests(t *testing.T, metaDB mTypes.MetaDB, preparationFuncs ...func
 			// 1. The nested index (with missing manifests)
 			// 2. The valid manifest
 			topLevelIndexContent := ispec.Index{
-				Versioned: specs.Versioned{SchemaVersion: 2},
-				MediaType: ispec.MediaTypeImageIndex,
+				SchemaVersion: 2,
+				MediaType:     ispec.MediaTypeImageIndex,
 				Manifests: []ispec.Descriptor{
 					{
 						MediaType: ispec.MediaTypeImageManifest,
@@ -657,6 +697,36 @@ func RunMetaDBTests(t *testing.T, metaDB mTypes.MetaDB, preparationFuncs ...func
 			So(repoMeta.Tags, ShouldContainKey, "tag")
 		})
 
+		Convey("ProjectRepoSize applies tag-rooted digest deduplication without persisting", func() {
+			repo := "projected-repo"
+			first := CreateImageWith().RandomLayers(2, 10).RandomConfig().Build()
+			firstMeta := first.AsImageMeta()
+			firstSize := first.ManifestDescriptor.Size + first.ConfigDescriptor.Size + 2*10
+
+			current, projected, err := metaDB.GetRepoSizeWithCandidate(ctx, repo, []string{"latest"}, firstMeta)
+			So(err, ShouldBeNil)
+			So(current, ShouldEqual, 0)
+			So(projected, ShouldEqual, firstSize)
+
+			_, err = metaDB.GetRepoMeta(ctx, repo)
+			So(errors.Is(err, zerr.ErrRepoMetaNotFound), ShouldBeTrue)
+
+			So(metaDB.SetRepoReference(ctx, repo, "latest", firstMeta), ShouldBeNil)
+
+			second := CreateImageWith().LayerBlobs(first.Layers).RandomConfig().Build()
+			secondMeta := second.AsImageMeta()
+			secondProjected := firstSize + second.ManifestDescriptor.Size + second.ConfigDescriptor.Size
+
+			current, projected, err = metaDB.GetRepoSizeWithCandidate(ctx, repo, []string{"second"}, secondMeta)
+			So(err, ShouldBeNil)
+			So(current, ShouldEqual, firstSize)
+			So(projected, ShouldEqual, secondProjected)
+
+			repoMeta, err := metaDB.GetRepoMeta(ctx, repo)
+			So(err, ShouldBeNil)
+			So(repoMeta.Size, ShouldEqual, firstSize)
+		})
+
 		Convey("Test SetRepoReference", func() {
 			var (
 				repo1 = "repo1"
@@ -677,11 +747,11 @@ func RunMetaDBTests(t *testing.T, metaDB mTypes.MetaDB, preparationFuncs ...func
 
 			multiImages := []Image{
 				CreateImageWith().RandomLayers(2, 10).
-					ImageConfig(ispec.Image{Platform: ispec.Platform{OS: "multi-os1", Architecture: "multi-arch1"}}).
+					ImageConfig(ispec.Image{OS: "multi-os1", Architecture: "multi-arch1"}).
 					Annotations(map[string]string{ispec.AnnotationVendor: "vendor1"}).
 					Build(),
 				CreateImageWith().RandomLayers(2, 10).
-					ImageConfig(ispec.Image{Platform: ispec.Platform{OS: "multi-os2", Architecture: "multi-arch2"}}).
+					ImageConfig(ispec.Image{OS: "multi-os2", Architecture: "multi-arch2"}).
 					Annotations(map[string]string{ispec.AnnotationVendor: "vendor2"}).
 					Build(),
 			}
@@ -727,6 +797,38 @@ func RunMetaDBTests(t *testing.T, metaDB mTypes.MetaDB, preparationFuncs ...func
 				So(repoMeta.Size, ShouldEqual, indexTotalSize)
 			})
 
+			Convey("Setting an index before its manifests", func() {
+				// sparse on-demand sync commits the index by tag first and the platform manifests
+				// later, by digest, when they are requested
+				err := metaDB.SetRepoReference(ctx, repo1, tag1, imgMulti.AsImageMeta())
+				So(err, ShouldBeNil)
+
+				err = metaDB.SetRepoReference(ctx, repo1, imgMulti.Images[0].DigestStr(),
+					imgMulti.Images[0].AsImageMeta())
+				So(err, ShouldBeNil)
+
+				image1TotalSize := multiImages[0].ManifestDescriptor.Size + multiImages[0].ConfigDescriptor.Size + 2*10
+
+				repoMeta, err := metaDB.GetRepoMeta(ctx, repo1)
+				So(err, ShouldBeNil)
+				So(repoMeta.Platforms, ShouldContain, ispec.Platform{OS: "multi-os1", Architecture: "multi-arch1"})
+				So(repoMeta.Platforms, ShouldNotContain, ispec.Platform{OS: "multi-os2", Architecture: "multi-arch2"})
+				So(repoMeta.Vendors, ShouldContain, "vendor1")
+				So(repoMeta.Size, ShouldEqual, image1TotalSize+imgMulti.IndexDescriptor.Size)
+
+				err = metaDB.SetRepoReference(ctx, repo1, imgMulti.Images[1].DigestStr(),
+					imgMulti.Images[1].AsImageMeta())
+				So(err, ShouldBeNil)
+
+				image2TotalSize := multiImages[1].ManifestDescriptor.Size + multiImages[1].ConfigDescriptor.Size + 2*10
+
+				repoMeta, err = metaDB.GetRepoMeta(ctx, repo1)
+				So(err, ShouldBeNil)
+				So(repoMeta.Platforms, ShouldContain, ispec.Platform{OS: "multi-os2", Architecture: "multi-arch2"})
+				So(repoMeta.Vendors, ShouldContain, "vendor2")
+				So(repoMeta.Size, ShouldEqual, image1TotalSize+image2TotalSize+imgMulti.IndexDescriptor.Size)
+			})
+
 			Convey("Set multiple repos", func() {
 				err := metaDB.SetRepoReference(ctx, repo1, tag1, imgData1)
 				So(err, ShouldBeNil)
@@ -757,7 +859,7 @@ func RunMetaDBTests(t *testing.T, metaDB mTypes.MetaDB, preparationFuncs ...func
 
 			Convey("Check repo blobs info for manifest image", func() {
 				image1 := CreateImageWith().RandomLayers(2, 10).
-					ImageConfig(ispec.Image{Platform: ispec.Platform{OS: "os1", Architecture: "arch1"}}).
+					ImageConfig(ispec.Image{OS: "os1", Architecture: "arch1"}).
 					Annotations(map[string]string{ispec.AnnotationVendor: "vendor1"}).
 					Build()
 				imageMeta1 := image1.AsImageMeta()
@@ -776,7 +878,7 @@ func RunMetaDBTests(t *testing.T, metaDB mTypes.MetaDB, preparationFuncs ...func
 
 				image2 := CreateImageWith().
 					LayerBlobs(image1.Layers).
-					ImageConfig(ispec.Image{Platform: ispec.Platform{OS: "os2", Architecture: "arch2"}}).
+					ImageConfig(ispec.Image{OS: "os2", Architecture: "arch2"}).
 					Annotations(map[string]string{ispec.AnnotationVendor: "vendor2"}).
 					Build()
 				imageMeta2 := image2.AsImageMeta()
@@ -846,6 +948,26 @@ func RunMetaDBTests(t *testing.T, metaDB mTypes.MetaDB, preparationFuncs ...func
 				repoMeta, err := metaDB.GetRepoMeta(ctx, repo1)
 				So(err, ShouldBeNil)
 				So(*repoMeta.LastUpdatedImage.LastUpdated, ShouldEqual, time.Date(2011, 3, 1, 12, 0, 0, 0, time.UTC))
+			})
+
+			Convey("Check last updated for an index set before its manifests", func() {
+				config := GetDefaultConfig()
+				config.Created = DateRef(2011, 3, 1, 12, 0, 0, 0, time.UTC)
+
+				image := CreateMultiarchWith().Images([]Image{
+					CreateImageWith().RandomLayers(1, 10).ImageConfig(config).Build(),
+				}).Build()
+
+				err := metaDB.SetRepoReference(ctx, repo1, tag1, image.AsImageMeta())
+				So(err, ShouldBeNil)
+
+				err = metaDB.SetRepoReference(ctx, repo1, image.Images[0].DigestStr(), image.Images[0].AsImageMeta())
+				So(err, ShouldBeNil)
+
+				repoMeta, err := metaDB.GetRepoMeta(ctx, repo1)
+				So(err, ShouldBeNil)
+				So(*repoMeta.LastUpdatedImage.LastUpdated, ShouldEqual, time.Date(2011, 3, 1, 12, 0, 0, 0, time.UTC))
+				So(repoMeta.LastUpdatedImage.Tag, ShouldEqual, tag1)
 			})
 
 			Convey("PushedBy field behavior", func() {
@@ -957,7 +1079,7 @@ func RunMetaDBTests(t *testing.T, metaDB mTypes.MetaDB, preparationFuncs ...func
 
 			image1 := CreateImageWith().
 				RandomLayers(2, 10).
-				ImageConfig(ispec.Image{Platform: ispec.Platform{OS: "os1", Architecture: "arch1"}}).
+				ImageConfig(ispec.Image{OS: "os1", Architecture: "arch1"}).
 				Annotations(map[string]string{ispec.AnnotationVendor: "vendor1"}).
 				Build()
 			imageMeta1 := image1.AsImageMeta()
@@ -965,7 +1087,7 @@ func RunMetaDBTests(t *testing.T, metaDB mTypes.MetaDB, preparationFuncs ...func
 
 			image2 := CreateImageWith().
 				LayerBlobs(image1.Layers).
-				ImageConfig(ispec.Image{Platform: ispec.Platform{OS: "os2", Architecture: "arch2"}}).
+				ImageConfig(ispec.Image{OS: "os2", Architecture: "arch2"}).
 				Annotations(map[string]string{ispec.AnnotationVendor: "vendor2", "annotation": "test"}).
 				Build()
 			imageMeta2 := image2.AsImageMeta()
@@ -1005,6 +1127,26 @@ func RunMetaDBTests(t *testing.T, metaDB mTypes.MetaDB, preparationFuncs ...func
 				So(repoMeta.Size, ShouldEqual, image1Size)
 				So(repoMeta.Platforms, ShouldNotContain, ispec.Platform{OS: "os2", Architecture: "arch2"})
 				So(repoMeta.Vendors, ShouldNotContain, "vendor2")
+			})
+
+			Convey("Removing the last tag keeps statistics of the now untagged manifest", func() {
+				err = metaDB.RemoveRepoReference(repo, tag1, imageMeta1.Digest)
+				So(err, ShouldBeNil)
+
+				repoMeta, err := metaDB.GetRepoMeta(ctx, repo)
+				So(err, ShouldBeNil)
+
+				_, ok := repoMeta.Statistics[imageMeta1.Digest.String()]
+				So(ok, ShouldBeTrue)
+
+				err = metaDB.RemoveRepoReference(repo, imageMeta1.Digest.String(), imageMeta1.Digest)
+				So(err, ShouldBeNil)
+
+				repoMeta, err = metaDB.GetRepoMeta(ctx, repo)
+				So(err, ShouldBeNil)
+
+				_, ok = repoMeta.Statistics[imageMeta1.Digest.String()]
+				So(ok, ShouldBeFalse)
 			})
 
 			Convey("Delete inexistent reference from repo", func() {
@@ -1057,21 +1199,21 @@ func RunMetaDBTests(t *testing.T, metaDB mTypes.MetaDB, preparationFuncs ...func
 
 			image1 := CreateImageWith().
 				RandomLayers(2, 10).
-				ImageConfig(ispec.Image{Platform: ispec.Platform{OS: "os1", Architecture: "arch1"}}).
+				ImageConfig(ispec.Image{OS: "os1", Architecture: "arch1"}).
 				Annotations(map[string]string{ispec.AnnotationVendor: "vendor1"}).
 				Build()
 			imageMeta1 := image1.AsImageMeta()
 
 			image2 := CreateImageWith().
 				LayerBlobs(image1.Layers).
-				ImageConfig(ispec.Image{Platform: ispec.Platform{OS: "os2", Architecture: "arch2"}}).
+				ImageConfig(ispec.Image{OS: "os2", Architecture: "arch2"}).
 				Annotations(map[string]string{ispec.AnnotationVendor: "vendor2"}).
 				Build()
 			imageMeta2 := image2.AsImageMeta()
 
 			image3 := CreateImageWith().
 				LayerBlobs(image1.Layers).
-				ImageConfig(ispec.Image{Platform: ispec.Platform{OS: "os3", Architecture: "arch3"}}).
+				ImageConfig(ispec.Image{OS: "os3", Architecture: "arch3"}).
 				Annotations(map[string]string{ispec.AnnotationVendor: "vendor3"}).
 				Build()
 			imageMeta3 := image3.AsImageMeta()
@@ -1662,7 +1804,7 @@ func RunMetaDBTests(t *testing.T, metaDB mTypes.MetaDB, preparationFuncs ...func
 			err = metaDB.AddManifestSignature(repo1, image1.Digest, mTypes.SignatureMetadata{
 				SignatureType:   "cosign",
 				SignatureDigest: "digest",
-				LayersInfo:      []mTypes.LayerInfo{{LayerDigest: "layer-digest", LayerContent: []byte{10}}},
+				LayersInfo:      []mTypes.LayerInfo{{LayerDigest: "layer-digest"}},
 			})
 			So(err, ShouldBeNil)
 
@@ -1670,7 +1812,7 @@ func RunMetaDBTests(t *testing.T, metaDB mTypes.MetaDB, preparationFuncs ...func
 				SignatureType:   "cosign",
 				SignatureTag:    fmt.Sprintf("sha256-%s.sig", image1.Digest.Encoded()),
 				SignatureDigest: "digesttag",
-				LayersInfo:      []mTypes.LayerInfo{{LayerDigest: "layer-digest", LayerContent: []byte{10}}},
+				LayersInfo:      []mTypes.LayerInfo{{LayerDigest: "layer-digest"}},
 			})
 			So(err, ShouldBeNil)
 
@@ -1687,13 +1829,112 @@ func RunMetaDBTests(t *testing.T, metaDB mTypes.MetaDB, preparationFuncs ...func
 			So(err, ShouldBeNil)
 			So(fullImageMeta.Signatures["cosign"][0].SignatureManifestDigest, ShouldResemble, "digesttag")
 			So(fullImageMeta.Signatures["cosign"][0].LayersInfo[0].LayerDigest, ShouldResemble, "layer-digest")
-			So(fullImageMeta.Signatures["cosign"][0].LayersInfo[0].LayerContent[0], ShouldEqual, 10)
 			So(fullImageMeta.Signatures["cosign"][1].SignatureManifestDigest, ShouldResemble, "digest")
 			So(fullImageMeta.Signatures["cosign"][1].LayersInfo[0].LayerDigest, ShouldResemble, "layer-digest")
-			So(fullImageMeta.Signatures["cosign"][1].LayersInfo[0].LayerContent[0], ShouldEqual, 10)
 		})
 
 		Convey("Test UpdateSignaturesValidity", func() {
+			Convey("the MetaDB stays writable while signatures are verified", func() {
+				var (
+					repo1     = "repo1"
+					tag1      = "0.0.1"
+					image1    = CreateRandomImage()
+					sigDigest = godigest.FromString("signature").String()
+				)
+
+				err := metaDB.SetRepoReference(ctx, repo1, tag1, image1.AsImageMeta())
+				So(err, ShouldBeNil)
+
+				err = metaDB.AddManifestSignature(repo1, image1.Digest(), mTypes.SignatureMetadata{
+					SignatureType:   "cosign",
+					SignatureDigest: sigDigest,
+					LayersInfo:      []mTypes.LayerInfo{{LayerDigest: godigest.FromString("layer").String()}},
+				})
+				So(err, ShouldBeNil)
+
+				originalTrustStore := metaDB.ImageTrustStore()
+				defer metaDB.SetImageTrustStore(originalTrustStore)
+
+				// the signature is removed while it is being verified
+				var deleteErr error
+
+				metaDB.SetImageTrustStore(trustStoreFunc(func() (mTypes.Author, mTypes.ExpiryDate, mTypes.Validity, error) {
+					deleteErr = metaDB.DeleteSignature(repo1, image1.Digest(), mTypes.SignatureMetadata{
+						SignatureType:   "cosign",
+						SignatureDigest: sigDigest,
+					})
+
+					return "author", time.Time{}, true, nil
+				}))
+
+				done := make(chan error, 1)
+
+				go func() { done <- metaDB.UpdateSignaturesValidity(ctx, repo1, image1.Digest()) }()
+
+				select {
+				case err = <-done:
+				case <-time.After(30 * time.Second):
+					So("UpdateSignaturesValidity blocked a MetaDB write made during verification", ShouldBeEmpty)
+				}
+
+				So(err, ShouldBeNil)
+				So(deleteErr, ShouldBeNil)
+
+				// and the deleted signature is not written back
+				repoMeta, err := metaDB.GetRepoMeta(ctx, repo1)
+				So(err, ShouldBeNil)
+
+				for _, sigInfo := range repoMeta.Signatures[image1.DigestStr()]["cosign"] {
+					So(sigInfo.SignatureManifestDigest, ShouldNotEqual, sigDigest)
+				}
+			})
+
+			Convey("a verification cancelled midway writes nothing", func() {
+				var (
+					repo1  = "repo1"
+					image1 = CreateRandomImage()
+				)
+
+				err := metaDB.SetRepoReference(ctx, repo1, "0.0.1", image1.AsImageMeta())
+				So(err, ShouldBeNil)
+
+				// two signature types, so that verification checks the context again after the first one
+				for _, sigType := range []string{"cosign", "notation"} {
+					err = metaDB.AddManifestSignature(repo1, image1.Digest(), mTypes.SignatureMetadata{
+						SignatureType:   sigType,
+						SignatureDigest: godigest.FromString(sigType).String(),
+						LayersInfo:      []mTypes.LayerInfo{{LayerDigest: godigest.FromString(sigType + "-layer").String()}},
+					})
+					So(err, ShouldBeNil)
+				}
+
+				originalTrustStore := metaDB.ImageTrustStore()
+				defer metaDB.SetImageTrustStore(originalTrustStore)
+
+				verifyCtx, cancel := context.WithCancel(ctx)
+				defer cancel()
+
+				metaDB.SetImageTrustStore(trustStoreFunc(func() (mTypes.Author, mTypes.ExpiryDate, mTypes.Validity, error) {
+					cancel()
+
+					return "author", time.Time{}, true, nil
+				}))
+
+				err = metaDB.UpdateSignaturesValidity(verifyCtx, repo1, image1.Digest())
+				So(err, ShouldEqual, context.Canceled)
+
+				repoMeta, err := metaDB.GetRepoMeta(ctx, repo1)
+				So(err, ShouldBeNil)
+
+				for _, sigs := range repoMeta.Signatures[image1.DigestStr()] {
+					for _, sigInfo := range sigs {
+						for _, layerInfo := range sigInfo.LayersInfo {
+							So(layerInfo.Signer, ShouldBeEmpty)
+						}
+					}
+				}
+			})
+
 			Convey("untrusted signature", func() {
 				var (
 					repo1  = "repo1"
@@ -1704,7 +1945,7 @@ func RunMetaDBTests(t *testing.T, metaDB mTypes.MetaDB, preparationFuncs ...func
 				err := metaDB.SetRepoReference(ctx, repo1, tag1, image1.AsImageMeta())
 				So(err, ShouldBeNil)
 
-				layerInfo := mTypes.LayerInfo{LayerDigest: "", LayerContent: []byte{}, SignatureKey: ""}
+				layerInfo := mTypes.LayerInfo{LayerDigest: "", SignatureKey: ""}
 
 				err = metaDB.AddManifestSignature(repo1, image1.Digest(), mTypes.SignatureMetadata{
 					SignatureType:   "cosign",
@@ -1792,10 +2033,7 @@ func RunMetaDBTests(t *testing.T, metaDB mTypes.MetaDB, preparationFuncs ...func
 				sig, _, err := newSigner.Sign(ctx, descToSign, signOpts)
 				So(err, ShouldBeNil)
 
-				layerInfo := mTypes.LayerInfo{
-					LayerDigest:  string(godigest.FromBytes(sig)),
-					LayerContent: sig, SignatureKey: mediaType,
-				}
+				layerInfo := mTypes.LayerInfo{LayerDigest: string(godigest.FromBytes(sig)), SignatureKey: mediaType}
 
 				err = metaDB.AddManifestSignature(repo, image1.Digest(), mTypes.SignatureMetadata{
 					SignatureType:   "notation",
@@ -1815,6 +2053,16 @@ func RunMetaDBTests(t *testing.T, metaDB mTypes.MetaDB, preparationFuncs ...func
 				imgTrustStore, ok := metaDB.ImageTrustStore().(*imagetrust.ImageTrustStore)
 				So(ok, ShouldBeTrue)
 
+				// the signature layer is loaded from storage when it is verified
+				imgTrustStore.GetSignatureBlob = func(repo string, digest godigest.Digest) ([]byte, error) {
+					if digest != godigest.FromBytes(sig) {
+						return nil, zerr.ErrBlobNotFound
+					}
+
+					return sig, nil
+				}
+				defer func() { imgTrustStore.GetSignatureBlob = nil }()
+
 				err = imagetrust.UploadCertificate(imgTrustStore.NotationStorage, certificateContent, "ca")
 				So(err, ShouldBeNil)
 
@@ -1828,6 +2076,32 @@ func RunMetaDBTests(t *testing.T, metaDB mTypes.MetaDB, preparationFuncs ...func
 					ShouldNotBeEmpty)
 				So(repoData.Signatures[image1.DigestStr()]["notation"][0].LayersInfo[0].Date,
 					ShouldNotBeZeroValue)
+
+				Convey("a signature layer gone from storage is no longer trusted", func() {
+					imgTrustStore.GetSignatureBlob = func(repo string, digest godigest.Digest) ([]byte, error) {
+						return nil, zerr.ErrBlobNotFound
+					}
+
+					err = metaDB.UpdateSignaturesValidity(ctx, repo, image1.Digest()) //nolint:contextcheck
+					So(err, ShouldBeNil)
+
+					repoData, err := metaDB.GetRepoMeta(ctx, repo)
+					So(err, ShouldBeNil)
+					So(repoData.Signatures[image1.DigestStr()]["notation"][0].LayersInfo[0].Signer, ShouldBeEmpty)
+				})
+
+				Convey("a signature layer that cannot be loaded right now keeps its validity", func() {
+					imgTrustStore.GetSignatureBlob = func(repo string, digest godigest.Digest) ([]byte, error) {
+						return nil, errStorageUnavailable
+					}
+
+					err = metaDB.UpdateSignaturesValidity(ctx, repo, image1.Digest()) //nolint:contextcheck
+					So(err, ShouldBeNil)
+
+					repoData, err := metaDB.GetRepoMeta(ctx, repo)
+					So(err, ShouldBeNil)
+					So(repoData.Signatures[image1.DigestStr()]["notation"][0].LayersInfo[0].Signer, ShouldNotBeEmpty)
+				})
 			})
 		})
 
@@ -1862,6 +2136,16 @@ func RunMetaDBTests(t *testing.T, metaDB mTypes.MetaDB, preparationFuncs ...func
 			)
 
 			err := metaDB.SetRepoReference(ctx, repo1, tag1, image1.AsImageMeta())
+			So(err, ShouldBeNil)
+
+			// SetRepoReference pre-creates Signatures[digest] with no typed entries.
+			// Deleting a cosign signature that was never added must not panic.
+			So(func() {
+				err = metaDB.DeleteSignature(repo1, image1.Digest(), mTypes.SignatureMetadata{
+					SignatureType:   "cosign",
+					SignatureDigest: "never-added-digest",
+				})
+			}, ShouldNotPanic)
 			So(err, ShouldBeNil)
 
 			err = metaDB.AddManifestSignature(repo1, image1.Digest(), mTypes.SignatureMetadata{
@@ -2941,8 +3225,8 @@ func RunMetaDBTests(t *testing.T, metaDB mTypes.MetaDB, preparationFuncs ...func
 			So(err, ShouldBeNil)
 
 			indexMultiArchMiddle1 := ispec.Index{
-				Versioned: specs.Versioned{SchemaVersion: 2},
-				MediaType: ispec.MediaTypeImageIndex,
+				SchemaVersion: 2,
+				MediaType:     ispec.MediaTypeImageIndex,
 				Manifests: []ispec.Descriptor{
 					{
 						Digest:    multiArchBottom11.IndexDescriptor.Digest,
@@ -2983,8 +3267,8 @@ func RunMetaDBTests(t *testing.T, metaDB mTypes.MetaDB, preparationFuncs ...func
 			So(err, ShouldBeNil)
 
 			indexMultiArchMiddle2 := ispec.Index{
-				Versioned: specs.Versioned{SchemaVersion: 2},
-				MediaType: ispec.MediaTypeImageIndex,
+				SchemaVersion: 2,
+				MediaType:     ispec.MediaTypeImageIndex,
 				Manifests: []ispec.Descriptor{
 					{
 						Digest:    multiArchBottom21.IndexDescriptor.Digest,
@@ -3021,8 +3305,8 @@ func RunMetaDBTests(t *testing.T, metaDB mTypes.MetaDB, preparationFuncs ...func
 			So(err, ShouldBeNil)
 
 			indexMultiArchTop := ispec.Index{
-				Versioned: specs.Versioned{SchemaVersion: 2},
-				MediaType: ispec.MediaTypeImageIndex,
+				SchemaVersion: 2,
+				MediaType:     ispec.MediaTypeImageIndex,
 				Manifests: []ispec.Descriptor{
 					{
 						Digest:    indexMultiArchMiddle1Digest,

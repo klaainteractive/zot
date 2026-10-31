@@ -2,11 +2,49 @@ package sync_test
 
 import (
 	"testing"
+	"time"
 
 	. "github.com/smartystreets/goconvey/convey"
 
 	syncconf "zotregistry.dev/zot/v2/pkg/extensions/config/sync"
+	syncConstants "zotregistry.dev/zot/v2/pkg/extensions/sync/constants"
 )
+
+func TestRegistryConfig_IsOnDemandInBackgroundEnabled(t *testing.T) {
+	Convey("IsOnDemandInBackgroundEnabled", t, func() {
+		Convey("returns false when OnDemandInBackground is nil", func() {
+			cfg := syncconf.RegistryConfig{}
+			So(cfg.IsOnDemandInBackgroundEnabled(), ShouldBeFalse)
+		})
+
+		Convey("returns the configured value", func() {
+			enabled := true
+			cfg := syncconf.RegistryConfig{OnDemandInBackground: &enabled}
+			So(cfg.IsOnDemandInBackgroundEnabled(), ShouldBeTrue)
+
+			enabled = false
+			So(cfg.IsOnDemandInBackgroundEnabled(), ShouldBeFalse)
+		})
+	})
+}
+
+func TestRegistryConfig_SetDockerCompat(t *testing.T) {
+	Convey("SetDockerCompat", t, func() {
+		Convey("nil receiver is a no-op", func() {
+			var nilCfg *syncconf.RegistryConfig
+			So(func() { nilCfg.SetDockerCompat(true) }, ShouldNotPanic)
+		})
+
+		Convey("sets dockerCompat on a real config", func() {
+			cfg := &syncconf.RegistryConfig{}
+			So(cfg.IsDockerCompatEnabled(), ShouldBeFalse)
+			cfg.SetDockerCompat(true)
+			So(cfg.IsDockerCompatEnabled(), ShouldBeTrue)
+			cfg.SetDockerCompat(false)
+			So(cfg.IsDockerCompatEnabled(), ShouldBeFalse)
+		})
+	})
+}
 
 func TestRegistryConfig_ShouldSyncLegacyCosignTags(t *testing.T) {
 	Convey("ShouldSyncLegacyCosignTags", t, func() {
@@ -26,6 +64,79 @@ func TestRegistryConfig_ShouldSyncLegacyCosignTags(t *testing.T) {
 			v := false
 			cfg := syncconf.RegistryConfig{SyncLegacyCosignTags: &v}
 			So(cfg.ShouldSyncLegacyCosignTags(), ShouldBeFalse)
+		})
+	})
+}
+
+func TestRegistryConfig_IsStreamEnabled(t *testing.T) {
+	Convey("IsStreamEnabled", t, func() {
+		Convey("returns false when Stream is nil (default)", func() {
+			cfg := syncconf.RegistryConfig{}
+			So(cfg.Stream, ShouldBeNil)
+			So(cfg.IsStreamEnabled(), ShouldBeFalse)
+		})
+
+		Convey("returns true when Stream is true", func() {
+			v := true
+			cfg := syncconf.RegistryConfig{Stream: &v}
+			So(cfg.IsStreamEnabled(), ShouldBeTrue)
+		})
+
+		Convey("returns false when Stream is false", func() {
+			v := false
+			cfg := syncconf.RegistryConfig{Stream: &v}
+			So(cfg.IsStreamEnabled(), ShouldBeFalse)
+		})
+	})
+}
+
+func TestRegistryConfig_ManifestCheckInterval(t *testing.T) {
+	Convey("ManifestCheckInterval", t, func() {
+		Convey("defaults to zero, which keeps checking upstream on every request", func() {
+			cfg := syncconf.RegistryConfig{}
+			So(cfg.ManifestCheckInterval, ShouldEqual, time.Duration(0))
+		})
+
+		Convey("holds the configured duration", func() {
+			cfg := syncconf.RegistryConfig{ManifestCheckInterval: 10 * time.Minute}
+			So(cfg.ManifestCheckInterval, ShouldEqual, 10*time.Minute)
+		})
+	})
+}
+
+func TestRegistryConfig_SyncTimeoutOrDefault(t *testing.T) {
+	Convey("SyncTimeoutOrDefault", t, func() {
+		Convey("returns default when unset", func() {
+			So(syncconf.RegistryConfig{}.SyncTimeoutOrDefault(), ShouldEqual, syncConstants.DefaultSyncTimeout)
+		})
+
+		Convey("returns configured value", func() {
+			cfg := syncconf.RegistryConfig{SyncTimeout: 2 * time.Hour}
+			So(cfg.SyncTimeoutOrDefault(), ShouldEqual, 2*time.Hour)
+		})
+	})
+}
+
+func TestConfig_LargestSyncTimeout(t *testing.T) {
+	Convey("LargestSyncTimeout", t, func() {
+		Convey("returns default when sync is nil", func() {
+			So((*syncconf.Config)(nil).LargestSyncTimeout(), ShouldEqual, syncConstants.DefaultSyncTimeout)
+		})
+
+		Convey("returns default when no registries are configured", func() {
+			So((&syncconf.Config{}).LargestSyncTimeout(), ShouldEqual, syncConstants.DefaultSyncTimeout)
+		})
+
+		Convey("returns largest per-registry timeout with defaults applied", func() {
+			cfg := &syncconf.Config{
+				Registries: []syncconf.RegistryConfig{
+					{SyncTimeout: 2 * time.Hour},
+					{},
+					{SyncTimeout: 4 * time.Hour},
+				},
+			}
+
+			So(cfg.LargestSyncTimeout(), ShouldEqual, 4*time.Hour)
 		})
 	})
 }

@@ -297,7 +297,7 @@ func TestBaseOciLayoutUtils(t *testing.T) {
 		conf.Storage.RootDirectory = dir
 		defaultVal := true
 		conf.Extensions = &extconf.ExtensionConfig{
-			Search: &extconf.SearchConfig{BaseConfig: extconf.BaseConfig{Enable: &defaultVal}},
+			Search: &extconf.SearchConfig{Enable: &defaultVal},
 		}
 
 		conf.Extensions.Search.CVE = nil
@@ -342,7 +342,7 @@ func TestBaseOciLayoutUtils(t *testing.T) {
 		conf.Storage.RootDirectory = dir
 		defaultVal := true
 		conf.Extensions = &extconf.ExtensionConfig{
-			Search: &extconf.SearchConfig{BaseConfig: extconf.BaseConfig{Enable: &defaultVal}},
+			Search: &extconf.SearchConfig{Enable: &defaultVal},
 		}
 
 		conf.Extensions.Search.CVE = nil
@@ -388,7 +388,7 @@ func TestBaseOciLayoutUtils(t *testing.T) {
 		conf.Storage.RootDirectory = dir
 		defaultVal := true
 		conf.Extensions = &extconf.ExtensionConfig{
-			Search: &extconf.SearchConfig{BaseConfig: extconf.BaseConfig{Enable: &defaultVal}},
+			Search: &extconf.SearchConfig{Enable: &defaultVal},
 		}
 
 		conf.Extensions.Search.CVE = nil
@@ -430,7 +430,7 @@ func TestExtractImageDetails(t *testing.T) {
 		dir := t.TempDir()
 		testLogger := log.NewTestLogger()
 		imageStore := local.NewImageStore(dir, false, false,
-			testLogger, monitoring.NewMetricsServer(false, testLogger), nil, nil, nil, nil)
+			testLogger, monitoring.NewNopMetricServer(), nil, nil, nil, nil)
 
 		storeController := storage.StoreController{
 			DefaultStore: imageStore,
@@ -454,7 +454,7 @@ func TestExtractImageDetails(t *testing.T) {
 		dir := t.TempDir()
 		testLogger := log.NewTestLogger()
 		imageStore := local.NewImageStore(dir, false, false,
-			testLogger, monitoring.NewMetricsServer(false, testLogger), nil, nil, nil, nil)
+			testLogger, monitoring.NewNopMetricServer(), nil, nil, nil, nil)
 
 		storeController := storage.StoreController{
 			DefaultStore: imageStore,
@@ -463,7 +463,8 @@ func TestExtractImageDetails(t *testing.T) {
 		olu := ociutils.NewBaseOciLayoutUtils(storeController, testLogger)
 		resDigest, resManifest, resIspecImage, resErr := olu.ExtractImageDetails("zot-test",
 			"latest", testLogger)
-		So(resErr, ShouldEqual, zerr.ErrRepoNotFound)
+		// GetImageManifest wraps Missing with ErrRepoNotFound (cause kept).
+		So(errors.Is(resErr, zerr.ErrRepoNotFound), ShouldBeTrue)
 		So(string(resDigest), ShouldEqual, "")
 		So(resManifest, ShouldBeNil)
 
@@ -474,7 +475,7 @@ func TestExtractImageDetails(t *testing.T) {
 		dir := t.TempDir()
 		testLogger := log.NewTestLogger()
 		imageStore := local.NewImageStore(dir, false, false,
-			testLogger, monitoring.NewMetricsServer(false, testLogger), nil, nil, nil, nil)
+			testLogger, monitoring.NewNopMetricServer(), nil, nil, nil, nil)
 
 		storeController := storage.StoreController{
 			DefaultStore: imageStore,
@@ -492,7 +493,7 @@ func TestExtractImageDetails(t *testing.T) {
 
 		olu := ociutils.NewBaseOciLayoutUtils(storeController, testLogger)
 		resDigest, resManifest, resIspecImage, resErr := olu.ExtractImageDetails("zot-test", "latest", testLogger)
-		So(resErr, ShouldEqual, zerr.ErrBlobNotFound)
+		So(errors.Is(resErr, zerr.ErrBlobNotFound), ShouldBeTrue)
 		So(string(resDigest), ShouldEqual, "")
 		So(resManifest, ShouldBeNil)
 		So(resIspecImage, ShouldBeNil)

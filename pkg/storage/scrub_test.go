@@ -20,12 +20,14 @@ import (
 
 	zerr "zotregistry.dev/zot/v2/errors"
 	rediscfg "zotregistry.dev/zot/v2/pkg/api/config/redis"
+	"zotregistry.dev/zot/v2/pkg/compat"
 	"zotregistry.dev/zot/v2/pkg/extensions/monitoring"
 	"zotregistry.dev/zot/v2/pkg/log"
 	"zotregistry.dev/zot/v2/pkg/storage"
 	"zotregistry.dev/zot/v2/pkg/storage/cache"
 	common "zotregistry.dev/zot/v2/pkg/storage/common"
 	storageConstants "zotregistry.dev/zot/v2/pkg/storage/constants"
+	"zotregistry.dev/zot/v2/pkg/storage/errclass"
 	"zotregistry.dev/zot/v2/pkg/storage/local"
 	storageTypes "zotregistry.dev/zot/v2/pkg/storage/types"
 	. "zotregistry.dev/zot/v2/pkg/test/image-utils"
@@ -44,9 +46,8 @@ func TestLocalCheckAllBlobsIntegrity(t *testing.T) {
 	Convey("test with local storage", t, func() {
 		tdir := t.TempDir()
 		log := log.NewTestLogger()
-		metrics := monitoring.NewMetricsServer(false, log)
+		metrics := monitoring.NewNopMetricServer()
 
-		defer metrics.Stop() // Clean up metrics server to prevent resource leaks
 		cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
 			RootDir:     tdir,
 			Name:        "cache",
@@ -66,7 +67,7 @@ func TestRedisCheckAllBlobsIntegrity(t *testing.T) {
 		tdir := t.TempDir()
 		log := log.NewTestLogger()
 
-		metrics := monitoring.NewMetricsServer(false, log)
+		metrics := monitoring.NewNopMetricServer()
 
 		client, _ := rediscfg.GetRedisClient(map[string]any{"url": "redis://" + miniRedis.Addr()}, log)
 
@@ -140,9 +141,7 @@ func TestScrubDetectsCorruptedConfigContent(t *testing.T) {
 	Convey("scrub detects config corruption that stays valid JSON", t, func() {
 		tdir := t.TempDir()
 		log := log.NewTestLogger()
-		metrics := monitoring.NewMetricsServer(false, log)
-
-		defer metrics.Stop()
+		metrics := monitoring.NewNopMetricServer()
 
 		cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
 			RootDir:     tdir,
@@ -188,6 +187,84 @@ func TestScrubDetectsCorruptedConfigContent(t *testing.T) {
 		space := regexp.MustCompile(`\s+`)
 		actual := strings.TrimSpace(space.ReplaceAllString(buff.String(), " "))
 		So(actual, ShouldContainSubstring, fmt.Sprintf("test 1.0 affected %s bad blob digest", configDig))
+	})
+}
+
+// TestScrubDockerCompat guards D4: scrub must recurse into a docker manifest-list and
+// validate its nested docker manifests' layers/config the same way it does for an OCI
+// index, instead of rejecting every docker manifest as a bad manifest media type.
+func TestScrubDockerCompat(t *testing.T) {
+	Convey("scrub a healthy docker manifest-list image", t, func() {
+		tdir := t.TempDir()
+		log := log.NewTestLogger()
+		metrics := monitoring.NewNopMetricServer()
+
+		compatMediaTypes := []compat.MediaCompatibility{compat.DockerManifestV2SchemaV2}
+		imgStore := local.NewImageStore(tdir, false, false, log, metrics, nil, nil, compatMediaTypes, nil)
+
+		storeCtlr := storage.StoreController{}
+		storeCtlr.DefaultStore = imgStore
+
+		dockerRepo := "docker-compat-scrub"
+
+		dockerList := CreateRandomMultiarch().AsDockerImage()
+
+		err := WriteMultiArchImageToFileSystem(dockerList, dockerRepo, "0.0.1", storeCtlr)
+		So(err, ShouldBeNil)
+
+		buff := bytes.NewBufferString("")
+
+		res, err := storeCtlr.CheckAllBlobsIntegrity(context.Background())
+		res.PrintScrubResults(buff)
+		So(err, ShouldBeNil)
+
+		space := regexp.MustCompile(`\s+`)
+		actual := strings.TrimSpace(space.ReplaceAllString(buff.String(), " "))
+		So(actual, ShouldContainSubstring, dockerRepo+" 0.0.1 ok")
+		So(actual, ShouldNotContainSubstring, "affected")
+	})
+
+	Convey("scrub detects a corrupted docker manifest's config content", t, func() {
+		tdir := t.TempDir()
+		log := log.NewTestLogger()
+		metrics := monitoring.NewNopMetricServer()
+
+		compatMediaTypes := []compat.MediaCompatibility{compat.DockerManifestV2SchemaV2}
+		imgStore := local.NewImageStore(tdir, true, true, log, metrics, nil, nil, compatMediaTypes, nil)
+		driver := local.New(true)
+
+		storeCtlr := storage.StoreController{}
+		storeCtlr.DefaultStore = imgStore
+
+		dockerRepo := "docker-compat-scrub-corrupted"
+
+		dockerList := CreateRandomMultiarch().AsDockerImage()
+
+		err := WriteMultiArchImageToFileSystem(dockerList, dockerRepo, "0.0.1", storeCtlr)
+		So(err, ShouldBeNil)
+
+		// corrupt the first nested docker manifest's config blob on disk, keeping it valid JSON
+		corruptedConfig := dockerList.Images[0].Config
+		corruptedConfig.Architecture += "-corrupted"
+
+		corruptedContent, err := json.Marshal(corruptedConfig)
+		So(err, ShouldBeNil)
+
+		configDig := dockerList.Images[0].ConfigDescriptor.Digest.Encoded()
+		configFile := path.Join(imgStore.RootDir(), dockerRepo, "/blobs/sha256", configDig)
+		_, err = driver.WriteFile(configFile, corruptedContent)
+		So(err, ShouldBeNil)
+
+		buff := bytes.NewBufferString("")
+
+		res, err := storeCtlr.CheckAllBlobsIntegrity(context.Background())
+		res.PrintScrubResults(buff)
+		So(err, ShouldBeNil)
+
+		space := regexp.MustCompile(`\s+`)
+		actual := strings.TrimSpace(space.ReplaceAllString(buff.String(), " "))
+		So(actual, ShouldContainSubstring,
+			fmt.Sprintf("%s 0.0.1 affected %s bad blob digest", dockerRepo, configDig))
 	})
 }
 
@@ -283,6 +360,7 @@ func RunCheckAllBlobsIntegrityTests( //nolint: thelper
 			str := space.ReplaceAllString(buff.String(), " ")
 			actual := strings.TrimSpace(str)
 			So(actual, ShouldContainSubstring, "REPOSITORY TAG STATUS AFFECTED BLOB ERROR")
+			// Top-level listed manifest Missing is soft-skipped (concurrent delete race).
 			So(actual, ShouldNotContainSubstring, "affected")
 
 			index, err := common.GetIndex(imgStore, repoName, log)
@@ -415,7 +493,8 @@ func RunCheckAllBlobsIntegrityTests( //nolint: thelper
 			// get content of layer
 			imageRes := storage.CheckLayers(repoName, tag, []ispec.Descriptor{{Digest: digest}}, imgStore)
 			So(imageRes.Status, ShouldEqual, "affected")
-			So(imageRes.Error, ShouldEqual, "blob not found")
+			// mapStorageErr wraps Missing under ErrBlobNotFound; match the sentinel text.
+			So(imageRes.Error, ShouldContainSubstring, "blob not found")
 
 			buff := bytes.NewBufferString("")
 
@@ -482,6 +561,48 @@ func RunCheckAllBlobsIntegrityTests( //nolint: thelper
 			So(actual, ShouldContainSubstring, missingManifestDig)
 		})
 
+		Convey("Scrub index walks remaining siblings after an affected child", func() {
+			// Present-but-corrupt child used to early-return and skip later siblings.
+			// Corrupt the first child's config, then remove the second child's config so
+			// continuing the walk surfaces the second digest on the tag row (last wins).
+			multiarchImage := CreateMultiarchWith().RandomImages(2).Build()
+			err = WriteMultiArchImageToFileSystem(multiarchImage, repoName, "2.2", storeCtlr)
+			So(err, ShouldBeNil)
+
+			So(len(multiarchImage.Images), ShouldEqual, 2)
+
+			firstConfig := multiarchImage.Images[0].Config
+			firstConfig.Architecture += "-corrupted"
+			corruptedContent, err := json.Marshal(firstConfig)
+			So(err, ShouldBeNil)
+
+			firstConfigDig := multiarchImage.Images[0].ConfigDescriptor.Digest.Encoded()
+			firstConfigFile := path.Join(imgStore.RootDir(), repoName, "/blobs/sha256", firstConfigDig)
+			_, err = driver.WriteFile(firstConfigFile, corruptedContent)
+			So(err, ShouldBeNil)
+
+			secondConfigDig := multiarchImage.Images[1].ConfigDescriptor.Digest.Encoded()
+			secondConfigFile := path.Join(imgStore.RootDir(), repoName, "/blobs/sha256", secondConfigDig)
+			err = driver.Delete(secondConfigFile)
+			So(err, ShouldBeNil)
+
+			buff := bytes.NewBufferString("")
+
+			res, err := storeCtlr.CheckAllBlobsIntegrity(context.Background())
+			res.PrintScrubResults(buff)
+			So(err, ShouldBeNil)
+
+			space := regexp.MustCompile(`\s+`)
+			str := space.ReplaceAllString(buff.String(), " ")
+			actual := strings.TrimSpace(str)
+
+			So(actual, ShouldContainSubstring, "REPOSITORY TAG STATUS AFFECTED BLOB ERROR")
+			So(actual, ShouldContainSubstring, "test 2.2 affected")
+			// Sibling walk reached the second child; tag row reports its missing config.
+			So(actual, ShouldContainSubstring, secondConfigDig)
+			So(actual, ShouldContainSubstring, "blob not found")
+		})
+
 		Convey("Scrub index with non-missing error on manifest blob via file permissions", func() {
 			// Skip for non-local storage (S3/DynamoDB) since we can't chmod remote files
 			if driver.Name() != storageConstants.LocalStorageDriverName {
@@ -542,8 +663,8 @@ func RunCheckAllBlobsIntegrityTests( //nolint: thelper
 			So(actual, ShouldContainSubstring, "test 2.1 affected")
 			// Should report the manifest digest as affected blob
 			So(actual, ShouldContainSubstring, manifestDig)
-			// Should have "bad blob digest" error
-			So(actual, ShouldContainSubstring, "bad blob digest")
+			// Permission denied is classified Permanent — preserve that
+			So(actual, ShouldContainSubstring, "storage backend returned a permanent error")
 		})
 
 		Convey("Scrub index", func() {
@@ -651,6 +772,7 @@ func RunCheckAllBlobsIntegrityTests( //nolint: thelper
 			actual = strings.TrimSpace(str)
 			So(actual, ShouldContainSubstring, "REPOSITORY TAG STATUS AFFECTED BLOB ERROR")
 			So(actual, ShouldContainSubstring, "test 1.0 ok")
+			// Top-level listed index blob Missing is soft-skipped (concurrent delete race).
 			So(actual, ShouldNotContainSubstring, "test affected")
 
 			index.Manifests[0].MediaType = "invalid"
@@ -712,7 +834,8 @@ func RunCheckAllBlobsIntegrityTests( //nolint: thelper
 			str := space.ReplaceAllString(buff.String(), " ")
 			actual := strings.TrimSpace(str)
 			So(actual, ShouldContainSubstring, "REPOSITORY TAG STATUS AFFECTED BLOB ERROR")
-			So(actual, ShouldNotContainSubstring, fmt.Sprintf("test 1.0 affected %s blob not found", manifestDig))
+			// Top-level listed manifest Missing is soft-skipped (concurrent delete race).
+			So(actual, ShouldNotContainSubstring, "test 1.0 affected "+manifestDig+" blob not found")
 
 			index, err := common.GetIndex(imgStore, repoName, log)
 			So(err, ShouldBeNil)
@@ -975,8 +1098,8 @@ func RunCheckAllBlobsIntegrityTests( //nolint: thelper
 			So(actual, ShouldContainSubstring, "test 0.0.6 affected")
 			// Should report the subject digest as affected blob
 			So(actual, ShouldContainSubstring, subjectManifestDig)
-			// Should have "bad blob digest" error
-			So(actual, ShouldContainSubstring, "bad blob digest")
+			// Permission denied is classified Permanent — preserve that, do not rewrite as bad digest
+			So(actual, ShouldContainSubstring, "storage backend returned a permanent error")
 		})
 
 		Convey("scrub with non-missing error on index subject blob via file permissions", func() {
@@ -1024,8 +1147,69 @@ func RunCheckAllBlobsIntegrityTests( //nolint: thelper
 			So(actual, ShouldContainSubstring, "test 0.0.7 affected")
 			// Should report the subject digest as affected blob
 			So(actual, ShouldContainSubstring, subjectManifestDig)
-			// Should have "bad blob digest" error
-			So(actual, ShouldContainSubstring, "bad blob digest")
+			// Permission denied is classified Permanent — preserve that, do not rewrite as bad digest
+			So(actual, ShouldContainSubstring, "storage backend returned a permanent error")
+		})
+	})
+}
+
+// TestCheckRepoTopLevelErrorClasses locks the scrub policy at the index.json
+// listing boundary: Missing soft-skips; Transient is reported as affected.
+func TestCheckRepoTopLevelErrorClasses(t *testing.T) {
+	Convey("CheckRepo top-level GetBlobContent class policy", t, func() {
+		manifestDig := godigest.FromString("top-level-manifest")
+		indexJSON, err := json.Marshal(ispec.Index{
+			SchemaVersion: 2,
+			Manifests: []ispec.Descriptor{
+				{
+					MediaType: ispec.MediaTypeImageManifest,
+					Digest:    manifestDig,
+					Size:      1,
+					Annotations: map[string]string{
+						ispec.AnnotationRefName: "v1",
+					},
+				},
+			},
+		})
+		So(err, ShouldBeNil)
+
+		baseStore := func(getBlobErr error) storageTypes.ImageStore {
+			return mocks.MockedImageStore{
+				ValidateRepoFn: func(string) (bool, error) { return true, nil },
+				GetIndexContentFn: func(string) ([]byte, error) {
+					return indexJSON, nil
+				},
+				GetBlobContentFn: func(string, godigest.Digest) ([]byte, error) {
+					return nil, getBlobErr
+				},
+			}
+		}
+
+		Convey("Missing soft-skips without an affected row", func() {
+			results, err := storage.CheckRepo(context.Background(), "repo",
+				baseStore(errclass.MarkMissing(errors.New("gone")))) //nolint:err113 // test
+			So(err, ShouldBeNil)
+			So(results, ShouldBeEmpty)
+		})
+
+		Convey("Transient is recorded as affected", func() {
+			results, err := storage.CheckRepo(context.Background(), "repo",
+				baseStore(errclass.MarkTransient(errors.New("blip")))) //nolint:err113 // test
+			So(err, ShouldBeNil)
+			So(len(results), ShouldEqual, 1)
+			So(results[0].Status, ShouldEqual, "affected")
+			So(results[0].Tag, ShouldEqual, "v1")
+			So(results[0].AffectedBlob, ShouldEqual, manifestDig.Encoded())
+			So(results[0].Error, ShouldContainSubstring, "transient")
+		})
+
+		Convey("Permanent is recorded as affected", func() {
+			results, err := storage.CheckRepo(context.Background(), "repo",
+				baseStore(errclass.MarkPermanent(errors.New("denied")))) //nolint:err113 // test
+			So(err, ShouldBeNil)
+			So(len(results), ShouldEqual, 1)
+			So(results[0].Status, ShouldEqual, "affected")
+			So(results[0].Error, ShouldContainSubstring, "permanent")
 		})
 	})
 }

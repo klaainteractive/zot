@@ -34,8 +34,14 @@ type Scanner interface {
 	ScanImage(ctx context.Context, image string) (cvemodel.ScanResult, error)
 	IsImageFormatScannable(repo, ref string) (bool, error)
 	IsImageMediaScannable(repo, digestStr, mediaType string) (bool, error)
-	IsResultCached(digestStr string) bool
-	GetCachedResult(digestStr string) map[string]zcommon.CVE
+	// IsResultCached reports whether scan work for digest in repo is already covered by
+	// the per-manifest CVE cache. For manifests this is a direct cache lookup. For indexes
+	// the index digest is never a cache key; complete means every present scannable member
+	// is cached (repo is used for blob presence checks).
+	IsResultCached(repo, digestStr string) bool
+	// GetCachedResult returns cached CVE results for digest in repo. For indexes it returns
+	// the union of present scannable members' cached results when IsResultCached is true.
+	GetCachedResult(repo, digestStr string) map[string]zcommon.CVE
 	UpdateDB(ctx context.Context) error
 }
 
@@ -73,10 +79,7 @@ func (cveinfo BaseCveInfo) GetImageListForCVE(ctx context.Context, repo, cveID s
 	}
 
 	for tag, descriptor := range repoMeta.Tags {
-		if descriptor.MediaType == ispec.MediaTypeImageManifest ||
-			descriptor.MediaType == ispec.MediaTypeImageIndex ||
-			compat.IsCompatibleManifestMediaType(descriptor.MediaType) ||
-			compat.IsCompatibleManifestListMediaType(descriptor.MediaType) {
+		if compat.IsImageManifestMediaType(descriptor.MediaType) || compat.IsImageIndexMediaType(descriptor.MediaType) {
 			manifestDigestStr := descriptor.Digest
 
 			manifestDigest := godigest.Digest(manifestDigestStr)
@@ -100,13 +103,25 @@ func (cveinfo BaseCveInfo) GetImageListForCVE(ctx context.Context, repo, cveID s
 			}
 
 			if _, hasCVE := scanResult.CVEMap[cveID]; hasCVE {
-				imgList = append(imgList, cvemodel.TagInfo{
+				tagInfo := cvemodel.TagInfo{
 					Tag: tag,
 					Descriptor: cvemodel.Descriptor{
 						Digest:    manifestDigest,
 						MediaType: descriptor.MediaType,
 					},
-				})
+				}
+
+				// images are matched by manifest digest, so for an index we also need
+				// to know which of its manifests are affected by the CVE
+				if compat.IsImageIndexMediaType(descriptor.MediaType) {
+					tagInfo.Manifests, err = cveinfo.getIndexManifestsAffectedByCVE(ctx, repo, tag,
+						manifestDigestStr, cveID)
+					if err != nil {
+						return imgList, err
+					}
+				}
+
+				imgList = append(imgList, tagInfo)
 			}
 		} else {
 			cveinfo.Log.Debug().Str("image", repo+":"+tag).Str("mediaType", descriptor.MediaType).
@@ -115,6 +130,57 @@ func (cveinfo BaseCveInfo) GetImageListForCVE(ctx context.Context, repo, cveID s
 	}
 
 	return imgList, nil
+}
+
+// getIndexManifestsAffectedByCVE returns the image manifests of the index which are affected by the CVE.
+// Manifests which can not be scanned are not considered affected.
+func (cveinfo BaseCveInfo) getIndexManifestsAffectedByCVE(ctx context.Context, repo, tag, indexDigestStr,
+	cveID string,
+) ([]cvemodel.DescriptorInfo, error) {
+	affectedManifests := []cvemodel.DescriptorInfo{}
+
+	indexContent, err := getIndexContent(cveinfo.MetaDB, indexDigestStr)
+	if err != nil {
+		cveinfo.Log.Error().Err(err).Str("repository", repo).Str("tag", tag).Str("cve-id", cveID).
+			Msg("failed to retrieve index content")
+
+		return affectedManifests, nil
+	}
+
+	for _, manifest := range indexContent.Manifests {
+		if !compat.IsImageManifestMediaType(manifest.MediaType) {
+			continue
+		}
+
+		manifestDigestStr := manifest.Digest.String()
+		image := zcommon.GetFullImageName(repo, manifestDigestStr)
+
+		isScanableImage, err := cveinfo.Scanner.IsImageMediaScannable(repo, manifestDigestStr, manifest.MediaType)
+		if !isScanableImage || err != nil {
+			cveinfo.Log.Debug().Str("image", image).Err(err).Msg("image is not scanable")
+
+			continue
+		}
+
+		scanResult, err := cveinfo.Scanner.ScanImage(ctx, image)
+		if err != nil {
+			if zcommon.IsContextDone(ctx) {
+				return affectedManifests, err
+			}
+
+			cveinfo.Log.Info().Str("image", image).Err(err).Msg("image scan failed")
+
+			continue
+		}
+
+		if _, hasCVE := scanResult.CVEMap[cveID]; hasCVE {
+			affectedManifests = append(affectedManifests, cvemodel.DescriptorInfo{
+				Digest: manifest.Digest, MediaType: manifest.MediaType,
+			})
+		}
+	}
+
+	return affectedManifests, nil
 }
 
 func (cveinfo BaseCveInfo) GetImageListWithCVEFixed(ctx context.Context, repo, cveID string,
@@ -136,8 +202,7 @@ func (cveinfo BaseCveInfo) GetImageListWithCVEFixed(ctx context.Context, repo, c
 		}
 
 		//nolint:gocritic // cannot convert to switch-case
-		if descriptor.MediaType == ispec.MediaTypeImageManifest ||
-			compat.IsCompatibleManifestMediaType(descriptor.MediaType) {
+		if compat.IsImageManifestMediaType(descriptor.MediaType) {
 			manifestDigestStr := descriptor.Digest
 
 			tagInfo, err := getTagInfoForManifest(tag, manifestDigestStr, cveinfo.MetaDB)
@@ -153,8 +218,7 @@ func (cveinfo BaseCveInfo) GetImageListWithCVEFixed(ctx context.Context, repo, c
 			if cveinfo.isManifestVulnerable(ctx, repo, tag, manifestDigestStr, cveID) {
 				vulnerableTags = append(vulnerableTags, tagInfo)
 			}
-		} else if descriptor.MediaType == ispec.MediaTypeImageIndex ||
-			compat.IsCompatibleManifestListMediaType(descriptor.MediaType) {
+		} else if compat.IsImageIndexMediaType(descriptor.MediaType) {
 			indexDigestStr := descriptor.Digest
 
 			indexContent, err := getIndexContent(cveinfo.MetaDB, indexDigestStr)
@@ -263,8 +327,8 @@ func getTagInfoForManifest(tag, manifestDigestStr string, metaDB mTypes.MetaDB) 
 		Descriptor: cvemodel.Descriptor{Digest: manifestDigest, MediaType: ispec.MediaTypeImageManifest},
 		Manifests: []cvemodel.DescriptorInfo{
 			{
-				Descriptor: cvemodel.Descriptor{Digest: manifestDigest, MediaType: ispec.MediaTypeImageManifest},
-				Timestamp:  lastUpdated,
+				Digest: manifestDigest, MediaType: ispec.MediaTypeImageManifest,
+				Timestamp: lastUpdated,
 			},
 		},
 		Timestamp: lastUpdated,
@@ -509,23 +573,18 @@ func (cveinfo BaseCveInfo) GetCVESummaryForImageMedia(ctx context.Context, repo,
 	// scannable no issues found           - max severity "NONE"        - cve count 0   - no Errors
 	// scannable issues found              - max severity from Scanner  - cve count >0  - no Errors
 	// For this call we only look at the scanner cache, we skip the actual scanning to save time
-	if !cveinfo.Scanner.IsResultCached(digestStr) {
+	if !cveinfo.Scanner.IsResultCached(repo, digestStr) {
 		isValidImage, err := cveinfo.Scanner.IsImageMediaScannable(repo, digestStr, mediaType)
 		if !isValidImage {
 			cveinfo.Log.Debug().Str("digest", digestStr).Str("mediaType", mediaType).
 				Err(err).Msg("image is not scannable")
 		}
 
-		// Counters are initialized with 0 by default
-		imageCVESummary := cvemodel.ImageCVESummary{
-			MaxSeverity: cvemodel.SeverityNotScanned,
-		}
-
-		return imageCVESummary, err
+		return cvemodel.ImageCVESummary{MaxSeverity: cvemodel.SeverityNotScanned}, err
 	}
 
-	// We will make due with cached results
-	cveMap := cveinfo.Scanner.GetCachedResult(digestStr)
+	// We will make do with cached results (indexes: union of member manifest caches)
+	cveMap := cveinfo.Scanner.GetCachedResult(repo, digestStr)
 
 	return initCVESummaryFromCVEMap(cveMap), nil
 }
@@ -549,13 +608,11 @@ func GetFixedTags(allTags, vulnerableTags []cvemodel.TagInfo) []cvemodel.TagInfo
 		vulnerableTagMap[tag.Tag] = tag
 
 		//nolint:gocritic // cannot convert to switch-case
-		if tag.Descriptor.MediaType == ispec.MediaTypeImageManifest ||
-			compat.IsCompatibleManifestMediaType(tag.Descriptor.MediaType) {
+		if compat.IsImageManifestMediaType(tag.Descriptor.MediaType) {
 			if tag.Timestamp.Before(earliestVulnerable.Timestamp) {
 				earliestVulnerable = tag
 			}
-		} else if tag.Descriptor.MediaType == ispec.MediaTypeImageIndex ||
-			compat.IsCompatibleManifestListMediaType(tag.Descriptor.MediaType) {
+		} else if compat.IsImageIndexMediaType(tag.Descriptor.MediaType) {
 			for _, manifestDesc := range tag.Manifests {
 				if manifestDesc.Timestamp.Before(earliestVulnerable.Timestamp) {
 					earliestVulnerable = tag
@@ -575,8 +632,7 @@ func GetFixedTags(allTags, vulnerableTags []cvemodel.TagInfo) []cvemodel.TagInfo
 	// newer images which don't
 	for _, tag := range allTags {
 		//nolint:gocritic // cannot convert to switch-case
-		if tag.Descriptor.MediaType == ispec.MediaTypeImageManifest ||
-			compat.IsCompatibleManifestMediaType(tag.Descriptor.MediaType) {
+		if compat.IsImageManifestMediaType(tag.Descriptor.MediaType) {
 			if tag.Timestamp.Before(earliestVulnerable.Timestamp) {
 				// The vulnerability did not exist at the time this
 				// image was built
@@ -588,8 +644,7 @@ func GetFixedTags(allTags, vulnerableTags []cvemodel.TagInfo) []cvemodel.TagInfo
 			if _, ok := vulnerableTagMap[tag.Tag]; !ok {
 				fixedTags = append(fixedTags, tag)
 			}
-		} else if tag.Descriptor.MediaType == ispec.MediaTypeImageIndex ||
-			compat.IsCompatibleManifestListMediaType(tag.Descriptor.MediaType) {
+		} else if compat.IsImageIndexMediaType(tag.Descriptor.MediaType) {
 			fixedManifests := []cvemodel.DescriptorInfo{}
 
 			// If the latest update inside the index is before the earliest vulnerability found then

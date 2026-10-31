@@ -17,6 +17,7 @@ import (
 	zerr "zotregistry.dev/zot/v2/errors"
 	"zotregistry.dev/zot/v2/pkg/api/config"
 	"zotregistry.dev/zot/v2/pkg/api/constants"
+	apiErr "zotregistry.dev/zot/v2/pkg/api/errors"
 	"zotregistry.dev/zot/v2/pkg/cel"
 	"zotregistry.dev/zot/v2/pkg/common"
 	"zotregistry.dev/zot/v2/pkg/log"
@@ -70,6 +71,37 @@ func NewAccessController(conf *config.Config) *AccessController {
 	}
 }
 
+// repositoriesForUser resolves username placeholders for both request authorization
+// and repository visibility. Static rules override templates resolving to the same
+// pattern, so operators can reserve namespaces using explicit rules.
+func (ac *AccessController) repositoriesForUser(username string) config.Repositories {
+	const placeholder = "${username}"
+
+	repositories := make(config.Repositories, len(ac.Config.Repositories))
+	validUsername := !strings.Contains(username, "/") && zreg.FullNameRegexp.MatchString(username)
+
+	for pattern, policyGroup := range ac.Config.Repositories {
+		if !strings.Contains(pattern, placeholder) {
+			repositories[pattern] = policyGroup
+
+			continue
+		}
+
+		// Anonymous users and names that are not literal repository components
+		// must never expand into a namespace or introduce glob operators.
+		if !validUsername {
+			continue
+		}
+
+		resolved := strings.ReplaceAll(pattern, placeholder, username)
+		if _, static := ac.Config.Repositories[resolved]; !static {
+			repositories[resolved] = policyGroup
+		}
+	}
+
+	return repositories
+}
+
 // getGlobPatterns gets glob patterns from authz config on which <username> has <action> perms.
 // used to filter /v2/_catalog repositories based on user rights.
 func (ac *AccessController) getGlobPatterns(evalReq *evalRequest) map[string]bool {
@@ -79,7 +111,7 @@ func (ac *AccessController) getGlobPatterns(evalReq *evalRequest) map[string]boo
 	groups := evalReq.groups()
 	action := evalReq.action
 
-	for pattern, policyGroup := range ac.Config.Repositories {
+	for pattern, policyGroup := range ac.repositoriesForUser(username) {
 		if username == "" {
 			// check anonymous policy
 			if slices.Contains(policyGroup.AnonymousPolicy, action) {
@@ -138,7 +170,9 @@ func (ac *AccessController) can(httpReq *http.Request, userAc *reqCtx.UserAccess
 ) (bool, string) {
 	var longestMatchedPattern string
 
-	for pattern := range ac.Config.Repositories {
+	repositories := ac.repositoriesForUser(userAc.GetUsername())
+
+	for pattern := range repositories {
 		matched, err := glob.Match(pattern, repository)
 		if err == nil {
 			if matched && len(pattern) > len(longestMatchedPattern) {
@@ -164,7 +198,6 @@ func (ac *AccessController) can(httpReq *http.Request, userAc *reqCtx.UserAccess
 		reason string
 	)
 
-	repositories := ac.Config.GetRepositories()
 	if pg, ok := repositories[longestMatchedPattern]; ok {
 		can, reason = ac.isPermitted(evalReq, pg)
 	}
@@ -253,6 +286,32 @@ func (ac *AccessController) updateUserAccessControl(httpReq *http.Request, userA
 		ac.getGlobPatterns(mkER(constants.DetectManifestCollisionPermission)))
 }
 
+// attachPermissionEvaluator wires config-based policy evaluation into userAc so
+// handlers can use CanOnResource without constructing AccessController.
+func (ac *AccessController) attachPermissionEvaluator(httpReq *http.Request, userAc *reqCtx.UserAccessControl) {
+	userAc.SetPermissionEvaluator(func(action, repository, reference string) bool {
+		ok, _ := ac.can(httpReq, userAc, action, repository, reference)
+
+		return ok
+	})
+}
+
+// attachAdminPolicyEvaluator wires the adminPolicy check, including its conditions, into userAc for
+// admin-only routes. Those routes have no repository or reference, so conditions see them empty.
+func (ac *AccessController) attachAdminPolicyEvaluator(httpReq *http.Request, userAc *reqCtx.UserAccessControl) {
+	userAc.SetAdminPolicyEvaluator(func() (bool, string) {
+		if !ac.isAdmin(userAc.GetUsername(), userAc.GetGroups()) {
+			return false, ""
+		}
+
+		return ac.policyConditionsMet(ac.Config.GetAdminPolicy(), &evalRequest{
+			httpReq: httpReq,
+			userAc:  userAc,
+			isAdmin: true,
+		})
+	})
+}
+
 // getAuthnMiddlewareContext builds ac context(allowed to read repos and if user is admin) and returns it.
 func (ac *AccessController) getAuthnMiddlewareContext(authnType string, request *http.Request) context.Context {
 	amwCtx := reqCtx.AuthnMiddlewareContext{
@@ -305,8 +364,15 @@ func CompileAccessControl(cfg *config.AccessControlConfig) (map[string]any, erro
 		return nil
 	}
 
-	for pattern, pg := range cfg.Repositories {
-		for i, policy := range pg.Policies {
+	for pattern, policyGroup := range cfg.Repositories {
+		for component := range strings.SplitSeq(pattern, "/") {
+			if strings.Contains(component, "${username}") && component != "${username}" {
+				return nil, fmt.Errorf("%w: repositories[%q]: ${username} must be a complete path component",
+					zerr.ErrBadConfig, pattern)
+			}
+		}
+
+		for i, policy := range policyGroup.Policies {
 			if err := compileAll(policy, fmt.Sprintf("repositories[%q].policies[%d]", pattern, i)); err != nil {
 				return nil, err
 			}
@@ -638,12 +704,14 @@ func BaseAuthzHandler(ctlr *Controller) mux.MiddlewareFunc {
 			// get access control context made in authn.go
 			userAc, err := reqCtx.UserAcFromContext(request.Context())
 			if err != nil { // should never happen
-				authFail(response, request, realm, failDelay)
+				authzFailWithReason(response, request, "", authConfig, realm, failDelay, "")
 
 				return
 			}
 
 			aCtlr.updateUserAccessControl(request, userAc)
+			aCtlr.attachPermissionEvaluator(request, userAc)
+			aCtlr.attachAdminPolicyEvaluator(request, userAc)
 			userAc.SaveOnRequest(request)
 
 			next.ServeHTTP(response, request) //nolint:contextcheck
@@ -683,7 +751,7 @@ func DistSpecAuthzHandler(ctlr *Controller) mux.MiddlewareFunc {
 			// get userAc built in authn and previous authz middlewares
 			userAc, err := reqCtx.UserAcFromContext(request.Context())
 			if err != nil { // should never happen
-				authFail(response, request, realm, failDelay)
+				authzFailWithReason(response, request, "", authConfig, realm, failDelay, "")
 
 				return
 			}
@@ -705,6 +773,10 @@ func DistSpecAuthzHandler(ctlr *Controller) mux.MiddlewareFunc {
 						// Fail closed if we cannot verify current tags for this repo.
 						ctlr.Log.Error().Err(repoTagErr).Str("repository", resource).
 							Msg("unable to verify permissions on existing tags")
+						if writeStorageClassError(response, repoTagErr) {
+							return
+						}
+
 						response.WriteHeader(http.StatusInternalServerError)
 
 						return
@@ -715,8 +787,8 @@ func DistSpecAuthzHandler(ctlr *Controller) mux.MiddlewareFunc {
 					denyReason, allowed := authorizeManifestWrite(
 						acCtrlr, request, userAc, resource, reference, repoTags, request.URL.Query()["tag"])
 					if !allowed {
-						common.AuthzFailWithReason(response, request, userAc.GetUsername(),
-							realm, failDelay, denyReason)
+						authzFailWithReason(response, request, userAc.GetUsername(),
+							authConfig, realm, failDelay, denyReason)
 
 						return
 					}
@@ -733,12 +805,48 @@ func DistSpecAuthzHandler(ctlr *Controller) mux.MiddlewareFunc {
 
 			can, denyReason := acCtrlr.can(request, userAc, action, resource, reference) //nolint:contextcheck
 			if !can {
-				common.AuthzFailWithReason(response, request, userAc.GetUsername(), realm, failDelay, denyReason)
+				authzFailWithReason(response, request, userAc.GetUsername(),
+					authConfig, realm, failDelay, denyReason)
 			} else {
 				next.ServeHTTP(response, request) //nolint:contextcheck
 			}
 		})
 	}
+}
+
+func authzFailWithReason(
+	w http.ResponseWriter, r *http.Request, identity string, authConfig *config.AuthConfig,
+	realm string, delay int, reason string,
+) {
+	if authConfig.ShouldAdvertiseBearerChallenge() {
+		bearerAuthzFailWithReason(w, r, identity, authConfig, delay, reason)
+
+		return
+	}
+
+	common.AuthzFailWithReason(w, r, identity, realm, delay, reason)
+}
+
+func bearerAuthzFailWithReason(
+	w http.ResponseWriter, r *http.Request, identity string, authConfig *config.AuthConfig, delay int, reason string,
+) {
+	time.Sleep(time.Duration(delay) * time.Second)
+	setBearerAuthChallengeForNonSessionClient(w, r, authConfig, requestedBearerResourceAction(r))
+
+	w.Header().Set("Content-Type", "application/json")
+
+	if identity == "" {
+		common.WriteJSON(w, http.StatusUnauthorized, apiErr.NewErrorList(apiErr.NewError(apiErr.UNAUTHORIZED)))
+
+		return
+	}
+
+	denied := apiErr.NewError(apiErr.DENIED)
+	if reason != "" {
+		denied.AddDetail(map[string]string{"reason": reason})
+	}
+
+	common.WriteJSON(w, http.StatusForbidden, apiErr.NewErrorList(denied))
 }
 
 // manifestWriteAuthzCheck is one (permission, reference) pair required for a manifest write.
@@ -903,7 +1011,7 @@ func MetricsAuthzHandler(ctlr *Controller) mux.MiddlewareFunc {
 			// get access control context made in authn.go
 			userAc, err := reqCtx.UserAcFromContext(request.Context())
 			if err != nil { // should never happen
-				common.AuthzFail(response, request, "", realm, failDelay)
+				authzFailWithReason(response, request, "", authConfig, realm, failDelay, "")
 
 				return
 			}
@@ -913,7 +1021,7 @@ func MetricsAuthzHandler(ctlr *Controller) mux.MiddlewareFunc {
 			if userAc.IsAnonymous() {
 				// If anonymous read is not specified in access control, deny.
 				if !slices.Contains(metricsAccessConfig.AnonymousPolicy, constants.ReadPermission) {
-					common.AuthzFail(response, request, "", realm, failDelay)
+					authzFailWithReason(response, request, "", authConfig, realm, failDelay, "")
 
 					return
 				}
@@ -923,13 +1031,13 @@ func MetricsAuthzHandler(ctlr *Controller) mux.MiddlewareFunc {
 					log := ctlr.Log
 					log.Warn().Msg("no users configured in metrics user list; " +
 						"metrics are not accessible to any authenticated user.")
-					common.AuthzFail(response, request, username, realm, failDelay)
+					authzFailWithReason(response, request, username, authConfig, realm, failDelay, "")
 
 					return
 				}
 
 				if !slices.Contains(metricsAccessConfig.Users, username) {
-					common.AuthzFail(response, request, username, realm, failDelay)
+					authzFailWithReason(response, request, username, authConfig, realm, failDelay, "")
 
 					return
 				}

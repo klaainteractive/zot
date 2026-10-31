@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	dockerList "github.com/distribution/distribution/v3/manifest/manifestlist"
+	docker "github.com/distribution/distribution/v3/manifest/schema2"
 	godigest "github.com/opencontainers/go-digest"
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
 	. "github.com/smartystreets/goconvey/convey"
@@ -145,7 +147,6 @@ func TestGetSignaturesInfo(t *testing.T) {
 					{
 						LayersInfo: []mTypes.LayerInfo{
 							{
-								LayerContent: []byte{},
 								LayerDigest:  "",
 								SignatureKey: "",
 								Signer:       "author",
@@ -171,7 +172,6 @@ func TestGetSignaturesInfo(t *testing.T) {
 					{
 						LayersInfo: []mTypes.LayerInfo{
 							{
-								LayerContent: []byte{},
 								LayerDigest:  "",
 								SignatureKey: "",
 								Signer:       "author",
@@ -619,13 +619,13 @@ func TestPaginatedConvert(t *testing.T) {
 
 	var (
 		badBothImage = CreateImageWith().DefaultLayers().ImageConfig(
-			ispec.Image{Platform: ispec.Platform{OS: "bad-os", Architecture: "bad-arch"}}).Build()
+			ispec.Image{OS: "bad-os", Architecture: "bad-arch"}).Build()
 		badOsImage = CreateImageWith().DefaultLayers().ImageConfig(
-			ispec.Image{Platform: ispec.Platform{OS: "bad-os", Architecture: "good-arch"}}).Build()
+			ispec.Image{OS: "bad-os", Architecture: "good-arch"}).Build()
 		badArchImage = CreateImageWith().DefaultLayers().ImageConfig(
-			ispec.Image{Platform: ispec.Platform{OS: "good-os", Architecture: "bad-arch"}}).Build()
+			ispec.Image{OS: "good-os", Architecture: "bad-arch"}).Build()
 		goodImage = CreateImageWith().DefaultLayers().ImageConfig(
-			ispec.Image{Platform: ispec.Platform{OS: "good-os", Architecture: "good-arch"}}).Build()
+			ispec.Image{OS: "good-os", Architecture: "good-arch"}).Build()
 
 		randomImage1    = CreateRandomImage()
 		randomImage2    = CreateRandomImage()
@@ -1199,10 +1199,8 @@ func TestRepoMeta2RepoSummary(t *testing.T) {
 				},
 			},
 			LastUpdatedImage: &mTypes.LastUpdatedImage{
-				Descriptor: mTypes.Descriptor{
-					Digest:    "sha256:digest2",
-					MediaType: "application/vnd.oci.image.manifest.v1+json",
-				},
+				Digest:      "sha256:digest2",
+				MediaType:   "application/vnd.oci.image.manifest.v1+json",
 				Tag:         "tag2",
 				LastUpdated: &newestTime, // This is newer than olderTime and newerTime, but older than futureTime
 			},
@@ -1246,10 +1244,8 @@ func TestRepoMeta2RepoSummary(t *testing.T) {
 				},
 			},
 			LastUpdatedImage: &mTypes.LastUpdatedImage{
-				Descriptor: mTypes.Descriptor{
-					Digest:    "sha256:digest1",
-					MediaType: "application/vnd.oci.image.manifest.v1+json",
-				},
+				Digest:      "sha256:digest1",
+				MediaType:   "application/vnd.oci.image.manifest.v1+json",
 				Tag:         "tag1",
 				LastUpdated: &newestTime,
 			},
@@ -1291,10 +1287,8 @@ func TestRepoMeta2RepoSummary(t *testing.T) {
 				},
 			},
 			LastUpdatedImage: &mTypes.LastUpdatedImage{
-				Descriptor: mTypes.Descriptor{
-					Digest:    "sha256:digest1",
-					MediaType: "application/vnd.oci.image.manifest.v1+json",
-				},
+				Digest:      "sha256:digest1",
+				MediaType:   "application/vnd.oci.image.manifest.v1+json",
 				Tag:         "tag1",
 				LastUpdated: nil,
 			},
@@ -1370,5 +1364,90 @@ func TestConvertErrors(t *testing.T) {
 			)
 			So(len(imgSums), ShouldEqual, 0)
 		})
+	})
+}
+
+func TestDockerIndexMediaTypeConversion(t *testing.T) {
+	Convey("Docker manifest lists retain their media type in image summaries", t, func() {
+		digest := godigest.FromString("docker-index")
+		imageMeta := mTypes.ImageMeta{
+			MediaType: dockerList.MediaTypeManifestList,
+			Digest:    digest,
+			Index: &ispec.Index{
+				MediaType: dockerList.MediaTypeManifestList,
+			},
+		}
+		repoMeta := mTypes.RepoMeta{
+			Name: "repo",
+			Tags: map[string]mTypes.Descriptor{
+				"latest": {Digest: digest.String()},
+			},
+		}
+
+		fullImageMeta := convert.GetFullImageMeta("latest", repoMeta, imageMeta)
+		So(fullImageMeta.MediaType, ShouldEqual, dockerList.MediaTypeManifestList)
+		So(fullImageMeta.Index.MediaType, ShouldEqual, dockerList.MediaTypeManifestList)
+
+		summary, _, err := convert.FullImageMeta2ImageSummary(context.Background(), fullImageMeta)
+		So(err, ShouldBeNil)
+		So(summary, ShouldNotBeNil)
+		So(summary.MediaType, ShouldNotBeNil)
+		So(*summary.MediaType, ShouldEqual, dockerList.MediaTypeManifestList)
+	})
+
+	Convey("Docker manifests prefer descriptor media type over empty nested JSON", t, func() {
+		digest := godigest.FromString("docker-manifest")
+		imageMeta := mTypes.ImageMeta{
+			MediaType: docker.MediaTypeManifest,
+			Digest:    digest,
+			Manifests: []mTypes.ManifestMeta{
+				{
+					Digest:   digest,
+					Manifest: ispec.Manifest{},
+					Config:   ispec.Image{},
+				},
+			},
+		}
+		repoMeta := mTypes.RepoMeta{
+			Name: "repo",
+			Tags: map[string]mTypes.Descriptor{
+				"latest": {Digest: digest.String()},
+			},
+		}
+
+		fullImageMeta := convert.GetFullImageMeta("latest", repoMeta, imageMeta)
+		summary, _, err := convert.FullImageMeta2ImageSummary(context.Background(), fullImageMeta)
+		So(err, ShouldBeNil)
+		So(summary, ShouldNotBeNil)
+		So(summary.MediaType, ShouldNotBeNil)
+		So(*summary.MediaType, ShouldEqual, docker.MediaTypeManifest)
+	})
+
+	Convey("empty top-level media type falls back to nested manifest JSON", t, func() {
+		digest := godigest.FromString("nested-media-type")
+		summary, _, err := convert.ImageManifest2ImageSummary(context.Background(), mTypes.FullImageMeta{
+			Repo:      "repo",
+			Tag:       "latest",
+			MediaType: "",
+			Digest:    digest,
+			Manifests: []mTypes.FullManifestMeta{
+				{
+					Digest: digest,
+					Size:   10,
+					Manifest: ispec.Manifest{
+						MediaType: docker.MediaTypeManifest,
+						Config: ispec.Descriptor{
+							Digest: godigest.FromString("config"),
+							Size:   2,
+						},
+					},
+					Config: ispec.Image{},
+				},
+			},
+		})
+		So(err, ShouldBeNil)
+		So(summary, ShouldNotBeNil)
+		So(summary.MediaType, ShouldNotBeNil)
+		So(*summary.MediaType, ShouldEqual, docker.MediaTypeManifest)
 	})
 }

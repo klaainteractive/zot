@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -123,6 +124,14 @@ func TestConfig(t *testing.T) {
 		So(firstStorageConfig.ParamsEqual(secondStorageConfig), ShouldBeFalse)
 
 		firstStorageConfig.RedirectBlobURL = false
+
+		So(firstStorageConfig.ParamsEqual(secondStorageConfig), ShouldBeTrue)
+
+		firstStorageConfig.HydrateBlobOnRead = true
+
+		So(firstStorageConfig.ParamsEqual(secondStorageConfig), ShouldBeFalse)
+
+		firstStorageConfig.HydrateBlobOnRead = false
 
 		So(firstStorageConfig.ParamsEqual(secondStorageConfig), ShouldBeTrue)
 
@@ -1363,6 +1372,29 @@ func TestConfig(t *testing.T) {
 			So(accessControlConfig.AnonymousPolicyExists(), ShouldBeFalse)
 		})
 
+		Convey("Test IsAnonymousCatalogDisabled()", func() {
+			var accessControlConfig *config.AccessControlConfig
+
+			So(accessControlConfig.IsAnonymousCatalogDisabled(), ShouldBeFalse)
+
+			accessControlConfig = &config.AccessControlConfig{}
+			So(accessControlConfig.IsAnonymousCatalogDisabled(), ShouldBeFalse)
+
+			accessControlConfig.DisableAnonymousCatalog = true
+			So(accessControlConfig.IsAnonymousCatalogDisabled(), ShouldBeTrue)
+		})
+
+		Convey("Test DisableAnonymousCatalog is applied by UpdateReloadableConfig", func() {
+			oldConf := config.New()
+			oldConf.HTTP.AccessControl = &config.AccessControlConfig{}
+
+			newConf := config.New()
+			newConf.HTTP.AccessControl = &config.AccessControlConfig{DisableAnonymousCatalog: true}
+
+			oldConf.UpdateReloadableConfig(newConf)
+			So(oldConf.CopyAccessControlConfig().IsAnonymousCatalogDisabled(), ShouldBeTrue)
+		})
+
 		Convey("Test GetRepositories()", func() {
 			repositories := config.Repositories{
 				"repo1": config.PolicyGroup{
@@ -1804,6 +1836,38 @@ func TestConfig(t *testing.T) {
 			})
 		})
 
+		Convey("Test IsHydrateBlobOnReadEnabled()", func() {
+			Convey("returns global setting for default store path", func() {
+				cfg := &config.Config{
+					Storage: config.GlobalStorageConfig{
+						StorageConfig: config.StorageConfig{HydrateBlobOnRead: true},
+					},
+				}
+
+				So(cfg.IsHydrateBlobOnReadEnabled("/"), ShouldBeTrue)
+			})
+
+			Convey("returns subpath setting when subpath exists", func() {
+				cfg := &config.Config{
+					Storage: config.GlobalStorageConfig{
+						StorageConfig: config.StorageConfig{HydrateBlobOnRead: false},
+						SubPaths: map[string]config.StorageConfig{
+							"/a": {HydrateBlobOnRead: true},
+						},
+					},
+				}
+
+				So(cfg.IsHydrateBlobOnReadEnabled("/a"), ShouldBeTrue)
+				So(cfg.IsHydrateBlobOnReadEnabled("/b"), ShouldBeFalse)
+			})
+
+			Convey("nil config returns false", func() {
+				var nilCfg *config.Config
+
+				So(nilCfg.IsHydrateBlobOnReadEnabled("/"), ShouldBeFalse)
+			})
+		})
+
 		Convey("Test CopyLogConfig()", func() {
 			Convey("Test with non-nil Log", func() {
 				cfg := &config.Config{
@@ -2233,6 +2297,59 @@ func TestConfig(t *testing.T) {
 			So(cfg.IsMTLSAuthEnabled(), ShouldBeTrue)
 		})
 
+		Convey("Test IsAuthnEnabled()", func() {
+			var cfg *config.Config
+			So(cfg.IsAuthnEnabled(), ShouldBeFalse)
+
+			cfg = config.New()
+			So(cfg.IsAuthnEnabled(), ShouldBeFalse)
+
+			cfg.HTTP.Auth.HTPasswd.Path = "/path/to/htpasswd"
+			So(cfg.IsAuthnEnabled(), ShouldBeTrue)
+
+			cfg = config.New()
+			cfg.HTTP.Auth.Bearer = &config.BearerConfig{
+				Cert:    "/path/to/cert.pem",
+				Realm:   "test-realm",
+				Service: "test-service",
+			}
+			So(cfg.IsAuthnEnabled(), ShouldBeTrue)
+
+			cfg = config.New()
+			cfg.HTTP.Auth.Bearer = &config.BearerConfig{
+				OIDC: []config.BearerOIDCConfig{{
+					Issuer:    "https://issuer.example.com",
+					Audiences: []string{"zot"},
+				}},
+			}
+			So(cfg.IsAuthnEnabled(), ShouldBeTrue)
+
+			// TLS without a client CA is not mTLS.
+			cfg = config.New()
+			cfg.HTTP.TLS = &config.TLSConfig{Cert: "/path/to/cert.pem", Key: "/path/to/key.pem"}
+			So(cfg.IsAuthnEnabled(), ShouldBeFalse)
+
+			// A client CA enables mTLS authn even without an http.auth.mtls block, matching the authn middleware.
+			cfg.HTTP.TLS.CACert = "/path/to/ca-cert.pem"
+			So(cfg.CopyAuthConfig().GetMTLSConfig(), ShouldBeNil)
+			So(cfg.IsAuthnEnabled(), ShouldBeTrue)
+		})
+
+		Convey("Test IsDockerCompatEnabled()", func() {
+			var nilCfg *config.Config
+			So(nilCfg.IsDockerCompatEnabled(), ShouldBeFalse)
+
+			cfg := &config.Config{}
+			So(cfg.IsDockerCompatEnabled(), ShouldBeFalse)
+
+			cfg = &config.Config{
+				HTTP: config.HTTPConfig{
+					Compat: []compat.MediaCompatibility{compat.DockerManifestV2SchemaV2},
+				},
+			}
+			So(cfg.IsDockerCompatEnabled(), ShouldBeTrue)
+		})
+
 		Convey("Test UseSecureSession()", func() {
 			// Test with nil Config
 			var cfg *config.Config = nil
@@ -2395,9 +2512,7 @@ func TestConfig(t *testing.T) {
 			cfg = &config.Config{
 				Extensions: &extconf.ExtensionConfig{
 					Search: &extconf.SearchConfig{
-						BaseConfig: extconf.BaseConfig{
-							Enable: &disabled,
-						},
+						Enable: &disabled,
 					},
 				},
 			}
@@ -2408,9 +2523,7 @@ func TestConfig(t *testing.T) {
 			cfg = &config.Config{
 				Extensions: &extconf.ExtensionConfig{
 					Search: &extconf.SearchConfig{
-						BaseConfig: extconf.BaseConfig{
-							Enable: &enabled,
-						},
+						Enable: &enabled,
 					},
 				},
 			}
@@ -2486,9 +2599,7 @@ func TestConfig(t *testing.T) {
 			cfg := &config.Config{
 				Extensions: &extconf.ExtensionConfig{
 					Search: &extconf.SearchConfig{
-						BaseConfig: extconf.BaseConfig{
-							Enable: &enabled,
-						},
+						Enable: &enabled,
 					},
 				},
 			}
@@ -2497,9 +2608,7 @@ func TestConfig(t *testing.T) {
 			newConfig := &config.Config{
 				Extensions: &extconf.ExtensionConfig{
 					Search: &extconf.SearchConfig{
-						BaseConfig: extconf.BaseConfig{
-							Enable: &enabled,
-						},
+						Enable: &enabled,
 						CVE: &extconf.CVEConfig{
 							UpdateInterval: time.Hour * 2,
 						},
@@ -2515,22 +2624,24 @@ func TestConfig(t *testing.T) {
 			cfg := &config.Config{
 				Storage: config.GlobalStorageConfig{
 					StorageConfig: config.StorageConfig{
-						GC:              true,
-						Dedupe:          false,
-						RedirectBlobURL: false,
-						GCDelay:         time.Hour,
-						GCInterval:      2 * time.Hour,
+						GC:                true,
+						Dedupe:            false,
+						RedirectBlobURL:   false,
+						HydrateBlobOnRead: false,
+						GCDelay:           time.Hour,
+						GCInterval:        2 * time.Hour,
 					},
 				},
 			}
 			newConfig := &config.Config{
 				Storage: config.GlobalStorageConfig{
 					StorageConfig: config.StorageConfig{
-						GC:              false,
-						Dedupe:          true,
-						RedirectBlobURL: true,
-						GCDelay:         3 * time.Hour,
-						GCInterval:      4 * time.Hour,
+						GC:                false,
+						Dedupe:            true,
+						RedirectBlobURL:   true,
+						HydrateBlobOnRead: true,
+						GCDelay:           3 * time.Hour,
+						GCInterval:        4 * time.Hour,
 					},
 				},
 			}
@@ -2540,6 +2651,7 @@ func TestConfig(t *testing.T) {
 			So(cfg.Storage.GC, ShouldBeFalse)
 			So(cfg.Storage.Dedupe, ShouldBeTrue)
 			So(cfg.Storage.RedirectBlobURL, ShouldBeTrue)
+			So(cfg.Storage.HydrateBlobOnRead, ShouldBeTrue)
 			So(cfg.Storage.GCDelay, ShouldEqual, 3*time.Hour)
 			So(cfg.Storage.GCInterval, ShouldEqual, 4*time.Hour)
 		})
@@ -2550,9 +2662,7 @@ func TestConfig(t *testing.T) {
 			cfg := &config.Config{
 				Extensions: &extconf.ExtensionConfig{
 					Search: &extconf.SearchConfig{
-						BaseConfig: extconf.BaseConfig{
-							Enable: &enabled,
-						},
+						Enable: &enabled,
 						CVE: &extconf.CVEConfig{
 							UpdateInterval: time.Hour,
 						},
@@ -2566,10 +2676,8 @@ func TestConfig(t *testing.T) {
 			newConfig := &config.Config{
 				Extensions: &extconf.ExtensionConfig{
 					Search: &extconf.SearchConfig{
-						BaseConfig: extconf.BaseConfig{
-							Enable: &enabled,
-						},
-						CVE: nil, // This should trigger the removal
+						Enable: &enabled,
+						CVE:    nil, // This should trigger the removal
 					},
 				},
 			}
@@ -2587,9 +2695,7 @@ func TestConfig(t *testing.T) {
 			cfg := &config.Config{
 				Extensions: &extconf.ExtensionConfig{
 					Search: &extconf.SearchConfig{
-						BaseConfig: extconf.BaseConfig{
-							Enable: &enabled,
-						},
+						Enable: &enabled,
 						CVE: &extconf.CVEConfig{
 							UpdateInterval: time.Hour,
 						},
@@ -2973,9 +3079,7 @@ func TestConfig(t *testing.T) {
 			cfg := &config.Config{
 				Extensions: &extconf.ExtensionConfig{
 					Search: &extconf.SearchConfig{
-						BaseConfig: extconf.BaseConfig{
-							Enable: &enabled,
-						},
+						Enable: &enabled,
 						CVE: &extconf.CVEConfig{
 							UpdateInterval: time.Hour,
 							Trivy: &extconf.TrivyConfig{
@@ -2992,23 +3096,17 @@ func TestConfig(t *testing.T) {
 						},
 					},
 					Metrics: &extconf.MetricsConfig{
-						BaseConfig: extconf.BaseConfig{
-							Enable: &enabled,
-						},
+						Enable: &enabled,
 						Prometheus: &extconf.PrometheusConfig{
 							Path: "/metrics",
 						},
 					},
 					Scrub: &extconf.ScrubConfig{
-						BaseConfig: extconf.BaseConfig{
-							Enable: &enabled,
-						},
+						Enable:   &enabled,
 						Interval: 24 * time.Hour,
 					},
 					UI: &extconf.UIConfig{
-						BaseConfig: extconf.BaseConfig{
-							Enable: &enabled,
-						},
+						Enable: &enabled,
 					},
 				},
 			}
@@ -3060,14 +3158,10 @@ func TestConfig(t *testing.T) {
 			enabled := true
 			newExtensionConfig := &extconf.ExtensionConfig{
 				Search: &extconf.SearchConfig{
-					BaseConfig: extconf.BaseConfig{
-						Enable: &enabled,
-					},
+					Enable: &enabled,
 				},
 				Metrics: &extconf.MetricsConfig{
-					BaseConfig: extconf.BaseConfig{
-						Enable: &enabled,
-					},
+					Enable: &enabled,
 					Prometheus: &extconf.PrometheusConfig{
 						Path: "/metrics",
 					},
@@ -3097,14 +3191,10 @@ func TestConfig(t *testing.T) {
 			cfg := &config.Config{
 				Extensions: &extconf.ExtensionConfig{
 					Search: &extconf.SearchConfig{
-						BaseConfig: extconf.BaseConfig{
-							Enable: &enabled,
-						},
+						Enable: &enabled,
 					},
 					Metrics: &extconf.MetricsConfig{
-						BaseConfig: extconf.BaseConfig{
-							Enable: &enabled,
-						},
+						Enable: &enabled,
 						Prometheus: &extconf.PrometheusConfig{
 							Path: "/metrics",
 						},
@@ -3126,9 +3216,7 @@ func TestConfig(t *testing.T) {
 			newConfig := &config.Config{
 				Extensions: &extconf.ExtensionConfig{
 					Search: &extconf.SearchConfig{
-						BaseConfig: extconf.BaseConfig{
-							Enable: &enabled,
-						},
+						Enable: &enabled,
 						CVE: &extconf.CVEConfig{
 							UpdateInterval: time.Hour * 2,
 							Trivy: &extconf.TrivyConfig{
@@ -3137,9 +3225,7 @@ func TestConfig(t *testing.T) {
 						},
 					},
 					Metrics: &extconf.MetricsConfig{
-						BaseConfig: extconf.BaseConfig{
-							Enable: &enabled,
-						},
+						Enable: &enabled,
 						Prometheus: &extconf.PrometheusConfig{
 							Path: "/custom/metrics",
 						},
@@ -3153,9 +3239,7 @@ func TestConfig(t *testing.T) {
 						},
 					},
 					Scrub: &extconf.ScrubConfig{
-						BaseConfig: extconf.BaseConfig{
-							Enable: &enabled,
-						},
+						Enable:   &enabled,
 						Interval: time.Hour * 12,
 					},
 				},
@@ -3196,14 +3280,10 @@ func TestConfig(t *testing.T) {
 			newConfig := &config.Config{
 				Extensions: &extconf.ExtensionConfig{
 					Search: &extconf.SearchConfig{
-						BaseConfig: extconf.BaseConfig{
-							Enable: &enabled,
-						},
+						Enable: &enabled,
 					},
 					Metrics: &extconf.MetricsConfig{
-						BaseConfig: extconf.BaseConfig{
-							Enable: &enabled,
-						},
+						Enable: &enabled,
 						Prometheus: &extconf.PrometheusConfig{
 							Path: "/new/metrics",
 						},
@@ -3231,9 +3311,7 @@ func TestConfig(t *testing.T) {
 			cfg := &config.Config{
 				Extensions: &extconf.ExtensionConfig{
 					Search: &extconf.SearchConfig{
-						BaseConfig: extconf.BaseConfig{
-							Enable: &enabled,
-						},
+						Enable: &enabled,
 					},
 				},
 			}
@@ -3475,18 +3553,20 @@ func TestConfig(t *testing.T) {
 					},
 					SubPaths: map[string]config.StorageConfig{
 						"/path1": {
-							GC:              true,
-							Dedupe:          false,
-							RedirectBlobURL: false,
-							GCDelay:         time.Hour,
-							GCInterval:      time.Hour * 24,
+							GC:                true,
+							Dedupe:            false,
+							RedirectBlobURL:   false,
+							HydrateBlobOnRead: false,
+							GCDelay:           time.Hour,
+							GCInterval:        time.Hour * 24,
 						},
 						"/path2": {
-							GC:              false,
-							Dedupe:          true,
-							RedirectBlobURL: true,
-							GCDelay:         time.Hour * 2,
-							GCInterval:      time.Hour * 48,
+							GC:                false,
+							Dedupe:            true,
+							RedirectBlobURL:   true,
+							HydrateBlobOnRead: true,
+							GCDelay:           time.Hour * 2,
+							GCInterval:        time.Hour * 48,
 						},
 					},
 				},
@@ -3496,24 +3576,27 @@ func TestConfig(t *testing.T) {
 			newConfig := &config.Config{
 				Storage: config.GlobalStorageConfig{
 					StorageConfig: config.StorageConfig{
-						GC:              true,
-						Dedupe:          false,
-						RedirectBlobURL: true,
+						GC:                true,
+						Dedupe:            false,
+						RedirectBlobURL:   true,
+						HydrateBlobOnRead: true,
 					},
 					SubPaths: map[string]config.StorageConfig{
 						"/path1": {
-							GC:              false,          // Changed
-							Dedupe:          true,           // Changed
-							RedirectBlobURL: true,           // Changed
-							GCDelay:         time.Hour * 2,  // Changed
-							GCInterval:      time.Hour * 12, // Changed
+							GC:                false,          // Changed
+							Dedupe:            true,           // Changed
+							RedirectBlobURL:   true,           // Changed
+							HydrateBlobOnRead: true,           // Changed
+							GCDelay:           time.Hour * 2,  // Changed
+							GCInterval:        time.Hour * 12, // Changed
 						},
 						"/path2": {
-							GC:              true,           // Changed
-							Dedupe:          false,          // Changed
-							RedirectBlobURL: false,          // Changed
-							GCDelay:         time.Hour * 3,  // Changed
-							GCInterval:      time.Hour * 36, // Changed
+							GC:                true,           // Changed
+							Dedupe:            false,          // Changed
+							RedirectBlobURL:   false,          // Changed
+							HydrateBlobOnRead: false,          // Changed
+							GCDelay:           time.Hour * 3,  // Changed
+							GCInterval:        time.Hour * 36, // Changed
 						},
 					},
 				},
@@ -3530,6 +3613,7 @@ func TestConfig(t *testing.T) {
 			So(path1Config.GC, ShouldBeFalse)
 			So(path1Config.Dedupe, ShouldBeTrue)
 			So(path1Config.RedirectBlobURL, ShouldBeTrue)
+			So(path1Config.HydrateBlobOnRead, ShouldBeTrue)
 			So(path1Config.GCDelay, ShouldEqual, time.Hour*2)
 			So(path1Config.GCInterval, ShouldEqual, time.Hour*12)
 
@@ -3538,6 +3622,7 @@ func TestConfig(t *testing.T) {
 			So(path2Config.GC, ShouldBeTrue)
 			So(path2Config.Dedupe, ShouldBeFalse)
 			So(path2Config.RedirectBlobURL, ShouldBeFalse)
+			So(path2Config.HydrateBlobOnRead, ShouldBeFalse)
 			So(path2Config.GCDelay, ShouldEqual, time.Hour*3)
 			So(path2Config.GCInterval, ShouldEqual, time.Hour*36)
 		})
@@ -3784,6 +3869,31 @@ func TestConfig(t *testing.T) {
 	})
 }
 
+func TestRepoByteQuotaConfig(t *testing.T) {
+	Convey("repo byte quota configuration", t, func() {
+		conf := config.New()
+
+		So(conf.IsQuotaEnabled(), ShouldBeFalse)
+		So(conf.MaxRepoBytesForStore("/"), ShouldEqual, int64(0))
+
+		conf.Storage.MaxRepoBytes = 1024
+		So(conf.IsQuotaEnabled(), ShouldBeTrue)
+		So(conf.MaxRepoBytesForStore("/"), ShouldEqual, int64(1024))
+
+		conf.Storage.SubPaths = map[string]config.StorageConfig{
+			"/tenant": {
+				MaxRepoBytes: 2048,
+			},
+			"/unlimited": {
+				MaxRepoBytes: 0,
+			},
+		}
+		So(conf.MaxRepoBytesForStore("/tenant"), ShouldEqual, int64(2048))
+		So(conf.MaxRepoBytesForStore("/unlimited"), ShouldEqual, int64(0))
+		So(conf.MaxRepoBytesForStore("/unknown"), ShouldEqual, int64(1024))
+	})
+}
+
 func TestHTTPTimeoutAccessors(t *testing.T) {
 	Convey("GetHTTPReadTimeout returns configured values", t, func() {
 		cfg := config.New()
@@ -3819,5 +3929,140 @@ func TestHTTPTimeoutAccessors(t *testing.T) {
 		positive := 1 * time.Minute
 		cfg.HTTP.WriteTimeout = &positive
 		So(cfg.GetHTTPWriteTimeout(), ShouldEqual, positive)
+	})
+}
+
+func TestConfigSyncStagingHelpers(t *testing.T) {
+	Convey("Config sync staging helpers", t, func() {
+		Convey("SyncStagingDownloadDir on nil config returns empty", func() {
+			var nilConf *config.Config
+
+			So(nilConf.SyncStagingDownloadDir(), ShouldEqual, "")
+		})
+
+		Convey("SyncStagingDownloadDir returns configured downloadDir", func() {
+			conf := config.New()
+			conf.Extensions = &extconf.ExtensionConfig{
+				Sync: &syncconf.Config{DownloadDir: "/tmp/sync-staging"},
+			}
+
+			So(conf.SyncStagingDownloadDir(), ShouldEqual, "/tmp/sync-staging")
+		})
+
+		Convey("GlobalStorageConfig.LargestGCDelay uses max across substores", func() {
+			storageConfig := config.GlobalStorageConfig{
+				GCDelay: time.Hour,
+				SubPaths: map[string]config.StorageConfig{
+					"/a": {GCDelay: 3 * time.Hour},
+				},
+			}
+
+			So(storageConfig.LargestGCDelay(), ShouldEqual, 3*time.Hour)
+		})
+
+		Convey("GlobalStorageConfig.LargestGCDelay falls back to default when unset", func() {
+			So(config.GlobalStorageConfig{}.LargestGCDelay(), ShouldBeGreaterThan, 0)
+		})
+	})
+}
+
+func TestSnapshotJSON(t *testing.T) {
+	Convey("A nil config has no snapshot", t, func() {
+		var conf *config.Config
+
+		blob, err := conf.SnapshotJSON()
+		So(err, ShouldBeNil)
+		So(blob, ShouldBeNil)
+	})
+
+	Convey("Secrets are left unmasked, so a rotation still reads as a change", t, func() {
+		conf := config.New()
+		conf.Storage.StorageDriver = map[string]any{"name": "s3", "secretkey": "rotate-me"}
+
+		blob, err := conf.SnapshotJSON()
+		So(err, ShouldBeNil)
+		So(string(blob), ShouldContainSubstring, "rotate-me")
+
+		// Sanitize is the masking one; comparing two masked configs would make
+		// a rotated secret look unchanged
+		So(string(mustJSON(conf.Sanitize())), ShouldNotContainSubstring, "rotate-me")
+	})
+
+	Convey("It is a view, not a clone: what JSON drops is absent", t, func() {
+		conf := config.New()
+		conf.HTTP.Auth = &config.AuthConfig{LDAP: &config.LDAPConfig{Address: "ldap.example.com"}}
+		conf.HTTP.Auth.LDAP.SetBindPassword("super-secret")
+		conf.HTTP.Auth.SessionHashKey = []byte("hash-key-material")
+
+		blob, err := conf.SnapshotJSON()
+		So(err, ShouldBeNil)
+
+		So(string(blob), ShouldContainSubstring, "ldap.example.com")
+		So(string(blob), ShouldNotContainSubstring, "super-secret")
+		So(string(blob), ShouldNotContainSubstring, "hash-key-material")
+	})
+}
+
+func mustJSON(conf *config.Config) []byte {
+	blob, err := json.Marshal(conf)
+	So(err, ShouldBeNil)
+
+	return blob
+}
+
+func TestEventsFingerprint(t *testing.T) {
+	newConf := func(address string) *config.Config {
+		enabled := true
+		conf := config.New()
+		conf.Extensions = &extconf.ExtensionConfig{
+			Events: &eventsconf.Config{
+				Enable: &enabled,
+				Sinks: []eventsconf.SinkConfig{{
+					Type:    eventsconf.HTTP,
+					Address: address,
+					Timeout: 5 * time.Second,
+				}},
+			},
+		}
+
+		return conf
+	}
+
+	Convey("EventsFingerprint", t, func() {
+		Convey("nil config yields an empty fingerprint", func() {
+			var nilConf *config.Config
+
+			So(nilConf.EventsFingerprint(), ShouldEqual, "")
+		})
+
+		Convey("no extensions or no events yields an empty fingerprint", func() {
+			So(config.New().EventsFingerprint(), ShouldEqual, "")
+
+			conf := config.New()
+			conf.Extensions = &extconf.ExtensionConfig{}
+			So(conf.EventsFingerprint(), ShouldEqual, "")
+		})
+
+		Convey("identical events config yields an identical, non-empty fingerprint", func() {
+			fingerprint := newConf("http://receiver").EventsFingerprint()
+
+			So(fingerprint, ShouldNotEqual, "")
+			So(newConf("http://receiver").EventsFingerprint(), ShouldEqual, fingerprint)
+		})
+
+		Convey("changing a sink changes the fingerprint", func() {
+			base := newConf("http://receiver").EventsFingerprint()
+
+			So(newConf("http://elsewhere").EventsFingerprint(), ShouldNotEqual, base)
+
+			credentials := newConf("http://receiver")
+			credentials.Extensions.Events.Sinks[0].Credentials = &eventsconf.Credentials{Token: "rotated"}
+			So(credentials.EventsFingerprint(), ShouldNotEqual, base)
+
+			disabled := newConf("http://receiver")
+			off := false
+			disabled.Extensions.Events.Enable = &off
+			So(disabled.EventsFingerprint(), ShouldNotEqual, base)
+		})
 	})
 }

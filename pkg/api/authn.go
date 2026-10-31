@@ -3,10 +3,8 @@ package api
 import (
 	"context"
 	"crypto"
-	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -19,6 +17,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-jose/go-jose/v4"
@@ -47,11 +46,15 @@ import (
 const (
 	issuedAtOffset           = 5 * time.Second
 	relyingPartyCookieMaxAge = 120
+	// bounds a single relying party initialization, without a deadline the oidc client waits 30s
+	// on an unreachable issuer, and every login for that provider waits with it.
+	relyingPartyInitTimeout = 10 * time.Second
 )
 
 type AuthnMiddleware struct {
 	htpasswd   *HTPasswd
 	ldapClient *LDAPClient
+	bearerAuth *BearerAuth
 	log        log.Logger
 }
 
@@ -67,16 +70,20 @@ func AuthHandler(ctlr *Controller) AuthSetup {
 	}
 
 	authConfig := ctlr.Config.CopyAuthConfig()
-	if authConfig.IsBearerAuthEnabled() {
+	if authConfig.ShouldInitializeBearerAuth() {
 		bearerAuth := NewBearerAuth(authConfig, ctlr.Log)
-
-		return AuthSetup{
-			Middleware:   bearerAuth.Middleware(ctlr),
-			TokenHandler: bearerAuth.TokenExchangeHandler(),
-		}
+		authnMiddleware.bearerAuth = bearerAuth
 	}
 
-	return AuthSetup{Middleware: authnMiddleware.tryAuthnHandlers(ctlr)}
+	var tokenHandler http.HandlerFunc
+	if authnMiddleware.bearerAuth != nil {
+		tokenHandler = authnMiddleware.bearerAuth.TokenExchangeHandler(ctlr)
+	}
+
+	return AuthSetup{
+		Middleware:   authnMiddleware.tryAuthnHandlers(ctlr),
+		TokenHandler: tokenHandler,
+	}
 }
 
 func (amw *AuthnMiddleware) sessionAuthn(ctlr *Controller, userAc *reqCtx.UserAccessControl,
@@ -231,8 +238,10 @@ func (amw *AuthnMiddleware) basicAuthn(ctlr *Controller, userAc *reqCtx.UserAcce
 		return true, nil
 	}
 
-	// next, LDAP if configured (network-based which can lose connectivity)
-	if authConfig.IsLdapAuthEnabled() {
+	// next, LDAP if configured (network-based which can lose connectivity). A
+	// reload can enable ldap without a client existing to serve it, which
+	// LoadNewConfig warns about once rather than on every request through here.
+	if authConfig.IsLdapAuthEnabled() && amw.ldapClient != nil {
 		ok, _, ldapgroups, err := amw.ldapClient.Authenticate(identity, passphrase)
 		if ok && err == nil {
 			// Process request
@@ -271,72 +280,83 @@ func (amw *AuthnMiddleware) basicAuthn(ctlr *Controller, userAc *reqCtx.UserAcce
 
 	// last try API keys
 	if authConfig.IsAPIKeyEnabled() {
-		apiKey := passphrase
-
-		if !strings.HasPrefix(apiKey, constants.APIKeysPrefix) {
-			ctlr.Log.Error().Msg("invalid api token format")
-
-			return false, nil
-		}
-
-		trimmedAPIKey := strings.TrimPrefix(apiKey, constants.APIKeysPrefix)
-
-		hashedKey := hashUUID(trimmedAPIKey)
-
-		storedIdentity, err := ctlr.MetaDB.GetUserAPIKeyInfo(hashedKey)
-		if err != nil {
-			if errors.Is(err, zerr.ErrUserAPIKeyNotFound) {
-				ctlr.Log.Info().Err(err).Msgf("failed to find any user info for hashed key %s in DB", hashedKey)
-
-				return false, nil
-			}
-
-			ctlr.Log.Error().Err(err).Msgf("failed to get user info for hashed key %s in DB", hashedKey)
-
-			return false, err
-		}
-
-		if storedIdentity == identity {
-			userAc.SetUsername(identity)
-			userAc.SaveOnRequest(request)
-
-			// check if api key expired
-			isExpired, err := ctlr.MetaDB.IsAPIKeyExpired(request.Context(), hashedKey)
-			if err != nil {
-				ctlr.Log.Err(err).Str("identity", identity).Msg("failed to verify if api key expired")
-
-				return false, err
-			}
-
-			if isExpired {
-				return false, nil
-			}
-
-			err = ctlr.MetaDB.UpdateUserAPIKeyLastUsed(request.Context(), hashedKey)
-			if err != nil {
-				ctlr.Log.Err(err).Str("identity", identity).Msg("failed to update user profile in DB")
-
-				return false, err
-			}
-
-			groups, err := ctlr.MetaDB.GetUserGroups(request.Context())
-			if err != nil {
-				ctlr.Log.Err(err).Str("identity", identity).Msg("failed to get user's groups in DB")
-
-				return false, err
-			}
-
-			userAc.AddGroups(groups)
-			userAc.SaveOnRequest(request)
-
-			return true, nil
-		}
+		return authenticateAPIKeyCredential(ctlr, userAc, request, identity, passphrase)
 	}
 
 	return false, nil
 }
 
-func (amw *AuthnMiddleware) tryAuthnHandlers(ctlr *Controller) mux.MiddlewareFunc { //nolint: gocyclo
+func authenticateAPIKeyCredential(ctlr *Controller, userAc *reqCtx.UserAccessControl, request *http.Request,
+	identity, apiKey string,
+) (bool, error) {
+	if !strings.HasPrefix(apiKey, constants.APIKeysPrefix) {
+		if ctlr != nil {
+			ctlr.Log.Error().Msg("invalid api token format")
+		}
+
+		return false, nil
+	}
+
+	if ctlr == nil || ctlr.MetaDB == nil {
+		return false, zerr.ErrAPIKeyMetadataDBRequired
+	}
+
+	trimmedAPIKey := strings.TrimPrefix(apiKey, constants.APIKeysPrefix)
+
+	hashedKey := hashUUID(trimmedAPIKey)
+
+	storedIdentity, err := ctlr.MetaDB.GetUserAPIKeyInfo(hashedKey)
+	if err != nil {
+		if errors.Is(err, zerr.ErrUserAPIKeyNotFound) {
+			ctlr.Log.Info().Err(err).Msgf("failed to find any user info for hashed key %s in DB", hashedKey)
+
+			return false, nil
+		}
+
+		ctlr.Log.Error().Err(err).Msgf("failed to get user info for hashed key %s in DB", hashedKey)
+
+		return false, err
+	}
+
+	if storedIdentity != identity {
+		return false, nil
+	}
+
+	userAc.SetUsername(identity)
+	userAc.SaveOnRequest(request)
+
+	isExpired, err := ctlr.MetaDB.IsAPIKeyExpired(request.Context(), hashedKey)
+	if err != nil {
+		ctlr.Log.Err(err).Str("identity", identity).Msg("failed to verify if api key expired")
+
+		return false, err
+	}
+
+	if isExpired {
+		return false, nil
+	}
+
+	err = ctlr.MetaDB.UpdateUserAPIKeyLastUsed(request.Context(), hashedKey)
+	if err != nil {
+		ctlr.Log.Err(err).Str("identity", identity).Msg("failed to update user profile in DB")
+
+		return false, err
+	}
+
+	groups, err := ctlr.MetaDB.GetUserGroups(request.Context())
+	if err != nil {
+		ctlr.Log.Err(err).Str("identity", identity).Msg("failed to get user groups in DB")
+
+		return false, err
+	}
+
+	userAc.AddGroups(groups)
+	userAc.SaveOnRequest(request)
+
+	return true, nil
+}
+
+func (amw *AuthnMiddleware) tryAuthnHandlers(ctlr *Controller) mux.MiddlewareFunc { //nolint: gocyclo,cyclop
 	// Get auth config once to avoid multiple calls
 	authConfig := ctlr.Config.CopyAuthConfig()
 
@@ -359,6 +379,7 @@ func (amw *AuthnMiddleware) tryAuthnHandlers(ctlr *Controller) mux.MiddlewareFun
 			ServerName:         ldapConfig.Address,
 			Log:                ctlr.Log,
 			SubtreeSearch:      ldapConfig.SubtreeSearch,
+			CACertPath:         ldapConfig.CACert,
 		}
 
 		amw.ldapClient = ctlr.LDAPClient
@@ -400,17 +421,18 @@ func (amw *AuthnMiddleware) tryAuthnHandlers(ctlr *Controller) mux.MiddlewareFun
 
 	// openid based authN
 	if authConfig.IsOpenIDAuthEnabled() {
-		ctlr.RelyingParties = make(map[string]rp.RelyingParty)
+		ctlr.RelyingParties = make(map[string]*LazyRelyingParty)
 
 		for provider := range authConfig.OpenID.Providers {
 			if config.IsOpenIDSupported(provider) {
-				rp := NewRelyingPartyOIDC(context.TODO(), ctlr.Config, provider, authConfig.SessionHashKey,
-					authConfig.SessionEncryptKey, ctlr.Log)
-				ctlr.RelyingParties[provider] = rp
+				// OIDC relying parties perform discovery against the issuer, so they are initialized
+				// on first use to avoid making zot startup depend on the identity provider availability.
+				ctlr.RelyingParties[provider] = NewLazyRelyingParty(newRelyingPartyOIDCFunc(ctlr.Config, provider,
+					authConfig.SessionHashKey, authConfig.SessionEncryptKey, ctlr.Log))
 			} else if config.IsOauth2Supported(provider) {
 				rp := NewRelyingPartyGithub(ctlr.Config, provider, authConfig.SessionHashKey,
 					authConfig.SessionEncryptKey, ctlr.Log)
-				ctlr.RelyingParties[provider] = rp
+				ctlr.RelyingParties[provider] = NewInitializedRelyingParty(rp)
 			}
 		}
 	}
@@ -445,6 +467,7 @@ func (amw *AuthnMiddleware) tryAuthnHandlers(ctlr *Controller) mux.MiddlewareFun
 			// Allow anonymous access to the metrics endpoint only if configured.
 			extensionsConfig := ctlr.Config.CopyExtensionsConfig()
 			isMetricsRequestedWithAnonymousAccess := isAnonymousMetricsRequest(request, accessControlConfig, extensionsConfig)
+			allowsUnauthenticatedRequest := isMgmtRequested || isMetricsRequestedWithAnonymousAccess || allowAnonymous
 
 			// build user access control info
 			userAc := reqCtx.NewUserAccessControl()
@@ -452,21 +475,48 @@ func (amw *AuthnMiddleware) tryAuthnHandlers(ctlr *Controller) mux.MiddlewareFun
 			userAc.SaveOnRequest(request)
 
 			authenticated := false
+			needsBearerChallenge := !allowsUnauthenticatedRequest ||
+				(isV2Requested && accessControlConfig.HasMixedAnonymousAndAuthenticatedPolicies())
 
 			var err error
 
-			// Switch authentication methods based on provided request context
+			// Switch authentication methods based on the credential transport the client chose.
 			switch {
-			// Reject requests with multiple Authorization headers as a security measure
+			// Reject requests with multiple Authorization headers as a security measure.
 			case hasMultipleAuthorizationHeaders(request):
 				authenticated = false
 
-			// The authorization header presence is an explicit attempt to use basic authentication
-			case !isAuthorizationHeaderEmpty(request) && authConfig.IsBasicAuthnEnabled():
-				authenticated, err = amw.basicAuthn(ctlr, userAc, response, request)
+			case hasBearerAuthorizationHeader(request) && amw.bearerAuth != nil:
+				result, err := amw.bearerAuth.Authenticate(ctlr, userAc, request)
+				if err != nil {
+					response.WriteHeader(http.StatusInternalServerError)
 
-			// The session header is an explicit attempt to use session authentication
-			case hasSessionHeader(request):
+					return
+				}
+
+				if result.authenticated {
+					amCtx := NewAccessController(ctlr.Config).getAuthnMiddlewareContext(result.authnType, request)
+					next.ServeHTTP(response, request.WithContext(amCtx)) //nolint:contextcheck
+
+					return
+				}
+
+				amw.bearerAuth.writeAuthenticationFailure(response, request, result)
+
+				return
+
+			case hasBasicAuthorizationHeader(request) && authConfig.CanAuthenticateWithBasicCredentials():
+				authenticated, err = amw.basicAuthn(ctlr, userAc, response, request)
+				if !authenticated && err == nil && hasEmptyBasicAuthorizationHeader(request) &&
+					allowsUnauthenticatedRequest {
+					authenticated = true
+				}
+
+			// The session header is an explicit attempt to use session authentication.
+			// CookieStore is only created when basic authn is enabled; without it, skip session
+			// handling so open/anonymous access still works for UI clients that send
+			// X-ZOT-API-CLIENT (see allowAnonymousAccess in mgmt -> zot-ui).
+			case hasSessionHeader(request) && ctlr.CookieStore != nil:
 				authenticated, err = amw.sessionAuthn(ctlr, userAc, response, request)
 				if err != nil {
 					break
@@ -475,18 +525,28 @@ func (amw *AuthnMiddleware) tryAuthnHandlers(ctlr *Controller) mux.MiddlewareFun
 				// If session authentication fails, but anonymous or management access is allowed,
 				// treat the request as authenticated. This fallback is necessary because the session
 				// header may be present for anonymous or management requests.
-				authenticated = authenticated || allowAnonymous || isMgmtRequested || isMetricsRequestedWithAnonymousAccess
+				authenticated = authenticated || allowsUnauthenticatedRequest
 
-			// Try mTLS authentication if client certificates are present
+			// Try mTLS authentication if client certificates are present.
 			case ctlr.Config.IsMTLSAuthEnabled() && request.TLS != nil && len(request.TLS.PeerCertificates) > 0:
 				authenticated, err = amw.mTLSAuthn(ctlr, userAc, request)
 
-			// If no auth methods enabled at all - then just authenticate anything
-			case !authConfig.IsBasicAuthnEnabled() && !ctlr.Config.IsMTLSAuthEnabled():
+			case isAuthorizationHeaderEmpty(request) && amw.shouldChallengeWithBearer(authConfig) &&
+				needsBearerChallenge:
+				bearerAuthFail(response, request, authConfig, delay)
+
+				return
+
+			// If no auth methods enabled at all - then just authenticate anything.
+			case !ctlr.Config.IsAuthnEnabled():
 				authenticated = true
 
-			// If no credentials provided - check for anonymous / mgmt / metrics requests
-			case allowAnonymous || isMgmtRequested || isMetricsRequestedWithAnonymousAccess:
+			// Reject Authorization credentials that were not handled by any enabled auth method.
+			case !isAuthorizationHeaderEmpty(request):
+				authenticated = false
+
+			// Check anonymous / mgmt / metrics fallback for requests not handled by an enabled credential method.
+			case allowsUnauthenticatedRequest:
 				// Docker workaround: force 401 on /v2/ when anonymous policies coexist with
 				// authenticated-only policies. Otherwise Docker treats 200 on /v2/ as "no auth"
 				// and will not send stored credentials for protected repositories.
@@ -509,7 +569,7 @@ func (amw *AuthnMiddleware) tryAuthnHandlers(ctlr *Controller) mux.MiddlewareFun
 			if authenticated {
 				next.ServeHTTP(response, request)
 			} else {
-				authFail(response, request, realm, delay)
+				amw.authFail(response, request, authConfig, realm, delay)
 			}
 		})
 	}
@@ -520,7 +580,7 @@ func setBearerAuthChallenge(
 	authConfig *config.AuthConfig,
 	requestedAccess *ResourceAction,
 ) {
-	if authConfig == nil || authConfig.Bearer == nil || authConfig.Bearer.Realm == "" {
+	if !authConfig.HasBearerChallengeConfig() {
 		return
 	}
 
@@ -531,6 +591,19 @@ func setBearerAuthChallenge(
 	}
 
 	response.Header().Set("WWW-Authenticate", challenge.Header())
+}
+
+func setBearerAuthChallengeForNonSessionClient(
+	response http.ResponseWriter,
+	request *http.Request,
+	authConfig *config.AuthConfig,
+	requestedAccess *ResourceAction,
+) {
+	if hasSessionHeader(request) {
+		return
+	}
+
+	setBearerAuthChallenge(response, authConfig, requestedAccess)
 }
 
 func canonicalOrigin(parsedURL *url.URL) (string, bool) {
@@ -666,12 +739,8 @@ func (rh *RouteHandler) AuthURLHandler() http.HandlerFunc {
 
 		provider := query.Get("provider")
 
-		client, ok := rh.c.RelyingParties[provider]
+		client, ok := rh.getRelyingParty(w, r, provider)
 		if !ok {
-			rh.c.Log.Error().Msg("failed to authenticate due to unrecognized openid provider")
-
-			w.WriteHeader(http.StatusBadRequest)
-
 			return
 		}
 
@@ -707,16 +776,158 @@ func (rh *RouteHandler) AuthURLHandler() http.HandlerFunc {
 	}
 }
 
-func NewRelyingPartyOIDC(ctx context.Context, config *config.Config, provider string,
+// getRelyingParty returns the relying party of the given provider, initializing it if needed.
+// If the provider is unknown or currently unavailable, it writes the error response and returns false.
+func (rh *RouteHandler) getRelyingParty(w http.ResponseWriter, r *http.Request, provider string,
+) (rp.RelyingParty, bool) {
+	lazyRelyingParty, ok := rh.c.RelyingParties[provider]
+	if !ok {
+		rh.c.Log.Error().Msg("failed to authenticate due to unrecognized openid provider")
+
+		w.WriteHeader(http.StatusBadRequest)
+
+		return nil, false
+	}
+
+	relyingParty, err := lazyRelyingParty.Get(r.Context())
+	if err != nil {
+		rh.c.Log.Error().Err(err).Str("provider", provider).
+			Msg("failed to authenticate due to unavailable openid provider")
+
+		w.WriteHeader(http.StatusServiceUnavailable)
+
+		return nil, false
+	}
+
+	return relyingParty, true
+}
+
+// LazyRelyingParty defers the creation of a relying party until it is first needed.
+// A failed initialization is not cached, so it is retried on the next call.
+type LazyRelyingParty struct {
+	mu           sync.Mutex
+	relyingParty rp.RelyingParty
+	// initDone is non-nil while an initialization is in flight, and is closed when it finishes.
+	initDone chan struct{}
+	initErr  error
+	newFn    func(ctx context.Context) (rp.RelyingParty, error)
+	// initTimeout bounds a single initialization, independently of the callers' contexts.
+	initTimeout time.Duration
+}
+
+func NewLazyRelyingParty(newFn func(ctx context.Context) (rp.RelyingParty, error)) *LazyRelyingParty {
+	return &LazyRelyingParty{newFn: newFn, initTimeout: relyingPartyInitTimeout}
+}
+
+// NewInitializedRelyingParty wraps an already initialized relying party.
+func NewInitializedRelyingParty(relyingParty rp.RelyingParty) *LazyRelyingParty {
+	return &LazyRelyingParty{relyingParty: relyingParty}
+}
+
+// Get returns the relying party, initializing it if this was not successfully done before.
+// Concurrent callers share a single initialization, which runs without holding the lock,
+// so a slow or unreachable issuer only delays the callers which actually need it.
+// The initialization is detached from the caller's cancellation, so a caller giving up
+// does not abort it for the others, but it is bounded by its own timeout.
+func (l *LazyRelyingParty) Get(ctx context.Context) (rp.RelyingParty, error) {
+	l.mu.Lock()
+
+	if l.relyingParty != nil {
+		relyingParty := l.relyingParty
+		l.mu.Unlock()
+
+		return relyingParty, nil
+	}
+
+	done := l.initDone
+	if done == nil {
+		done = make(chan struct{})
+		l.initDone = done
+
+		go l.initialize(context.WithoutCancel(ctx), done)
+	}
+
+	l.mu.Unlock()
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-done:
+		l.mu.Lock()
+		defer l.mu.Unlock()
+
+		if l.relyingParty != nil {
+			return l.relyingParty, nil
+		}
+
+		return nil, l.initErr
+	}
+}
+
+// GetIfInitialized returns the relying party only if it was already initialized,
+// it never contacts the issuer.
+func (l *LazyRelyingParty) GetIfInitialized() (rp.RelyingParty, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	return l.relyingParty, l.relyingParty != nil
+}
+
+func (l *LazyRelyingParty) initialize(ctx context.Context, done chan struct{}) {
+	ctx, cancel := context.WithTimeout(ctx, l.initTimeout)
+	defer cancel()
+
+	relyingParty, err := l.newFn(ctx)
+	if err == nil && relyingParty == nil {
+		err = zerr.ErrOpenIDRelyingPartyNil
+	}
+
+	l.mu.Lock()
+	// set the result before closing done, so waiters woken up by it observe the result.
+	// Only a successful result is published, anything else is retried by the next Get.
+	if err == nil {
+		l.relyingParty = relyingParty
+	}
+
+	l.initErr = err
+	l.initDone = nil
+	l.mu.Unlock()
+
+	close(done)
+}
+
+// newRelyingPartyOIDCFunc validates the provider configuration and returns a function
+// which initializes the relying party, performing the OIDC discovery against the issuer.
+func newRelyingPartyOIDCFunc(config *config.Config, provider string,
 	hashKey, encryptKey []byte, log log.Logger,
-) rp.RelyingParty {
+) func(ctx context.Context) (rp.RelyingParty, error) {
 	issuer, clientID, clientSecret, redirectURI, scopes, options := getRelyingPartyArgs(config,
 		provider, hashKey, encryptKey, log)
 
-	relyingParty, err := rp.NewRelyingPartyOIDC(ctx, issuer, clientID, clientSecret, redirectURI, scopes, options...)
+	// Accept the ID token signing algorithms advertised by the issuer in its discovery document
+	// (id_token_signing_alg_values_supported) instead of the library default of RS256, ES256 and PS256.
+	// If the issuer does not advertise any, the library default is kept.
+	options = append(options, rp.WithSigningAlgsFromDiscovery())
+
+	return func(ctx context.Context) (rp.RelyingParty, error) {
+		relyingParty, err := rp.NewRelyingPartyOIDC(ctx, issuer, clientID, clientSecret, redirectURI, scopes, options...)
+		if err != nil {
+			log.Error().Err(err).Str("provider", provider).Str("issuer", issuer).Str("redirectURI", redirectURI).
+				Strs("scopes", scopes).Msg("failed to initialize new relying party oidc")
+
+			return nil, err
+		}
+
+		return relyingParty, nil
+	}
+}
+
+func NewRelyingPartyOIDC(ctx context.Context, config *config.Config, provider string,
+	hashKey, encryptKey []byte, log log.Logger,
+) rp.RelyingParty {
+	relyingParty, err := newRelyingPartyOIDCFunc(config, provider, hashKey, encryptKey, log)(ctx)
 	if err != nil {
-		log.Panic().Err(err).Str("issuer", issuer).Str("redirectURI", redirectURI).Strs("scopes", scopes).
-			Msg("failed to initialize new relying party oidc")
+		log.Panic().Err(err).Str("provider", provider).Msg("failed to initialize new relying party oidc")
 	}
 
 	return relyingParty
@@ -813,7 +1024,40 @@ func getRelyingPartyArgs(cfg *config.Config, provider string, hashKey, encryptKe
 		options = append(options, rp.WithJWTProfile(rp.SignerFromKeyPath(keyPath)))
 	}
 
+	// The discovery document is fetched from this URL instead of <issuer>/.well-known/openid-configuration.
+	// Its issuer must still match the configured one.
+	if providerConfig.DiscoveryURL != "" {
+		options = append(options, rp.WithCustomDiscoveryUrl(providerConfig.DiscoveryURL))
+	}
+
 	return issuer, clientID, clientSecret, redirectURI, scopes, options
+}
+
+func (amw *AuthnMiddleware) authFail(w http.ResponseWriter, r *http.Request, authConfig *config.AuthConfig,
+	realm string, delay int,
+) {
+	if amw.shouldChallengeWithBearer(authConfig) {
+		bearerAuthFail(w, r, authConfig, delay)
+
+		return
+	}
+
+	authFail(w, r, realm, delay)
+}
+
+func (amw *AuthnMiddleware) shouldChallengeWithBearer(authConfig *config.AuthConfig) bool {
+	return amw.bearerAuth != nil && authConfig.ShouldAdvertiseBearerChallenge()
+}
+
+func bearerAuthFail(w http.ResponseWriter, r *http.Request, authConfig *config.AuthConfig, delay int) {
+	if !isAuthorizationHeaderEmpty(r) || hasSessionHeader(r) {
+		time.Sleep(time.Duration(delay) * time.Second)
+	}
+
+	setBearerAuthChallengeForNonSessionClient(w, r, authConfig, requestedBearerResourceAction(r))
+
+	w.Header().Set("Content-Type", "application/json")
+	zcommon.WriteJSON(w, http.StatusUnauthorized, apiErr.NewError(apiErr.UNAUTHORIZED))
 }
 
 func authFail(w http.ResponseWriter, r *http.Request, realm string, delay int) {
@@ -822,18 +1066,20 @@ func authFail(w http.ResponseWriter, r *http.Request, realm string, delay int) {
 	}
 
 	// don't send auth headers if request is coming from UI
-	if r.Header.Get(constants.SessionClientHeaderName) != constants.SessionClientHeaderValue {
-		if realm == "" {
-			realm = "Authorization Required"
-		}
-
-		realm = "Basic realm=" + strconv.Quote(realm)
-
-		w.Header().Set("WWW-Authenticate", realm)
+	if !hasSessionHeader(r) {
+		setBasicAuthChallenge(w, realm)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	zcommon.WriteJSON(w, http.StatusUnauthorized, apiErr.NewError(apiErr.UNAUTHORIZED))
+}
+
+func setBasicAuthChallenge(response http.ResponseWriter, realm string) {
+	if realm == "" {
+		realm = "Authorization Required"
+	}
+
+	response.Header().Set("WWW-Authenticate", "Basic realm="+strconv.Quote(realm))
 }
 
 func isAnonymousMetricsRequest(request *http.Request, accessControlConfig *config.AccessControlConfig,
@@ -846,6 +1092,29 @@ func isAnonymousMetricsRequest(request *http.Request, accessControlConfig *confi
 		extensionsConfig.IsMetricsEnabled() &&
 		prometheusConfig != nil &&
 		strings.HasPrefix(request.URL.Path, prometheusConfig.Path)
+}
+
+func hasBasicAuthorizationHeader(request *http.Request) bool {
+	return hasAuthorizationScheme(request, "basic")
+}
+
+func hasEmptyBasicAuthorizationHeader(request *http.Request) bool {
+	username, password, err := getUsernamePasswordBasicAuth(request)
+
+	return err == nil && username == "" && password == ""
+}
+
+func hasBearerAuthorizationHeader(request *http.Request) bool {
+	return hasAuthorizationScheme(request, "bearer")
+}
+
+func hasAuthorizationScheme(request *http.Request, scheme string) bool {
+	authScheme, _, ok := splitAuthorizationHeader(request.Header.Get("Authorization"))
+	if !ok {
+		return false
+	}
+
+	return strings.EqualFold(authScheme, scheme)
 }
 
 func isAuthorizationHeaderEmpty(request *http.Request) bool {
@@ -873,18 +1142,12 @@ func hasSessionHeader(request *http.Request) bool {
 }
 
 func getUsernamePasswordBasicAuth(request *http.Request) (string, string, error) {
-	basicAuth := request.Header.Get("Authorization")
-
-	if basicAuth == "" {
+	scheme, credential, ok := splitAuthorizationHeader(request.Header.Get("Authorization"))
+	if !ok || !strings.EqualFold(scheme, "basic") {
 		return "", "", zerr.ErrParsingAuthHeader
 	}
 
-	splitStr := strings.SplitN(basicAuth, " ", 2) //nolint:mnd
-	if len(splitStr) != 2 || strings.ToLower(splitStr[0]) != "basic" {
-		return "", "", zerr.ErrParsingAuthHeader
-	}
-
-	decodedStr, err := base64.StdEncoding.DecodeString(splitStr[1])
+	decodedStr, err := base64.StdEncoding.DecodeString(credential)
 	if err != nil {
 		return "", "", err
 	}
@@ -898,6 +1161,15 @@ func getUsernamePasswordBasicAuth(request *http.Request) (string, string, error)
 	passphrase := pair[1]
 
 	return identity, passphrase, nil
+}
+
+func splitAuthorizationHeader(header string) (string, string, bool) {
+	fields := strings.Fields(header)
+	if len(fields) != 2 {
+		return "", "", false
+	}
+
+	return fields[0], fields[1], true
 }
 
 func GetGithubUserInfo(ctx context.Context, client *github.Client, log log.Logger) (string, []string, error) {
@@ -1215,6 +1487,14 @@ func OAuth2Callback(ctlr *Controller, w http.ResponseWriter, r *http.Request, st
 		return "", zerr.ErrInvalidStateCookie
 	}
 
+	// besides the groups received from the provider, the user is also a member of the
+	// accessControl groups listing it, same as for htpasswd, LDAP and mTLS users
+	accessControl := ctlr.Config.CopyAccessControlConfig()
+	if accessControl != nil {
+		ac := NewAccessController(ctlr.Config)
+		groups = append(ac.getUserGroups(identity), groups...)
+	}
+
 	userAc := reqCtx.NewUserAccessControl()
 	userAc.SetUsername(identity)
 	userAc.AddGroups(groups)
@@ -1242,10 +1522,9 @@ func OAuth2Callback(ctlr *Controller, w http.ResponseWriter, r *http.Request, st
 }
 
 func hashUUID(uuid string) string {
-	digester := sha256.New()
-	digester.Write([]byte(uuid))
-
-	return godigest.NewDigestFromEncoded(godigest.SHA256, hex.EncodeToString(digester.Sum(nil))).Encoded()
+	// API key digests are stable metadata lookup keys; existing keys depend on
+	// this exact SHA-256 encoded output.
+	return godigest.FromString(uuid).Encoded()
 }
 
 /*
