@@ -577,4 +577,4 @@ require (
 	sigs.k8s.io/yaml v1.6.0 // indirect
 )
 
-replace github.com/distribution/distribution/v3 => github.com/klaainteractive/distribution/v3 v3.1.2-klaa1
+replace github.com/distribution/distribution/v3 => github.com/klaainteractive/distribution/v3 v3.1.2-klaa2

@@ -10,7 +10,7 @@ on:
       tag:
         description: Image tag to publish to ghcr.io/<owner>/zot
         required: true
-        default: v2.1.22-klaa1
+        default: v2.1.22-klaa2
 
 permissions:
   contents: read
